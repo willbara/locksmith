@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Locksmith
+GenericName=File Encryption
+Comment=Encrypt, decrypt and share files securely
+Exec=locksmith %F
+Icon=locksmith
+Terminal=false
+Categories=Utility;Security;
+Keywords=encrypt;decrypt;security;aes;chacha;password;share;
+MimeType=application/x-locksmith;
+StartupWMClass=locksmith

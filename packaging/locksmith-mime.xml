@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-locksmith">
+    <comment>Locksmith encrypted file</comment>
+    <magic priority="60">
+      <match type="string" offset="0" value="LOCKED"/>
+    </magic>
+    <glob pattern="*.locked"/>
+  </mime-type>
+</mime-info>

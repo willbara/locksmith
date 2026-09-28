@@ -108,14 +108,15 @@ def config_dir() -> Path:
     return path
 
 
-def write_secret_file(path: Path, text: str):
-    """Atomically write a file that is never readable by other users, even briefly."""
+def write_secret_file(path: Path, data: str | bytes):
+    """Atomically write a file that is never readable by other users, even briefly.
+    An existing file (or symlink) at ``path`` is replaced, never written through."""
     path = Path(path)
     tmp = path.with_name(f".{path.name}.{secrets.token_hex(4)}.tmp")
     fd = open_new(tmp)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-            f.write(text)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data.encode() if isinstance(data, str) else data)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)

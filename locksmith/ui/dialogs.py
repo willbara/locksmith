@@ -17,14 +17,13 @@ from PySide6.QtWidgets import (
     QApplication,
     QGraphicsOpacityEffect,
     QHBoxLayout,
-    QLabel,
     QPlainTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
 from .theme import font, pixmap, theme
-from .widgets import Button, IconButton, LineEdit, PasswordField, copy_secret, label, toast
+from .widgets import Button, IconButton, Label, LineEdit, PasswordField, copy_secret, label, toast
 
 _host: QWidget | None = None
 
@@ -63,12 +62,12 @@ class Sheet(QWidget):
         head = QHBoxLayout()
         head.setSpacing(12)
         if icon:
-            ic = QLabel()
+            ic = Label()
             ic.setPixmap(pixmap(icon, 22))
             head.addWidget(ic, 0, Qt.AlignmentFlag.AlignTop)
         tl = QVBoxLayout()
         tl.setSpacing(4)
-        t = QLabel(title)
+        t = Label(title)
         t.setFont(font(17, QFont.Weight.DemiBold))
         tl.addWidget(t)
         if caption:

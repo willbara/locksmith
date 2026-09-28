@@ -39,6 +39,31 @@ def fsync_dir(path: Path):
         pass
 
 
+def copy_zone_identifier(source: Path, target: Path):
+    """Windows: give decrypted output the source file's Mark of the Web (the
+    Zone.Identifier stream that downloads carry). Without it, a program or macro
+    document received encrypted would open without SmartScreen or Office Protected
+    View. For a folder, every file inside is marked. Best effort, like other
+    archivers: file systems without alternate streams (FAT, network shares) skip it."""
+    if not IS_WINDOWS:
+        return
+    try:
+        with open(f"{source}:Zone.Identifier", "rb") as f:
+            mark = f.read(4096)
+    except OSError:
+        return  # the source has no mark: nothing to carry over
+    files = [Path(root) / name for root, _, names in os.walk(target) for name in names] \
+        if Path(target).is_dir() else [Path(target)]
+    for path in files:
+        if path.is_symlink():
+            continue
+        try:
+            with open(f"{path}:Zone.Identifier", "wb") as f:
+                f.write(mark)
+        except OSError:
+            pass
+
+
 def config_base() -> Path:
     if IS_WINDOWS:
         return Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")

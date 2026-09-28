@@ -32,6 +32,8 @@ PySide6 desktop app for file encryption, packaged as an AppImage. It is built lo
 - Blocking work goes through `ui/workers.run_task`. Read widget values on the UI thread before starting the
   task, never inside it.
 - Dialogs are in-window sheets (`ui/dialogs.py`), not native windows.
+- Use `widgets.Label` / `widgets.label()`, never a bare `QLabel`: file names, notes and messages come from
+  whoever made the file, and a bare `QLabel` renders text that looks like HTML as markup.
 - The process is hardened (`locksmith/hardening.py`: no core dumps, non-dumpable). The desktop portal rejects
   non-dumpable processes, so never call it directly: go through a child process in `ui/host.py`. Native file
   dialogs are disabled for the same reason.

@@ -132,3 +132,21 @@ def test_lock_and_panic_clear_secrets(window):
     window.share.secret.setText("again")
     window.locker.panic()
     assert window.share.secret.text() == "" and window.locker.overlay.isVisible()
+
+
+def test_sender_text_is_never_rendered_as_html(tmp_path, window, monkeypatch):
+    """File names and notes come from whoever made the file: show them literally."""
+    from PySide6.QtWidgets import QLabel
+
+    from locksmith.ui import dialogs
+    monkeypatch.setattr(dialogs, "text_view", lambda *a, **k: None)
+
+    page = window.decrypt
+    evil = "<h1>Verified by your bank<img src='x.png'>"
+    page._add_result("file", str(tmp_path / f"{evil}.pdf"), {"note": evil})
+    page._add_result("text", evil, {})
+    texts = [lab for lab in page.findChildren(QLabel) if "<h1>" in lab.text()]
+    assert len(texts) >= 3
+    assert all(lab.textFormat() == Qt.TextFormat.PlainText for lab in texts)
+    for lab in window.findChildren(QLabel):
+        assert lab.textFormat() == Qt.TextFormat.PlainText, lab.text()

@@ -62,11 +62,15 @@ CODECS["zlib"] = Codec(
     lambda d, lvl: zlib.compress(d, lvl),
     zlib.decompressobj,
 )
+# A crafted .xz header can declare a dictionary of up to 1.5 GiB, which the decoder
+# allocates up front (once per worker thread). Presets up to 6 need under 10 MiB.
+LZMA_MEMLIMIT = 128 << 20
+
 CODECS["lzma"] = Codec(
     "lzma", "LZMA / XZ",
     {"fast": 1, "balanced": 4, "max": 6},
     lambda d, lvl: lzma.compress(d, preset=lvl),
-    lzma.LZMADecompressor,
+    lambda: lzma.LZMADecompressor(format=lzma.FORMAT_XZ, memlimit=LZMA_MEMLIMIT),
 )
 CODECS["bz2"] = Codec(
     "bz2", "bzip2",

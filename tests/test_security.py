@@ -650,3 +650,126 @@ def test_windows_file_names(monkeypatch, tmp_path):
     skipped = engine.extract_archive(archive, tmp_path / "out")
     assert sorted(skipped) == ["folder/CON", "folder/aux.txt", "folder/stream:hidden"]
     assert (tmp_path / "out" / "folder" / "ok.txt").read_bytes() == b"hi"
+
+
+# ── abuse by a sender: names, metadata and archive layout ────────────────────
+
+@pytest.mark.parametrize("name, good", [
+    (".bash_profile", "bash_profile"), (".ssh", "ssh"), ("...", "decrypted"), (". .", "decrypted"),
+    ("invoice‮fdp.exe", "invoicefdp.exe"), ("a​b⁦c.txt", "abc.txt"), ("line\nbreak", "linebreak"),
+    ("é" * 300, "é" * 120),
+])
+def test_names_cannot_hide_or_disguise_files(name, good):
+    assert engine.safe_name(name) == good
+
+
+def test_hidden_folder_name_is_not_planted(tmp_path):
+    """A folder named ".ssh" decrypted into a home folder must not become ~/.ssh."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        info = tarfile.TarInfo(".ssh/authorized_keys")
+        info.size = 3
+        tar.addfile(info, io.BytesIO(b"key"))
+    evil = _forge(tmp_path, [_frame(engine.KIND_RAW, buf.getvalue())],
+                  {"name": ".ssh", "kind": "dir", "comp": "none"}, chunk=len(buf.getvalue()) + 64)
+    home = tmp_path / "home"
+    res = engine.decrypt_path(evil, home, PW)
+    assert res.path.name == "ssh" and not (home / ".ssh").exists()
+    assert (res.path / "authorized_keys").read_bytes() == b"key"
+
+
+@pytest.mark.parametrize("meta", [{"name": "x", "kind": "file", "comp": []},
+                                  {"name": "x", "kind": ["dir"], "comp": {"a": 1}, "note": 7, "mtime": True}])
+def test_mistyped_metadata_is_ignored(tmp_path, meta):
+    evil = _forge(tmp_path, [_frame(engine.KIND_RAW, b"payload")], meta)
+    res = engine.decrypt_path(evil, tmp_path / "out", PW)
+    assert res.path.read_bytes() == b"payload"
+    assert all(not isinstance(v, (list, dict, bool)) for v in res.meta.values())
+
+
+def test_folder_whose_top_entry_is_a_symlink_is_not_unwrapped(tmp_path, needs_symlinks):
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        link = tarfile.TarInfo("Photos")
+        link.type, link.linkname = tarfile.SYMTYPE, "sibling"
+        tar.addfile(link)
+        d = tarfile.TarInfo("sibling")
+        d.type = tarfile.DIRTYPE
+        tar.addfile(d)
+    evil = _forge(tmp_path, [_frame(engine.KIND_RAW, buf.getvalue())],
+                  {"name": "Photos", "kind": "dir", "comp": "none"}, chunk=len(buf.getvalue()) + 64)
+    out = tmp_path / "out"
+    (out / "sibling").mkdir(parents=True)
+    res = engine.decrypt_path(evil, out, PW)
+    assert res.path.is_dir() and not res.path.is_symlink()
+    assert res.path.parent == out
+
+
+def test_dangling_symlink_is_never_replaced(tmp_path, needs_symlinks):
+    (tmp_path / "report.txt").symlink_to(tmp_path / "missing")
+    assert engine.unique_path(tmp_path / "report.txt").name == "report (1).txt"
+
+
+def test_lzma_dictionary_bomb_rejected(tmp_path):
+    """A header declaring a huge dictionary must fail before it is allocated."""
+    import lzma
+    big = lzma.compress(b"x", format=lzma.FORMAT_XZ,
+                        filters=[{"id": lzma.FILTER_LZMA2, "dict_size": 1 << 30}])
+    with pytest.raises(CorruptedError):
+        compress.CODECS["lzma"].decompress(big, 4096)
+    assert compress.CODECS["lzma"].decompress(lzma.compress(b"ok", preset=6), 4096) == b"ok"
+
+
+@pytest.mark.parametrize("share", ["locksmithshare-2-300-ab-000000", "locksmithshare-999-1-ab-000000",
+                                   "locksmithshare-2-0-ab-000000", "locksmithshare-2-1-abc-000000"])
+def test_malformed_shares_are_reported(share):
+    with pytest.raises(LocksmithError, match="right format"):
+        tools.shamir_combine([share, share])
+
+
+def test_shares_with_different_thresholds_rejected():
+    a = tools.shamir_split(b"secret", 2, 3)
+    b = tools.shamir_split(b"secret", 3, 3)
+    with pytest.raises(LocksmithError, match="different secrets"):
+        tools.shamir_combine([a[0], b[1], b[2]])
+
+
+def test_shred_refuses_hard_linked_file(tmp_path):
+    f = tmp_path / "a"
+    f.write_bytes(b"plain")
+    try:
+        os.link(f, tmp_path / "b")
+    except (OSError, NotImplementedError):
+        pytest.skip("hard links are not available")
+    with pytest.raises(LocksmithError, match="hard links"):
+        tools.shred(f)
+    assert (tmp_path / "b").read_bytes() == b"plain"
+
+
+def test_split_never_overwrites(tmp_path):
+    src = tmp_path / "f.locked"
+    src.write_bytes(os.urandom(3000))
+    victim = tmp_path / "f.locked.part002"
+    victim.write_bytes(b"keep me")
+    with pytest.raises(FileExistsError):
+        tools.split_file(src, 1000)
+    assert victim.read_bytes() == b"keep me"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Mark of the Web is a Windows feature")
+def test_mark_of_the_web_carries_over(tmp_path):
+    """A downloaded .locked file's zone mark reaches what it decrypts to, so a received
+    program or macro document still gets SmartScreen and Protected View."""
+    mark = b"[ZoneTransfer]\r\nZoneId=3\r\n"
+    src = tmp_path / "in"
+    (src / "sub").mkdir(parents=True)
+    (src / "sub" / "run.exe").write_bytes(b"MZ")
+    enc = engine.encrypt_paths([src], tmp_path / "enc", EncryptOptions(password="pw", **FAST))
+    try:
+        with open(f"{enc}:Zone.Identifier", "wb") as f:
+            f.write(mark)
+    except OSError:
+        pytest.skip("this file system has no alternate data streams")
+    res = engine.decrypt_path(enc, tmp_path / "dec", PW)
+    with open(f"{res.path / 'sub' / 'run.exe'}:Zone.Identifier", "rb") as f:
+        assert f.read() == mark

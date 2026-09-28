@@ -56,7 +56,7 @@ from . import kdf as kdfmod
 from . import metadata
 from .ciphers import NONCE_SIZE, SUITES, SuiteCipher, layer_key_sizes
 from .errors import CancelledError, CorruptedError, LocksmithError, WrongKeyError
-from .osutil import IS_WINDOWS, open_new, portable_name, windows_unsafe
+from .osutil import IS_WINDOWS, copy_zone_identifier, open_new, portable_name, windows_unsafe
 
 
 @dataclass(frozen=True)
@@ -229,7 +229,8 @@ def pad_target(size: int, mode: str) -> int:
 
 
 def unique_path(path: Path) -> Path:
-    if not path.exists():
+    # lexists: a dangling symlink counts as taken, so it is never replaced.
+    if not os.path.lexists(path):
         return path
     stem, suffix = path.name, ""
     if path.is_file() or "." in path.name[1:]:
@@ -237,7 +238,7 @@ def unique_path(path: Path) -> Path:
     n = 1
     while True:
         candidate = path.with_name(f"{stem} ({n}){suffix}")
-        if not candidate.exists():
+        if not os.path.lexists(candidate):
             return candidate
         n += 1
 
@@ -591,6 +592,12 @@ def _unlock(header: dict, keys: DecryptKeys, chk: _Checker, fmt: Format) -> _Key
     return k
 
 
+# Expected type of each metadata field. The sender chooses the metadata, so a
+# field of the wrong type (e.g. a list as "comp") is dropped rather than trusted.
+_META_TYPES = {"name": str, "kind": str, "comp": str, "note": str, "size": int, "mtime": int,
+               "created": int, "items": int}
+
+
 def _read_meta(header: dict, keys: _Keys) -> dict:
     try:
         m = header["meta"]
@@ -599,9 +606,10 @@ def _read_meta(header: dict, keys: _Keys) -> dict:
         meta = json.loads(plain)
         if not isinstance(meta, dict):
             raise ValueError
-        return meta
     except (InvalidTag, KeyError, ValueError) as e:
         raise CorruptedError("The encrypted metadata is damaged.") from e
+    return {k: v for k, v in meta.items()
+            if k not in _META_TYPES or (isinstance(v, _META_TYPES[k]) and not isinstance(v, bool))}
 
 
 # ── frame streams ────────────────────────────────────────────────────────────
@@ -1090,8 +1098,12 @@ def decrypt_path(path: Path, out_dir: Path | None, keys: DecryptKeys, threads: i
                 if kind == "dir":
                     staging = out_dir / f".locksmith-{secrets.token_hex(6)}"
                     skipped = extract_archive(tmp, staging)
-                    inner = staging / name
-                    os.replace(inner if inner.exists() else staging, target)
+                    # Unwrap the archive's top-level folder (stored under its original
+                    # name, which may differ from the safe one). Only a real folder: a
+                    # symlink moved out of staging would resolve against the output folder.
+                    inner = next((e for e in staging.iterdir() if safe_name(e.name) == name
+                                  and e.is_dir() and not e.is_symlink()), staging)
+                    os.replace(inner, target)
                     shutil.rmtree(staging, ignore_errors=True)
                 else:
                     skipped = extract_archive(tmp, target)
@@ -1108,6 +1120,7 @@ def decrypt_path(path: Path, out_dir: Path | None, keys: DecryptKeys, threads: i
         except BaseException:
             tmp.unlink(missing_ok=True)
             raise
+    copy_zone_identifier(path, target)
     chk.report(1.0, "Done")
     return DecryptResult(target, meta, skipped=skipped)
 
@@ -1124,10 +1137,17 @@ def decrypt_bytes(blob: bytes, keys: DecryptKeys) -> DecryptResult:
 
 
 def safe_name(name) -> str:
+    """Make a received file name safe to create. Besides staying inside the output
+    folder, it drops control and invisible formatting characters (a right-to-left
+    override, U+202E, can make "photo\u202egpj.exe" display as "photoexe.jpg") and
+    leading dots, so a sender cannot plant hidden files such as .bash_profile or .ssh."""
     if not isinstance(name, str):
         return "decrypted"
-    name = os.path.basename(name.replace("\\", "/").replace("\x00", "")).strip()
-    name = portable_name(name[:255]) if name not in ("", ".", "..") else "decrypted"
+    name = "".join(ch for ch in name if unicodedata.category(ch) not in ("Cc", "Cf"))
+    name = os.path.basename(name.replace("\\", "/")).strip().lstrip(".").strip()
+    # 240 bytes leaves room for a " (n)" suffix within the usual 255-byte limit.
+    name = name.encode()[:240].decode(errors="ignore")
+    name = portable_name(name) if name not in ("", ".", "..") else "decrypted"
     return name if name not in ("", ".", "..") else "decrypted"
 
 

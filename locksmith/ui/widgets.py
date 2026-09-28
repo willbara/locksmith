@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import os
 import sys
 from pathlib import Path
@@ -37,6 +38,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..core import tools
+from ..core.keys import write_secret_file
 from .theme import EASE, EASE_IN_OUT, font, mix, pixmap, theme
 
 W = QFont.Weight
@@ -87,6 +89,19 @@ class _Hover:
         self._press_anim.setStartValue(self._pv)
         self._press_anim.setEndValue(to)
         self._press_anim.start()
+
+
+# ── labels ───────────────────────────────────────────────────────────────────
+
+class Label(QLabel):
+    """A QLabel that never renders its text as HTML. Plain QLabels guess, so a file
+    name or note chosen by a sender (such as "<h1>Verified</h1>") would be drawn as
+    markup. Every label in the app is one of these."""
+
+    def __init__(self, text="", parent=None):
+        super().__init__(parent)
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self.setText(text)
 
 
 # ── buttons ──────────────────────────────────────────────────────────────────
@@ -213,7 +228,7 @@ class IconButton(Button):
                      pixmap(self._icon, 18, fg))
 
 
-class LinkButton(QLabel):
+class LinkButton(Label):
     clicked = Signal()
 
     def __init__(self, text, parent=None):
@@ -289,11 +304,11 @@ class ToggleRow(QWidget):
         lay.setSpacing(16)
         text = QVBoxLayout()
         text.setSpacing(2)
-        t = QLabel(title)
+        t = Label(title)
         t.setFont(font(13, W.Medium))
         text.addWidget(t)
         if caption:
-            c = QLabel(caption)
+            c = Label(caption)
             c.setProperty("role", "caption")
             c.setWordWrap(True)
             text.addWidget(c)
@@ -426,7 +441,7 @@ class Field(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(6)
-        lab = QLabel(label.upper())
+        lab = Label(label.upper())
         lab.setProperty("role", "label")
         lay.addWidget(lab)
         if isinstance(control, QWidget):
@@ -434,7 +449,7 @@ class Field(QWidget):
         else:
             lay.addLayout(control)
         self.control = control
-        self.caption = QLabel(caption)
+        self.caption = Label(caption)
         self.caption.setProperty("role", "caption")
         self.caption.setWordWrap(True)
         self.caption.setVisible(bool(caption))
@@ -539,11 +554,11 @@ class Card(QFrame):
         if title:
             head = QVBoxLayout()
             head.setSpacing(3)
-            t = QLabel(title)
+            t = Label(title)
             t.setProperty("role", "h2")
             head.addWidget(t)
             if caption:
-                c = QLabel(caption)
+                c = Label(caption)
                 c.setProperty("role", "caption")
                 c.setWordWrap(True)
                 head.addWidget(c)
@@ -837,7 +852,8 @@ class _FileRow(QWidget, _Hover):
         self.rm = IconButton("x", "Remove", size=30)
         self.rm.clicked.connect(lambda: self.removed.emit(self.path))
         lay.addWidget(self.rm)
-        self.setToolTip(path)
+        # Escaped: tooltips also guess at HTML, and file names can contain markup.
+        self.setToolTip(f"<p style='white-space:pre'>{html.escape(path)}</p>")
 
     def enterEvent(self, e):
         self._go_hover(1.0)
@@ -878,7 +894,7 @@ class FileList(QWidget):
         self._rows: dict[str, _FileRow] = {}
         self._labels: dict[str, str] = {}
         self.head = QHBoxLayout()
-        self.count_label = QLabel()
+        self.count_label = Label()
         self.count_label.setProperty("role", "caption")
         self.head.addWidget(self.count_label)
         self.head.addStretch(1)
@@ -1082,7 +1098,7 @@ class PasswordField(QWidget):
         if strength:
             self.meter = StrengthMeter()
             lay.addWidget(self.meter)
-            self.info = QLabel(" ")
+            self.info = Label(" ")
             self.info.setProperty("role", "caption")
             lay.addWidget(self.info)
         self.edit.textChanged.connect(self._changed)
@@ -1131,7 +1147,7 @@ class KeyfilePicker(QWidget):
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(8)
-        self.label = QLabel("No keyfile")
+        self.label = Label("No keyfile")
         self.label.setProperty("role", "caption")
         self.choose = Button("Keyfile…", "key")
         self.choose.setToolTip("Any file can be a keyfile. Its exact bytes become part of the key.")
@@ -1169,9 +1185,7 @@ class KeyfilePicker(QWidget):
     def _generate(self):
         path, _ = QFileDialog.getSaveFileName(self, "Save new keyfile", "locksmith.key")
         if path:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "wb") as f:
-                f.write(os.urandom(4096))
+            write_secret_file(Path(path), os.urandom(4096))
             self.set_path(path)
             toast("Keyfile created. Keep a backup: without it the file cannot be opened.", "key")
 
@@ -1246,9 +1260,9 @@ class ProgressPanel(QWidget):
         lay.setContentsMargins(0, 4, 0, 0)
         lay.setSpacing(10)
         top = QHBoxLayout()
-        self.stage = QLabel("Preparing")
+        self.stage = Label("Preparing")
         self.stage.setFont(font(13, W.Medium))
-        self.percent = QLabel("")
+        self.percent = Label("")
         self.percent.setProperty("role", "mono")
         top.addWidget(self.stage, 1)
         top.addWidget(self.percent)
@@ -1447,7 +1461,7 @@ class Sidebar(QWidget):
         brand.setSpacing(10)
         self.logo = _Logo()
         brand.addWidget(self.logo)
-        name = QLabel("Locksmith")
+        name = Label("Locksmith")
         name.setFont(font(19, W.DemiBold))
         brand.addWidget(name)
         brand.addStretch(1)
@@ -1467,7 +1481,7 @@ class Sidebar(QWidget):
             item.clicked.connect(lambda _=False, i=index: self.select(i))
             self.items.append(item)
             lay.addWidget(item)
-        self.footer = QLabel("")
+        self.footer = Label("")
         self.footer.setProperty("role", "faint")
         self.footer.setContentsMargins(10, 12, 0, 0)
         lay.addWidget(self.footer)
@@ -1599,10 +1613,10 @@ class Page(QWidget):
         self.lay = QVBoxLayout(column)
         self.lay.setContentsMargins(0, 0, 0, 0)
         self.lay.setSpacing(16)
-        t = QLabel(title)
+        t = Label(title)
         t.setProperty("role", "title")
         self.lay.addWidget(t)
-        s = QLabel(subtitle)
+        s = Label(subtitle)
         s.setProperty("role", "subtitle")
         s.setWordWrap(True)
         self.lay.addWidget(s)
@@ -1633,8 +1647,8 @@ def hrow(*widgets, spacing=10, stretch_last=False) -> QHBoxLayout:
     return lay
 
 
-def label(text, role=None, wrap=True) -> QLabel:
-    lab = QLabel(text)
+def label(text, role=None, wrap=True) -> Label:
+    lab = Label(text)
     if role:
         lab.setProperty("role", role)
     lab.setWordWrap(wrap)

@@ -112,18 +112,26 @@ def _read(f, off, n) -> bytes:
     return data
 
 
+# Segments a decoder needs, besides the APPn kept below: SOFn, DHT and DAC (C0-CF),
+# DQT, DNL, DRI, DHP and EXP (DB-DF). Anything else (APPn, COM, JPGn extensions) is dropped.
+JPEG_KEEP = set(range(0xC0, 0xD0)) | set(range(0xDB, 0xE0))
+
+
 def _plan_jpeg(f, size) -> Plan:
     plan: Plan = [(0, 2)]  # SOI
     pos = 2
+    scanned = False
     while pos < size:
         if _read(f, pos, 1) != b"\xff":
             raise ValueError("expected a marker")
         while _read(f, pos + 1, 1) == b"\xff":  # fill bytes
             pos += 1
         marker = _read(f, pos + 1, 1)[0]
-        if marker == 0xD9:                      # EOI: keep the rest (e.g. motion-photo video)
-            plan.append((pos, size - pos))
-            break
+        if marker == 0xD9:
+            # EOI: the image ends here. Whatever follows is dropped: appended previews and
+            # second images carry their own EXIF and GPS, and so can motion-photo video.
+            plan.append((pos, 2))
+            return plan
         if 0xD0 <= marker <= 0xD7 or marker == 0x01:
             plan.append((pos, 2))
             pos += 2
@@ -132,11 +140,17 @@ def _plan_jpeg(f, size) -> Plan:
         if length < 2:
             raise ValueError("bad segment length")
         end = pos + 2 + length
-        if marker == 0xDA:                      # start of scan: image data follows, keep all
-            plan.append((pos, size - pos))
-            break
+        if end > size:
+            raise ValueError("truncated segment")
+        if marker == 0xDA:
+            # Start of scan: keep its header and compressed data. Progressive images have
+            # several scans, with tables (and possibly metadata) between them.
+            scan_end = _scan_end(f, end, size)
+            plan.append((pos, scan_end - pos))
+            pos, scanned = scan_end, True
+            continue
         body = _read(f, pos + 4, min(length - 2, 64 << 10)) if marker in (0xE1, 0xE2) else b""
-        if marker == 0xE1 and body.startswith(b"Exif\x00\x00"):
+        if marker == 0xE1 and body.startswith(b"Exif\x00\x00") and not scanned:
             # Replace the whole EXIF block, in place, by one holding only the orientation.
             orientation = _read_orientation(_read(f, pos + 4, length - 2)[6:])
             if orientation and orientation != 1:
@@ -144,13 +158,31 @@ def _plan_jpeg(f, size) -> Plan:
         keep = (marker == 0xE0                                         # JFIF
                 or (marker == 0xE2 and body.startswith(b"ICC_PROFILE\x00"))  # colour profile
                 or marker == 0xEE                                      # Adobe (colour transform)
-                or not 0xE0 <= marker <= 0xEF and marker != 0xFE)       # not APPn / COM
+                or marker in JPEG_KEEP)
         if keep:
             plan.append((pos, end - pos))
         pos = end
-    else:
+    if not scanned:
         raise ValueError("no image data")
-    return plan
+    return plan  # truncated after its image data: keep what is there, as viewers do
+
+
+def _scan_end(f, pos: int, size: int) -> int:
+    """Offset of the marker that ends the compressed data starting at ``pos``. Inside
+    it, 0xFF is only followed by 0x00 (a stuffed byte), a restart marker (D0-D7) or
+    another 0xFF (fill before a marker)."""
+    while pos < size - 1:
+        f.seek(pos)
+        block = f.read(min(1 << 20, size - pos))
+        i = block.find(b"\xff")
+        while 0 <= i < len(block) - 1:
+            nxt = block[i + 1]
+            if nxt not in (0x00, 0xFF) and not 0xD0 <= nxt <= 0xD7:
+                return pos + i
+            i = block.find(b"\xff", i + 1)
+        # An 0xFF at the very end of the block is examined again with the next byte.
+        pos += len(block) - 1 if i == len(block) - 1 else len(block)
+    return size
 
 
 def _read_orientation(tiff: bytes) -> int | None:

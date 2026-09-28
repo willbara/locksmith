@@ -9,12 +9,14 @@ import math
 import os
 import re
 import secrets
+import stat
 import string
 import threading
 from collections.abc import Callable
 from pathlib import Path
 
 from .errors import CancelledError, LocksmithError
+from .osutil import open_new
 
 
 def same_secret(a: str | bytes, b: str | bytes) -> bool:
@@ -212,10 +214,14 @@ def shamir_combine(texts: list[str]) -> bytes:
         if not m:
             raise LocksmithError("One of the shares is not in the right format.")
         k, x, hexdata, check = int(m[1]), int(m[2]), m[3], m[4]
+        if not (2 <= k <= 255 and 1 <= x <= 255) or len(hexdata) % 2:
+            raise LocksmithError("One of the shares is not in the right format.")
         body = bytes([k, x]) + bytes.fromhex(hexdata)
         if not same_secret(hashlib.sha256(body).hexdigest()[:6], check):
             raise LocksmithError(f"Share #{x} has a typo (checksum mismatch).")
-        threshold = threshold or k
+        if threshold is not None and k != threshold:
+            raise LocksmithError("The shares belong to different secrets.")
+        threshold = k
         points[x] = bytes.fromhex(hexdata)
     if threshold is None:
         raise LocksmithError("Paste at least two shares.")
@@ -257,8 +263,18 @@ def shred(path: Path, passes: int = 1, cancel: threading.Event | None = None):
     if path.is_symlink() or not path.is_file():
         path.unlink(missing_ok=True)
         return
-    size = path.stat().st_size
-    with open(path, "r+b", buffering=0) as f:
+    # O_NOFOLLOW: if the file is swapped for a symlink after the check above, fail
+    # rather than overwrite whatever the link points to.
+    fd = os.open(path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink > 1:
+        os.close(fd)
+        # Overwriting would also destroy the other names; unlinking alone would leave the
+        # data readable through them. Neither is what "shred" promises, so stop.
+        raise LocksmithError(f"{path.name} was not shredded: it has other hard links or is not "
+                             "a regular file. Remove the other links first.")
+    size = st.st_size
+    with os.fdopen(fd, "r+b", buffering=0) as f:
         for _ in range(passes):
             f.seek(0)
             left = size
@@ -284,7 +300,8 @@ def split_file(path: Path, part_size: int, out_dir: Path | None = None) -> list[
         n = 1
         while block := f.read(part_size):
             part = out_dir / f"{path.name}.part{n:03d}"
-            part.write_bytes(block)
+            with os.fdopen(open_new(part), "wb") as out:  # never overwrites or follows a link
+                out.write(block)
             parts.append(part)
             n += 1
     return parts
@@ -309,7 +326,7 @@ def join_parts(parts: list[Path], out_dir: Path | None = None) -> Path:
     out_dir = Path(out_dir) if out_dir else parts[0].parent
     from .engine import unique_path
     target = unique_path(out_dir / base)
-    with open(target, "wb") as out:
+    with os.fdopen(open_new(target), "wb") as out:
         for p in parts:
             with open(p, "rb") as f:
                 while block := f.read(4 << 20):

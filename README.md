@@ -1,5 +1,7 @@
 # Locksmith
 
+![Locksmith's Encrypt page in the dark theme](example.png)
+
 A minimalist black-and-white desktop app to encrypt, decrypt and share files on Linux and Windows.
 Build it yourself as a single AppImage or a single Windows .exe.
 

@@ -7,6 +7,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QFileDialog, QSlider
 
 from ...core import tools
+from ...core.keys import write_secret_file
 from .. import dialogs
 from ..lock import mark_sensitive
 from ..widgets import (
@@ -211,9 +212,7 @@ class ToolsPage(Page):
         path, _ = QFileDialog.getSaveFileName(self, "Save keyfile", "locksmith.key")
         if not path:
             return
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "wb") as f:
-            f.write(os.urandom(self.kf_size.value()))
+        write_secret_file(Path(path), os.urandom(self.kf_size.value()))
         toast("Keyfile created", "key")
 
     # ── shred ──

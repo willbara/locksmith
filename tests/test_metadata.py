@@ -79,13 +79,43 @@ def test_jpeg(tmp_path):
     for s in SECRETS[:4] + [b"MPF-SECRET", b"PRIVATE-SECRET"]:
         assert s not in out, s
     assert b"ICC_PROFILE" in out, "colour profile must be kept"
-    assert out.endswith(b"TRAILER-SECRET-video"), "data after the image (e.g. motion photo) is kept"
+    assert b"TRAILER-SECRET" not in out and out.endswith(b"\xff\xd9"), "nothing after the image is kept"
     sos = jpg.index(b"\xff\xda")
     assert jpg[sos:] in out, "compressed image data must be byte-identical"
     app1 = out.index(b"Exif\x00\x00")
     assert metadata._read_orientation(out[app1 + 6:]) == 6, "orientation must survive"
     assert app1 < out.index(b"\xff\xdb"), "orientation EXIF stays near the start of the file"
     _decode(out)
+
+
+def test_jpeg_appended_image_and_between_scan_metadata_dropped(tmp_path):
+    """An appended second JPEG (MPF, previews, gain maps) carries its own EXIF and GPS;
+    metadata can also sit between the scans of a progressive image."""
+    jpg, _ = _image("JPG")
+    sos = jpg.index(b"\xff\xda")
+    second = jpg[:2] + _seg(0xE1, _exif(1)) + jpg[2:]
+    evil = jpg[:-2] + _seg(0xFE, b"COMMENT-SECRET") + _seg(0xE1, _exif(1)) + jpg[-2:] + second
+    out, _ = _roundtrip(tmp_path, "p.jpg", evil)
+    assert b"GPS-SECRET" not in out and b"COMMENT-SECRET" not in out
+    assert out.count(b"\xff\xd8") == 1 and jpg[sos:-2] in out
+    _decode(out)
+
+
+def test_progressive_jpeg_keeps_every_scan(tmp_path):
+    from PySide6.QtGui import QImageWriter
+    _, img = _image("JPG")
+    buf = QBuffer()
+    buf.open(QIODevice.OpenModeFlag.WriteOnly)
+    w = QImageWriter(buf, b"jpg")
+    w.setProgressiveScanWrite(True)
+    w.setQuality(90)
+    assert w.write(img)
+    jpg = bytes(buf.data())
+    assert jpg.count(b"\xff\xda") > 1, "Qt did not write a progressive JPEG"
+    evil = jpg[:2] + _seg(0xE1, _exif(1)) + jpg[2:] + b"TRAILER-SECRET"
+    out, _ = _roundtrip(tmp_path, "prog.jpg", evil)
+    assert out == jpg, "a clean progressive image must pass through byte-identical"
+    assert _decode(out).pixelColor(10, 10) == _decode(jpg).pixelColor(10, 10)
 
 
 def test_jpeg_without_rotation_gets_no_exif(tmp_path):

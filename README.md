@@ -79,8 +79,11 @@ tests/       tests for core/
   (AES + ChaCha20, AES + ChaCha20 + OCB3) with an independent key per layer.
 - **Key derivation:** Argon2id, scrypt or PBKDF2-SHA512, with four strength presets (Fast → Paranoid).
 - **Protection:** a password, a keyfile (second factor), public keys for any number of recipients, or any
-  combination. Each one wraps the same random file key. New identities are hybrid post-quantum
-  (X25519 + ML-KEM-768); identity keys can be sealed to the machine's TPM.
+  combination. Each one wraps the same random file key.
+- **Keys:** identities (your key pairs) and contacts (other people's public keys). New identities are hybrid
+  post-quantum (X25519 + ML-KEM-768), and older classical ones can be upgraded. An identity can be protected
+  with a passphrase, sealed to the machine's TPM, exported as a backup, and shared as text or a QR code.
+  Recipients stay anonymous: a file doesn't say who it was encrypted for.
 - **Privacy:** optional lossless removal of photo metadata (JPEG, PNG, WebP: location, camera, dates), file
   times and archive owner names.
 - **Extras:** streaming chunked encryption with parallel per-chunk compression (Zstandard, zlib, LZMA,
@@ -90,6 +93,7 @@ tests/       tests for core/
   parts and join them, send encrypted text messages, show a password as a QR code, split a password among
   people with Shamir secret sharing, publish your public key.
 - **Tools:** password and passphrase generator, strength tester, checksums, keyfile generator, shredder.
+- **Interface:** dark, light or system theme, monochrome throughout.
 
 ## File format
 

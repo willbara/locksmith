@@ -297,6 +297,12 @@ def validate_options(opts: EncryptOptions):
     for rpk in opts.recipients:
         if not isinstance(rpk, bytes) or len(rpk) not in (X25519_LEN, X25519_LEN + MLKEM_PUBLIC_LEN):
             raise LocksmithError("A recipient's public key is invalid.")
+    # The reader accepts at most MAX_SLOTS slots: never write a file it would refuse.
+    opts.recipients = list(dict.fromkeys(opts.recipients))  # a repeated key adds nothing
+    slots = len(opts.recipients) + bool(opts.password or opts.keyfile)
+    if slots > MAX_SLOTS:
+        raise LocksmithError(f"A file can have at most {MAX_SLOTS} ways to open it, counting the password "
+                             f"as one. Choose fewer recipients (this needs {slots}).")
 
 
 class _Checker:
@@ -422,7 +428,17 @@ def _build_header(opts: EncryptOptions, meta: dict, chk: _Checker,
         "slots": slots,
         "meta": {"n": _b64(mnonce), "c": _b64(mct)},
     }
-    return json.dumps(header, separators=(",", ":")).encode(), keys
+    raw = json.dumps(header, separators=(",", ":")).encode()
+    # Hold the new header to the reader's rules, so a mismatch between writer and
+    # reader fails here, before anything is written, not when the file is opened.
+    if len(raw) > MAX_HEADER:
+        raise LocksmithError("The note is too long to store in the file. Shorten it and try again.")
+    try:
+        _check_header(json.loads(raw), fmt)
+    except (ValueError, KeyError, TypeError, AttributeError) as e:
+        raise LocksmithError("These settings would make a file that can't be opened. "
+                             "Nothing was written.") from e
+    return raw, keys
 
 
 def _read_header(f: BinaryIO) -> tuple[dict, bytes, Format]:

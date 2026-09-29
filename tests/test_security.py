@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from locksmith.core import compress, engine, kdf, keys, osutil, tools
@@ -326,6 +327,71 @@ def test_invalid_options_rejected_before_writing(tmp_path, bad):
         engine.encrypt_paths([src], tmp_path / "out", opts)
     assert not (tmp_path / "out").exists() or not any((tmp_path / "out").iterdir())
     assert src.read_text() == "data"
+
+
+def _recipients(n: int) -> tuple[list[bytes], list[bytes]]:
+    """n classical key pairs as (private, public) raw bytes."""
+    privs = [X25519PrivateKey.generate() for _ in range(n)]
+    return [p.private_bytes_raw() for p in privs], [p.public_key().public_bytes_raw() for p in privs]
+
+
+def _no_output(folder: Path) -> bool:
+    return not folder.exists() or not any(folder.iterdir())
+
+
+def test_too_many_slots_refused_before_writing(tmp_path):
+    """The reader accepts at most MAX_SLOTS slots, so the writer must never make more."""
+    src = tmp_path / "f.txt"
+    src.write_text("data", encoding="utf-8")
+    privs, pubs = _recipients(engine.MAX_SLOTS)
+    with pytest.raises(LocksmithError, match="64"):
+        engine.encrypt_paths([src], tmp_path / "out", EncryptOptions(password="pw", recipients=pubs, **FAST))
+    assert _no_output(tmp_path / "out")
+    with pytest.raises(LocksmithError):
+        engine.encrypt_bytes(b"x", EncryptOptions(password="pw", recipients=pubs, **FAST))
+
+    # Right at the limit: 63 recipients plus a password, or 64 recipients alone.
+    for i, opts in enumerate((EncryptOptions(password="pw", recipients=pubs[:-1], **FAST),
+                              EncryptOptions(recipients=pubs, **FAST))):
+        enc = engine.encrypt_paths([src], tmp_path / f"ok{i}", opts)
+        assert engine.inspect(enc).recipient_slots == len(opts.recipients)
+        res = engine.decrypt_path(enc, tmp_path / f"dec{i}", DecryptKeys(identities=[privs[-2]]))
+        assert res.path.read_text(encoding="utf-8") == "data"
+
+
+def test_duplicate_recipients_share_one_slot(tmp_path):
+    src = tmp_path / "f.txt"
+    src.write_text("data", encoding="utf-8")
+    privs, pubs = _recipients(2)
+    # Duplicates don't count towards the limit either.
+    opts = EncryptOptions(password="pw", recipients=[pubs[0]] * engine.MAX_SLOTS + [pubs[1]], **FAST)
+    enc = engine.encrypt_paths([src], tmp_path / "out", opts)
+    assert engine.inspect(enc).recipient_slots == 2
+    for priv in privs:
+        assert engine.decrypt_bytes(enc.read_bytes(), DecryptKeys(identities=[priv])).data == b"data"
+
+
+def test_oversized_header_refused_before_writing(tmp_path):
+    """A note that pushes the header past MAX_HEADER would make an unreadable file."""
+    src = tmp_path / "f.txt"
+    src.write_text("data", encoding="utf-8")
+    opts = EncryptOptions(password="pw", note="n" * engine.MAX_HEADER, **FAST)
+    with pytest.raises(LocksmithError, match="note"):
+        engine.encrypt_paths([src], tmp_path / "out", opts)
+    assert _no_output(tmp_path / "out")
+    with pytest.raises(LocksmithError, match="note"):
+        engine.encrypt_bytes(b"x", opts)
+    # A long note that still fits is fine.
+    opts.note = "n" * (engine.MAX_HEADER // 2)
+    enc = engine.encrypt_paths([src], tmp_path / "out", opts)
+    assert engine.decrypt_path(enc, tmp_path / "dec", PW).meta["note"] == opts.note
+
+
+def test_writer_runs_reader_checks_on_its_header(monkeypatch):
+    """Any future mismatch between writer and reader fails before anything is written."""
+    monkeypatch.setattr(engine, "_check_header", lambda h, fmt: (_ for _ in ()).throw(ValueError()))
+    with pytest.raises(LocksmithError):
+        engine.encrypt_bytes(b"x", EncryptOptions(password="pw", **FAST))
 
 
 def test_keyfile_rules(tmp_path):

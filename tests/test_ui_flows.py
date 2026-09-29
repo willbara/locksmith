@@ -150,3 +150,42 @@ def test_sender_text_is_never_rendered_as_html(tmp_path, window, monkeypatch):
     assert all(lab.textFormat() == Qt.TextFormat.PlainText for lab in texts)
     for lab in window.findChildren(QLabel):
         assert lab.textFormat() == Qt.TextFormat.PlainText, lab.text()
+
+
+def test_output_is_durable_before_shred_or_delete(tmp_path, window, monkeypatch):
+    """The output folder is fsynced before any original is shredded or source deleted."""
+    from pathlib import Path
+
+    from locksmith.core import engine, tools
+    events = []
+    monkeypatch.setattr(engine, "fsync_dir", lambda p: events.append(("sync", Path(p))))
+    real_shred, real_unlink = tools.shred, Path.unlink
+    monkeypatch.setattr(tools, "shred", lambda p, **k: (events.append(("shred", p)), real_shred(p, **k))[1])
+
+    def unlink(self, *a, **k):
+        if self.suffix == ".locked":
+            events.append(("delete", self))
+        return real_unlink(self, *a, **k)
+    monkeypatch.setattr(Path, "unlink", unlink)
+
+    e, d = window.encrypt, window.decrypt
+    (tmp_path / "a.txt").write_text("a", encoding="utf-8")
+    e.add_paths([str(tmp_path / "a.txt")])
+    _set_password(e)
+    e.shred.setChecked(True)
+    e.output._dir = str(tmp_path / "enc")
+    e.output._rebuild()
+    e.go.click()
+    wait(lambda: e.task is None)
+    assert events == [("sync", tmp_path / "enc"), ("shred", tmp_path / "a.txt")]
+
+    events.clear()
+    d.add_paths([str(p) for p in (tmp_path / "enc").glob("*.locked")])
+    _set_password(d)
+    d.delete_after.setChecked(True)
+    d.output._dir = str(tmp_path / "dec")
+    d.output._rebuild()
+    d.go.click()
+    wait(lambda: d.task is None)
+    assert [ev[0] for ev in events] == ["sync", "delete"] and events[0][1] == tmp_path / "dec"
+    assert (tmp_path / "dec" / "a.txt").read_text(encoding="utf-8") == "a"

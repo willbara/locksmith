@@ -16,7 +16,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from .errors import CancelledError, LocksmithError
-from .osutil import open_new
+from .osutil import fsync_dir, open_new
 
 
 def same_secret(a: str | bytes, b: str | bytes) -> bool:
@@ -326,9 +326,20 @@ def join_parts(parts: list[Path], out_dir: Path | None = None) -> Path:
     out_dir = Path(out_dir) if out_dir else parts[0].parent
     from .engine import unique_path
     target = unique_path(out_dir / base)
-    with os.fdopen(open_new(target), "wb") as out:
-        for p in parts:
-            with open(p, "rb") as f:
-                while block := f.read(4 << 20):
-                    out.write(block)
+    # Build under a temporary name, so a failed join never leaves a truncated file
+    # under the real name.
+    tmp = out_dir / f".{base}.{secrets.token_hex(4)}.part"
+    try:
+        with os.fdopen(open_new(tmp), "wb") as out:
+            for p in parts:
+                with open(p, "rb") as f:
+                    while block := f.read(4 << 20):
+                        out.write(block)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp, target)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    fsync_dir(out_dir)
     return target

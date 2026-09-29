@@ -447,7 +447,8 @@ class KeyStore:
                 raise ValueError
             if ident.locked is not None and not isinstance(ident.locked, dict):
                 raise ValueError
-        except (KeyError, ValueError, TypeError, AttributeError, LocksmithError, UnicodeDecodeError) as e:
+        except (KeyError, ValueError, TypeError, AttributeError, LocksmithError, UnicodeDecodeError,
+                RecursionError) as e:
             raise LocksmithError("That is not a valid Locksmith identity backup.") from e
         if ident.private:
             ident.private_raw()  # raises if the pair does not match

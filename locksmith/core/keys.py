@@ -24,7 +24,7 @@ import shutil
 import subprocess
 import time
 import unicodedata
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 
 from cryptography.exceptions import InvalidTag
@@ -283,6 +283,12 @@ def _protect(raw: bytes, passphrase: str) -> dict:
     return {"kdf": "argon2id", "p": params, "salt": b64(salt), "n": b64(nonce), "c": b64(ct)}
 
 
+def _assign(target, source):
+    """Copy every dataclass field of ``source`` onto ``target`` in place."""
+    for f in fields(target):
+        setattr(target, f.name, getattr(source, f.name))
+
+
 def _from_dict(cls, data):
     """Build a dataclass from stored JSON, ignoring unknown fields (from newer
     versions) and rejecting entries with missing or mistyped required fields."""
@@ -365,13 +371,21 @@ class KeyStore:
             return ident
         was_locked, was_sealed = ident.is_locked, ident.is_sealed
         raw = ident.private_raw(passphrase) + MLKEM768PrivateKey.generate().private_bytes_raw()
-        ident.public = encode_public(public_from_private(raw))
-        ident.private = ident.locked = ident.sealed = None
-        ident.sealed_locked = False
-        self._store_private(ident, raw, passphrase if was_locked else None)
+        # Build the upgrade on a copy and apply it only once every step has succeeded:
+        # if the TPM refuses the new seal, the identity must not be left holding the
+        # key unsealed, where the next save of anything would write it to disk.
+        new = replace(ident, public=encode_public(public_from_private(raw)),
+                      private=None, locked=None, sealed=None, sealed_locked=False)
+        self._store_private(new, raw, passphrase if was_locked else None)
         if was_sealed:
-            self._seal(ident)
-        self.save()
+            self._seal(new)
+        old = replace(ident)
+        _assign(ident, new)
+        try:
+            self.save()
+        except BaseException:
+            _assign(ident, old)  # the save is atomic, so the file still holds the old identity
+            raise
         return ident
 
     def seal(self, ident: Identity) -> Identity:

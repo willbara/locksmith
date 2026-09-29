@@ -5,6 +5,7 @@ never a crash, a write outside the chosen folder, or partial plaintext on disk.
 """
 
 import base64
+import dataclasses
 import hashlib
 import io
 import json
@@ -522,6 +523,57 @@ def test_damaged_identity_does_not_block_others(tmp_path):
     bad = store.generate("bad")
     bad.private = "!!!"
     assert store.unlocked_private_keys() == [good.private_raw()]
+
+
+def _fake_tpm(monkeypatch):
+    """A reversible stand-in for systemd-creds, so sealing is testable without a TPM."""
+    monkeypatch.setattr(keys, "tpm_seal", lambda data: b"SEALED:" + data)
+    monkeypatch.setattr(keys, "tpm_unseal", lambda blob: blob.removeprefix(b"SEALED:"))
+
+
+def _refuse(*_):
+    raise LocksmithError("The TPM refused the request.")
+
+
+@pytest.mark.parametrize("fail", ["seal", "unseal-check", "save"])
+@pytest.mark.parametrize("passphrase", [None, "pass"])
+def test_failed_upgrade_of_sealed_identity_changes_nothing(tmp_path, monkeypatch, fail, passphrase):
+    """A sealed identity whose upgrade fails must never end up stored unsealed."""
+    _fake_tpm(monkeypatch)
+    store = keys.KeyStore(tmp_path)
+    ident = store.seal(store.generate("me", passphrase=passphrase, post_quantum=False))
+    before = dataclasses.asdict(ident)
+    if fail == "seal":
+        monkeypatch.setattr(keys, "tpm_seal", _refuse)
+    elif fail == "unseal-check":   # the TPM seals, but does not give the same data back
+        monkeypatch.setattr(keys, "tpm_seal", lambda data: b"BROKEN:" + data)
+    else:
+        monkeypatch.setattr(keys, "write_secret_file", lambda *a: _refuse())
+    with pytest.raises(LocksmithError):
+        store.upgrade(ident, passphrase)
+    assert dataclasses.asdict(ident) == before
+    assert ident.sealed and ident.private is None and ident.locked is None and not ident.is_post_quantum
+
+    monkeypatch.undo()
+    _fake_tpm(monkeypatch)
+    store.add_contact("Friend", keys.KeyStore(tmp_path / "f").generate("f").public)
+    reloaded = keys.KeyStore(tmp_path).identities[0]
+    assert dataclasses.asdict(reloaded) == before
+    assert reloaded.private_raw(passphrase)
+
+
+@pytest.mark.parametrize("passphrase", [None, "pass"])
+def test_upgrade_of_sealed_identity_stays_sealed(tmp_path, monkeypatch, passphrase):
+    _fake_tpm(monkeypatch)
+    store = keys.KeyStore(tmp_path)
+    ident = store.seal(store.generate("me", passphrase=passphrase, post_quantum=False))
+    x25519 = ident.private_raw(passphrase)
+    store.upgrade(ident, passphrase)
+    reloaded = keys.KeyStore(tmp_path).identities[0]
+    assert dataclasses.asdict(reloaded) == dataclasses.asdict(ident)
+    assert reloaded.sealed and reloaded.private is None and reloaded.locked is None
+    assert reloaded.is_post_quantum and reloaded.is_locked == bool(passphrase)
+    assert reloaded.private_raw(passphrase)[:32] == x25519
 
 
 @pytest.mark.parametrize("raw", [bytes(32), b"\x01" + bytes(31),

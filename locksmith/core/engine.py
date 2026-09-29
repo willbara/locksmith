@@ -56,7 +56,7 @@ from . import kdf as kdfmod
 from . import metadata
 from .ciphers import NONCE_SIZE, SUITES, SuiteCipher, layer_key_sizes
 from .errors import CancelledError, CorruptedError, LocksmithError, WrongKeyError
-from .osutil import IS_WINDOWS, copy_zone_identifier, open_new, portable_name, windows_unsafe
+from .osutil import IS_WINDOWS, copy_zone_identifier, fsync_dir, open_new, portable_name, windows_unsafe
 
 
 @dataclass(frozen=True)
@@ -446,7 +446,8 @@ def _read_header(f: BinaryIO) -> tuple[dict, bytes, Format]:
         _check_header(header, fmt)
     except CorruptedError:
         raise
-    except (ValueError, KeyError, TypeError, AttributeError) as e:
+    except (ValueError, KeyError, TypeError, AttributeError, RecursionError) as e:
+        # RecursionError: deeply nested JSON, such as a header of 200,000 "[".
         raise CorruptedError("The file header is damaged.") from e
     return header, raw, fmt
 
@@ -606,7 +607,7 @@ def _read_meta(header: dict, keys: _Keys) -> dict:
         meta = json.loads(plain)
         if not isinstance(meta, dict):
             raise ValueError
-    except (InvalidTag, KeyError, ValueError) as e:
+    except (InvalidTag, KeyError, ValueError, RecursionError) as e:
         raise CorruptedError("The encrypted metadata is damaged.") from e
     return {k: v for k, v in meta.items()
             if k not in _META_TYPES or (isinstance(v, _META_TYPES[k]) and not isinstance(v, bool))}
@@ -744,7 +745,7 @@ def _decrypt_stream(f: BinaryIO, total: int, header: dict, raw_header: bytes,
     threads = auto_threads(threads)
     batch = max(1, min(threads * 2, (256 << 20) // chunk))
 
-    def open_frame(item) -> bytes:
+    def open_frame(item) -> tuple[int, bytes]:
         idx, ct, final = item
         if idx >= MAX_FRAMES:
             raise CorruptedError("The file has too many chunks.")
@@ -757,18 +758,22 @@ def _decrypt_stream(f: BinaryIO, total: int, header: dict, raw_header: bytes,
         if len(frame) < FRAME_HDR.size:
             raise CorruptedError("A chunk is malformed.")
         kind, n = FRAME_HDR.unpack_from(frame)
-        block = frame[FRAME_HDR.size:FRAME_HDR.size + n]
-        if len(block) != n:
+        end = FRAME_HDR.size + n
+        block = frame[FRAME_HDR.size:end]
+        # Everything after the block is padding and must be zero; a padding frame
+        # carries no block. The writer never does otherwise, so reject any other layout.
+        if len(block) != n or frame.count(0, end) != len(frame) - end or (kind == KIND_PAD and n):
             raise CorruptedError("A chunk is malformed.")
         if kind == KIND_COMPRESSED:
             if codec is None:
                 raise CorruptedError("Unknown compression method.")
-            return codec.decompress(block, chunk)
+            return kind, codec.decompress(block, chunk)
         if kind in (KIND_RAW, KIND_PAD):
-            return block
+            return kind, block
         raise CorruptedError("A chunk is malformed.")
 
     index = 0
+    padding = False     # padding frames come only after the last data frame
     started = time.monotonic()
     it = _frames(f, limit)
     with ThreadPoolExecutor(threads) as pool:
@@ -781,8 +786,13 @@ def _decrypt_stream(f: BinaryIO, total: int, header: dict, raw_header: bytes,
                     break
             if not items:
                 break
-            for plain in pool.map(open_frame, items):
-                out.write(plain)
+            for kind, plain in pool.map(open_frame, items):
+                if kind == KIND_PAD:
+                    padding = True
+                elif padding:
+                    raise CorruptedError("A chunk is malformed.")
+                else:
+                    out.write(plain)
             index += len(items)
             pos = f.tell() if f.seekable() else 0
             rate = pos / max(time.monotonic() - started, 1e-6)
@@ -989,6 +999,7 @@ def encrypt_paths(paths: list[Path], out_dir: Path | None, opts: EncryptOptions,
             _verify_written(tmp, header, keys, meta, opts.threads, chk)
         chk.report(1.0, "Done")
         os.replace(tmp, target)
+        fsync_dir(out_dir)  # callers may shred the originals as soon as this returns
         os.chmod(target, 0o644)  # ciphertext is safe to share
     except BaseException:
         tmp.unlink(missing_ok=True)
@@ -1117,6 +1128,7 @@ def decrypt_path(path: Path, out_dir: Path | None, keys: DecryptKeys, threads: i
                         os.utime(target, (time.time(), mtime))
                     except (OverflowError, OSError, ValueError):
                         pass
+            fsync_dir(out_dir)  # callers may delete the source as soon as this returns
         except BaseException:
             tmp.unlink(missing_ok=True)
             raise

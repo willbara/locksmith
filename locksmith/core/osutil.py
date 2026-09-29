@@ -71,13 +71,14 @@ def config_base() -> Path:
 
 
 _WINDOWS_BAD_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-_WINDOWS_RESERVED = re.compile(r"^(con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³])(\..*)?$", re.IGNORECASE)
+_WINDOWS_RESERVED = re.compile(r"^(con|conin\$|conout\$|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³])(\..*)?$",
+                                re.IGNORECASE)
 
 
 def windows_unsafe(name: str) -> bool:
     """True if a single path component cannot be created safely on Windows.
     A colon would write into an NTFS alternate data stream; reserved device names
-    (CON, NUL, COM1...) and trailing dots or spaces are invalid or ambiguous."""
+    (CON, CONIN$, NUL, COM1...) and trailing dots or spaces are invalid or ambiguous."""
     return bool(_WINDOWS_BAD_CHARS.search(name) or _WINDOWS_RESERVED.match(name)
                 or name.endswith((".", " ")))
 

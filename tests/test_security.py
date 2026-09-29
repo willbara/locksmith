@@ -18,8 +18,9 @@ import time
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from locksmith.core import compress, engine, kdf, keys, tools
+from locksmith.core import compress, engine, kdf, keys, osutil, tools
 from locksmith.core.engine import DecryptKeys, EncryptOptions
 from locksmith.core.errors import CorruptedError, LocksmithError, WrongKeyError
 
@@ -154,11 +155,17 @@ def test_armored_garbage(tmp_path):
 
 # ── malicious sender (holds a valid key, crafts the plaintext) ───────────────
 
-def _forge(tmp_path, frames: list[bytes], meta: dict, chunk=4096) -> Path:
-    """Build a correctly encrypted file whose frames and metadata we choose."""
+def _forge(tmp_path, frames: list[bytes], meta: dict, chunk=4096, meta_raw: bytes | None = None) -> Path:
+    """Build a correctly encrypted file whose frames and metadata we choose.
+    ``meta_raw`` replaces the encrypted metadata with arbitrary bytes."""
     opts = EncryptOptions(password="pw", chunk_size=chunk, **FAST)
     header, k = engine._build_header(opts, meta, engine._Checker(None, None))
     h = json.loads(header)
+    if meta_raw is not None:
+        n = os.urandom(12)
+        c = AESGCM(k.meta_key).encrypt(n, meta_raw, k.fmt.label + b"meta")
+        h["meta"] = {"n": base64.b64encode(n).decode(), "c": base64.b64encode(c).decode()}
+        header = json.dumps(h, separators=(",", ":")).encode()
     prefix = base64.b64decode(h["np"])
     aad = hashlib.sha256(header).digest()
     out = io.BytesIO()
@@ -190,6 +197,51 @@ def test_decompression_bomb_rejected(tmp_path, codec):
 def test_malformed_frames(tmp_path, frame):
     evil = _forge(tmp_path, [frame], {"name": "x", "kind": "file", "comp": "zlib"})
     _assert_rejected(tmp_path, evil.read_bytes())
+
+
+PAD0 = engine.FRAME_HDR.pack(engine.KIND_PAD, 0)
+
+
+@pytest.mark.parametrize("frames", [
+    [_frame(engine.KIND_RAW, b"data"), _frame(engine.KIND_PAD, b"hidden")],     # pad frame carrying data
+    [_frame(engine.KIND_PAD, b"hidden")],
+    [_frame(engine.KIND_RAW, b"data") + b"\x00\x00\x01"],                         # non-zero padding bytes
+    [_frame(engine.KIND_RAW, b"data"), PAD0 + bytes(8) + b"\xff"],
+    [_frame(engine.KIND_RAW, b"a"), PAD0 + bytes(16), _frame(engine.KIND_RAW, b"b")],  # data after padding
+    [_frame(engine.KIND_RAW, b"a"), PAD0, PAD0, _frame(engine.KIND_RAW, b"")],
+], ids=["pad-with-data", "only-pad-with-data", "nonzero-tail", "nonzero-pad", "data-after-pad",
+        "empty-data-after-pad"])
+def test_padding_is_validated(tmp_path, frames):
+    evil = _forge(tmp_path, frames, {"name": "x", "kind": "file", "comp": "none"})
+    _assert_rejected(tmp_path, evil.read_bytes())
+
+
+def test_valid_padding_is_accepted(tmp_path):
+    ok = _forge(tmp_path, [_frame(engine.KIND_RAW, b"da"), _frame(engine.KIND_RAW, b"ta") + bytes(100),
+                           PAD0 + bytes(4000), PAD0],
+                {"name": "x", "kind": "file", "comp": "none"})
+    assert engine.decrypt_path(ok, tmp_path / "out", PW).path.read_bytes() == b"data"
+
+
+@pytest.mark.parametrize("pad", list(engine.PADDING))
+def test_every_padding_mode_decrypts_with_many_pad_frames(tmp_path, pad):
+    data = os.urandom(5000)
+    enc = _encrypt(tmp_path, data, chunk_size=engine.MIN_CHUNK, padding=pad)
+    assert engine.decrypt_path(enc, tmp_path / "out", PW).path.read_bytes() == data
+
+
+def test_deeply_nested_header_is_reported_as_damage():
+    raw = b"[" * 200_000
+    with pytest.raises(CorruptedError):
+        engine.inspect_bytes(engine.MAGIC + struct.pack(">I", len(raw)) + raw)
+
+
+def test_deeply_nested_metadata_is_reported_as_damage(tmp_path):
+    evil = _forge(tmp_path, [_frame(engine.KIND_RAW, b"x")], {}, meta_raw=b"[" * 200_000)
+    with pytest.raises(CorruptedError):
+        engine.decrypt_path(evil, tmp_path / "out", PW)
+    with pytest.raises(CorruptedError):
+        engine.decrypt_bytes(evil.read_bytes(), PW)
 
 
 @pytest.mark.parametrize("name", ["../../escape.txt", "/etc/passwd", "..", ".", "", "a/../../b",
@@ -441,7 +493,8 @@ def test_import_rejects_mismatched_keypair(tmp_path):
 
 @pytest.mark.parametrize("content", ["{}", "[]", '{"locksmith-identity": 1}', '{"locksmith-identity": 2}',
                                      "garbage", '{"locksmith-identity": 1, "name": "x", "public": "locksmith1AAAA",'
-                                     ' "created": 0}'])
+                                     ' "created": 0}',
+                                     pytest.param("[" * 200_000, id="deeply-nested")])
 def test_import_garbage(tmp_path, content):
     f = tmp_path / "b.json"
     f.write_text(content)
@@ -569,6 +622,59 @@ def test_join_parts_edge_cases(tmp_path):
             tools.join_parts(paths)
 
 
+def _parts(tmp_path, data: bytes) -> list[Path]:
+    (tmp_path / "big.bin").write_bytes(data)
+    (tmp_path / "parts").mkdir()
+    return tools.split_file(tmp_path / "big.bin", 4000, tmp_path / "parts")
+
+
+def test_failed_join_leaves_no_output(tmp_path, monkeypatch):
+    parts = _parts(tmp_path, os.urandom(10_000))
+    real_open = open
+
+    def failing_open(path, *a, **k):
+        if Path(path) == parts[1]:
+            raise OSError(5, "Input/output error")
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr("builtins.open", failing_open)
+    out = tmp_path / "joined"
+    out.mkdir()
+    with pytest.raises(OSError):
+        tools.join_parts(parts, out)
+    assert list(out.iterdir()) == []
+
+
+def test_join_is_made_durable(tmp_path, monkeypatch):
+    data = os.urandom(10_000)
+    parts = _parts(tmp_path, data)
+    synced = []
+    monkeypatch.setattr(tools, "fsync_dir", synced.append)
+    target = tools.join_parts(parts, tmp_path / "parts")
+    assert target.read_bytes() == data and synced == [tmp_path / "parts"]
+    assert sorted(p.name for p in (tmp_path / "parts").iterdir()) == sorted(
+        [target.name, *(p.name for p in parts)])
+
+
+@pytest.mark.parametrize("kind", ["file", "dir", "bundle"])
+def test_output_folder_synced_before_returning(tmp_path, monkeypatch, kind):
+    """Callers shred originals or delete the source as soon as these return, so the
+    rename into the output folder must already be durable."""
+    synced = []
+    monkeypatch.setattr(engine, "fsync_dir", lambda p: synced.append(Path(p)))
+    src = tmp_path / "src"
+    (src / "folder").mkdir(parents=True)
+    (src / "folder" / "a.txt").write_text("a", encoding="utf-8")
+    (src / "b.txt").write_text("b", encoding="utf-8")
+    paths = {"file": [src / "b.txt"], "dir": [src / "folder"], "bundle": [src / "folder", src / "b.txt"]}[kind]
+    opts = EncryptOptions(password="pw", **FAST)
+    enc = engine.encrypt_paths(paths, tmp_path / "enc", opts)
+    assert synced == [tmp_path / "enc"]
+    synced.clear()
+    res = engine.decrypt_path(enc, tmp_path / "dec", PW)
+    assert synced == [tmp_path / "dec"] and res.path.parent == tmp_path / "dec"
+
+
 def test_password_generator_properties():
     for length in (1, 2, 3, 4, 8, 64):
         pw = tools.generate_password(length)
@@ -631,7 +737,6 @@ def test_windows_hardening_reports_only_verified_protection():
 def test_windows_file_names(monkeypatch, tmp_path):
     """Received names that Windows cannot create safely are sanitised, and such
     archive entries are skipped (checked on every platform by simulating Windows)."""
-    from locksmith.core import osutil
     monkeypatch.setattr(osutil, "IS_WINDOWS", True)
     monkeypatch.setattr(engine, "IS_WINDOWS", True)
     for bad, good in (("report:secret.txt", "report_secret.txt"), ("CON", "_CON"), ("nul.txt", "_nul.txt"),
@@ -650,6 +755,25 @@ def test_windows_file_names(monkeypatch, tmp_path):
     skipped = engine.extract_archive(archive, tmp_path / "out")
     assert sorted(skipped) == ["folder/CON", "folder/aux.txt", "folder/stream:hidden"]
     assert (tmp_path / "out" / "folder" / "ok.txt").read_bytes() == b"hi"
+
+
+def test_console_device_names_are_reserved(monkeypatch):
+    """CONIN$ and CONOUT$ are console devices on Windows, like CON."""
+    for name in ("CONIN$", "conout$.txt", "Conin$.log"):
+        assert osutil.windows_unsafe(name), name
+    assert not osutil.windows_unsafe("conin.txt") and not osutil.windows_unsafe("console$")
+    monkeypatch.setattr(osutil, "IS_WINDOWS", True)
+    assert engine.safe_name("CONIN$") == "_CONIN$"
+    assert engine.safe_name("conout$.txt") == "_conout$.txt"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="real Windows file names")
+def test_console_device_names_safe_on_windows(tmp_path):
+    for name in ("CONIN$", "CONOUT$"):
+        safe = engine.safe_name(name)
+        assert not osutil.windows_unsafe(safe)
+        (tmp_path / safe).write_bytes(b"x")
+        assert (tmp_path / safe).read_bytes() == b"x"
 
 
 # ── abuse by a sender: names, metadata and archive layout ────────────────────

@@ -875,6 +875,68 @@ def test_windows_file_names(monkeypatch, tmp_path):
     assert (tmp_path / "out" / "folder" / "ok.txt").read_bytes() == b"hi"
 
 
+def _tar(tmp_path, entries: list[tuple[str, bytes | None]], links: dict[str, str] | None = None) -> Path:
+    """A tar of files (bytes), folders (None) and symlinks (``links``: name -> target)."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        for name, data in entries:
+            info = tarfile.TarInfo(name)
+            if name in (links or {}):
+                info.type, info.linkname = tarfile.SYMTYPE, links[name]
+                tar.addfile(info)
+            elif data is None:
+                info.type, info.mode = tarfile.DIRTYPE, 0o755
+                tar.addfile(info)
+            else:
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+    archive = tmp_path / "a.tar"
+    archive.write_bytes(buf.getvalue())
+    return archive
+
+
+def test_names_differing_in_case_never_overwrite_on_windows(tmp_path, monkeypatch):
+    """Notes.txt and notes.txt are one file on Windows: the first is kept and the second reported.
+    Simulated here on every platform, and real under the Windows test run."""
+    monkeypatch.setattr(osutil, "IS_WINDOWS", True)
+    monkeypatch.setattr(engine, "IS_WINDOWS", True)
+    archive = _tar(tmp_path, [("folder/Notes.txt", b"first"), ("folder/notes.txt", b"second"),
+                              ("folder/NOTES.TXT", b"third"), ("folder/other.txt", b"other")])
+    skipped = engine.extract_archive(archive, tmp_path / "out")
+    assert skipped == ["folder/notes.txt", "folder/NOTES.TXT"]
+    assert (tmp_path / "out" / "folder" / "Notes.txt").read_bytes() == b"first"
+    assert sorted(p.name for p in (tmp_path / "out" / "folder").iterdir()) == ["Notes.txt", "other.txt"]
+
+
+def test_exact_duplicate_names_never_overwrite(tmp_path):
+    archive = _tar(tmp_path, [("a.txt", b"first"), ("dir", None), ("dir/b.txt", b"b"), ("a.txt", b"second"),
+                              ("dir/b.txt", b"again")])
+    skipped = engine.extract_archive(archive, tmp_path / "out")
+    assert skipped == ["a.txt", "dir/b.txt"]
+    assert (tmp_path / "out" / "a.txt").read_bytes() == b"first"
+    assert (tmp_path / "out" / "dir" / "b.txt").read_bytes() == b"b"
+
+
+def test_repeated_folders_merge_without_being_reported(tmp_path, monkeypatch):
+    """A folder listed twice (or, on Windows, as Docs and docs) overwrites nothing."""
+    archive = _tar(tmp_path, [("d", None), ("d/x.txt", b"x"), ("d", None), ("d/y.txt", b"y"),
+                              ("Docs/a.txt", b"a"), ("docs/b.txt", b"b")])
+    assert engine.extract_archive(archive, tmp_path / "out") == []
+    monkeypatch.setattr(engine, "IS_WINDOWS", True)
+    assert engine.extract_archive(archive, tmp_path / "out-win") == []
+    assert (tmp_path / "out-win" / "d" / "x.txt").read_bytes() == b"x"
+
+
+def test_folder_link_cannot_reach_an_earlier_file(tmp_path, needs_symlinks):
+    """alias -> real, then alias/x.txt, would overwrite real/x.txt through the link."""
+    archive = _tar(tmp_path, [("real/x.txt", b"first"), ("alias", None), ("alias/x.txt", b"second"),
+                              ("alias/new.txt", b"new")], links={"alias": "real"})
+    skipped = engine.extract_archive(archive, tmp_path / "out")
+    assert skipped == ["alias/x.txt"]
+    assert (tmp_path / "out" / "real" / "x.txt").read_bytes() == b"first"
+    assert (tmp_path / "out" / "real" / "new.txt").read_bytes() == b"new"
+
+
 def test_console_device_names_are_reserved(monkeypatch):
     """CONIN$ and CONOUT$ are console devices on Windows, like CON."""
     for name in ("CONIN$", "conout$.txt", "Conin$.log"):

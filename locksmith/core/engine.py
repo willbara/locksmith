@@ -1179,23 +1179,44 @@ def safe_name(name) -> str:
     return name if name not in ("", ".", "..") else "decrypted"
 
 
+def _extracted_key(dest: str, name: str) -> str:
+    """Identify the file an archive member would be written to. The folder part is
+    resolved as it stands on disk, so a path through an extracted folder link matches
+    the real path; Windows compares names without case."""
+    parent, leaf = os.path.split(os.path.normpath(name))
+    key = os.path.join(os.path.realpath(os.path.join(dest, parent)), leaf)
+    return key.casefold() if IS_WINDOWS else key
+
+
 def extract_archive(archive: Path, dest: Path) -> list[str]:
     """Extract with the tarfile "data" filter. Members the filter rejects (such as
     links pointing outside the folder, or device files) are skipped and reported
     instead of aborting, so one odd entry cannot make a whole folder unrecoverable."""
     skipped: list[str] = []
+    extracted: dict[str, bool] = {}  # _extracted_key -> is a folder
 
     def keep_safe(member, path):
+        name = member.name
         # On Windows, a name such as "a:b" would write into an NTFS alternate data
         # stream and "CON" is a device: skip anything Windows cannot create safely.
-        if IS_WINDOWS and any(windows_unsafe(part) for part in member.name.split("/") if part):
-            skipped.append(member.name)
+        if IS_WINDOWS and any(windows_unsafe(part) for part in name.split("/") if part):
+            skipped.append(name)
             return None
         try:
-            return tarfile.data_filter(member, path)
+            member = tarfile.data_filter(member, path)
         except tarfile.FilterError:
-            skipped.append(member.name)
+            skipped.append(name)
             return None
+        # A later member must never replace an earlier one: an exact duplicate, a name
+        # differing only in case on Windows (Notes.txt, notes.txt), or a path through a
+        # folder link. The first is kept and the collision reported. A folder listed
+        # twice just merges, overwriting nothing.
+        key = _extracted_key(path, member.name)
+        if key in extracted and not (extracted[key] and member.isdir()):
+            skipped.append(name)
+            return None
+        extracted[key] = member.isdir()
+        return member
 
     dest.mkdir(mode=0o700, parents=True, exist_ok=False)
     try:

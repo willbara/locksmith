@@ -1038,6 +1038,45 @@ def test_shares_with_different_thresholds_rejected():
         tools.shamir_combine([a[0], b[1], b[2]])
 
 
+def test_shares_from_same_length_secrets_rejected():
+    a = tools.shamir_split(b"secret A", 2, 3)
+    b = tools.shamir_split(b"secret B", 2, 3)
+    with pytest.raises(LocksmithError, match="different secrets"):
+        tools.shamir_combine([a[0], b[1]])
+
+
+def _reshare(share, data):
+    """Replace a v2 share's data and recompute its typo check, as a deliberate forger would."""
+    _, k, x, split_id, _, _ = share.split("-")
+    body = bytes([int(k), int(x)]) + bytes.fromhex(split_id) + data
+    return f"locksmithshare2-{k}-{x}-{split_id}-{data.hex()}-{hashlib.sha256(body).hexdigest()[:6]}"
+
+
+def test_altered_share_with_valid_checksum_rejected():
+    shares = tools.shamir_split(b"s3cret", 2, 3)
+    data = bytearray.fromhex(shares[1].split("-")[4])
+    data[0] ^= 1
+    forged = _reshare(shares[1], bytes(data))
+    with pytest.raises(LocksmithError, match="fit together"):
+        tools.shamir_combine([shares[0], forged])
+    # With an extra share, the disagreement is caught even before the tag check.
+    with pytest.raises(LocksmithError, match="fit together"):
+        tools.shamir_combine([shares[0], shares[2], forged])
+    with pytest.raises(LocksmithError, match="twice"):
+        tools.shamir_combine([shares[0], shares[1], forged])
+    assert tools.shamir_combine([shares[2], shares[0], shares[1]]) == b"s3cret"
+
+
+def test_old_format_shares_still_combine():
+    old = ["locksmithshare-2-1-60714d9e165fd1a51310-bf5073",
+           "locksmithshare-2-2-71563647b9111cc789bc-bd2f36",
+           "locksmithshare-2-3-7e4b1ff9dc2bae10ffd8-56887e"]
+    assert tools.shamir_combine(old[1:]) == b"old secret"
+    assert tools.shamir_combine(old) == b"old secret"
+    with pytest.raises(LocksmithError, match="different secrets"):
+        tools.shamir_combine([old[0], tools.shamir_split(b"old secret", 2, 3)[1]])
+
+
 def test_shred_refuses_hard_linked_file(tmp_path):
     f = tmp_path / "a"
     f.write_bytes(b"plain")

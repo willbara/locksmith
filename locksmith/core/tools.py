@@ -183,12 +183,44 @@ def _div(a, b):
     return 0 if a == 0 else _EXP[(_LOG[a] - _LOG[b]) % 255]
 
 
+# Share text formats. Both end in a 6-hex-digit typo check over the share's fields.
+#   locksmithshare-<k>-<x>-<data>-<check>          v1, still read
+#   locksmithshare2-<k>-<x>-<id>-<data>-<check>    v2, written
+# v2 adds a random split ID shared by every share of one split, and splits the secret
+# followed by a tag (a hash of the ID and secret), so mixed or altered shares are caught.
+_SHARE_V1 = re.compile(r"locksmithshare-(\d+)-(\d+)-()([0-9a-f]+)-([0-9a-f]{6})")
+_SHARE_V2 = re.compile(r"locksmithshare2-(\d+)-(\d+)-([0-9a-f]{8})-([0-9a-f]+)-([0-9a-f]{6})")
+_SPLIT_ID = 4
+_TAG = 8
+
+
+def _share_tag(split_id: bytes, secret: bytes) -> bytes:
+    return hashlib.sha256(b"locksmith/share/v2" + split_id + secret).digest()[:_TAG]
+
+
+def _interpolate(points: dict[int, bytes], xs: list[int], at: int) -> bytes:
+    """Evaluate, at x = `at`, the polynomials through the shares at `xs` (one per byte)."""
+    out = bytearray(len(points[xs[0]]))
+    for xj in xs:
+        num, den = 1, 1
+        for xm in xs:
+            if xm != xj:
+                num = _mul(num, at ^ xm)
+                den = _mul(den, xj ^ xm)
+        weight = _div(num, den)
+        for i, y in enumerate(points[xj]):
+            out[i] ^= _mul(y, weight)
+    return bytes(out)
+
+
 def shamir_split(secret: bytes, threshold: int, shares: int) -> list[str]:
     if not 2 <= threshold <= shares <= 255:
         raise LocksmithError("Need 2 ≤ threshold ≤ shares ≤ 255.")
     if not secret:
         raise LocksmithError("Nothing to split.")
-    coeffs = [[b] + [secrets.randbelow(256) for _ in range(threshold - 1)] for b in secret]
+    split_id = secrets.token_bytes(_SPLIT_ID)
+    data = secret + _share_tag(split_id, secret)
+    coeffs = [[b] + [secrets.randbelow(256) for _ in range(threshold - 1)] for b in data]
     out = []
     for x in range(1, shares + 1):
         ys = bytearray()
@@ -197,52 +229,56 @@ def shamir_split(secret: bytes, threshold: int, shares: int) -> list[str]:
             for c in reversed(poly):  # Horner
                 y = _mul(y, x) ^ c
             ys.append(y)
-        body = bytes([threshold, x]) + bytes(ys)
+        body = bytes([threshold, x]) + split_id + bytes(ys)
         check = hashlib.sha256(body).hexdigest()[:6]
-        out.append(f"locksmithshare-{threshold}-{x}-{body[2:].hex()}-{check}")
+        out.append(f"locksmithshare2-{threshold}-{x}-{split_id.hex()}-{ys.hex()}-{check}")
     return out
 
 
 def shamir_combine(texts: list[str]) -> bytes:
-    points = {}
-    threshold = None
+    points: dict[int, bytes] = {}
+    split = None  # (format, threshold, split ID) of the first share; the rest must match
     for text in texts:
         text = text.strip()
         if not text:
             continue
-        m = re.fullmatch(r"locksmithshare-(\d+)-(\d+)-([0-9a-f]+)-([0-9a-f]{6})", text)
+        m = _SHARE_V2.fullmatch(text) or _SHARE_V1.fullmatch(text)
         if not m:
             raise LocksmithError("One of the shares is not in the right format.")
-        k, x, hexdata, check = int(m[1]), int(m[2]), m[3], m[4]
+        k, x, split_id, hexdata, check = int(m[1]), int(m[2]), bytes.fromhex(m[3]), m[4], m[5]
         if not (2 <= k <= 255 and 1 <= x <= 255) or len(hexdata) % 2:
             raise LocksmithError("One of the shares is not in the right format.")
-        body = bytes([k, x]) + bytes.fromhex(hexdata)
-        if not same_secret(hashlib.sha256(body).hexdigest()[:6], check):
+        data = bytes.fromhex(hexdata)
+        if not same_secret(hashlib.sha256(bytes([k, x]) + split_id + data).hexdigest()[:6], check):
             raise LocksmithError(f"Share #{x} has a typo (checksum mismatch).")
-        if threshold is not None and k != threshold:
+        if split is not None and (m.re, k, split_id) != split:
             raise LocksmithError("The shares belong to different secrets.")
-        threshold = k
-        points[x] = bytes.fromhex(hexdata)
-    if threshold is None:
+        split = (m.re, k, split_id)
+        if x in points and not same_secret(points[x], data):
+            raise LocksmithError(f"Share #{x} was given twice with different contents.")
+        points[x] = data
+    if split is None:
         raise LocksmithError("Paste at least two shares.")
+    version, threshold, split_id = split
     if len(points) < threshold:
         raise LocksmithError(f"Need {threshold} different shares, got {len(points)}.")
-    xs = list(points)[:threshold]
-    length = len(points[xs[0]])
-    if any(len(points[x]) != length for x in xs):
+    lengths = {len(d) for d in points.values()}
+    if len(lengths) > 1 or (version is _SHARE_V2 and lengths.pop() <= _TAG):
         raise LocksmithError("The shares belong to different secrets.")
-    secret = bytearray()
-    for i in range(length):
-        acc = 0
-        for xj in xs:
-            num, den = 1, 1
-            for xm in xs:
-                if xm != xj:
-                    num = _mul(num, xm)
-                    den = _mul(den, xm ^ xj)
-            acc ^= _mul(points[xj][i], _div(num, den))
-        secret.append(acc)
-    return bytes(secret)
+    xs = list(points)[:threshold]
+    mismatch = LocksmithError("The shares don't fit together: one is damaged or belongs to a "
+                              "different secret.")
+    # Shares beyond the threshold must lie on the same polynomials.
+    for x in list(points)[threshold:]:
+        if not same_secret(_interpolate(points, xs, x), points[x]):
+            raise mismatch
+    data = _interpolate(points, xs, 0)
+    if version is _SHARE_V1:
+        return data
+    secret, tag = data[:-_TAG], data[-_TAG:]
+    if not same_secret(_share_tag(split_id, secret), tag):
+        raise mismatch
+    return secret
 
 
 # ── shredding ────────────────────────────────────────────────────────────────

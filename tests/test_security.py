@@ -306,6 +306,54 @@ def test_folder_with_absolute_symlink_still_recoverable(tmp_path, needs_symlinks
     assert (res.path / "data.txt").read_text() == "keep me"
     assert (res.path / "rel-link").read_text() == "keep me"
     assert res.skipped == ["proj/abs-link"]
+    assert not res.complete  # the source is the only copy of the skipped link
+
+
+@pytest.mark.parametrize("kind", ["file", "dir", "bundle"])
+def test_decrypt_complete_only_when_restored_and_flushed(tmp_path, monkeypatch, kind):
+    src = tmp_path / "src"
+    (src / "folder" / "sub").mkdir(parents=True)
+    (src / "folder" / "sub" / "a.txt").write_text("a", encoding="utf-8")
+    (src / "b.txt").write_text("b", encoding="utf-8")
+    paths = {"file": [src / "b.txt"], "dir": [src / "folder"], "bundle": [src / "folder", src / "b.txt"]}[kind]
+    enc = engine.encrypt_paths(paths, tmp_path / "enc", EncryptOptions(password="pw", **FAST))
+    assert engine.decrypt_path(enc, tmp_path / "ok", PW).complete
+    monkeypatch.setattr(engine, "fsync_dir", lambda p: False)
+    assert not engine.decrypt_path(enc, tmp_path / "no-dir-sync", PW).complete
+    if kind != "file":
+        monkeypatch.setattr(engine, "fsync_dir", lambda p: True)
+        monkeypatch.setattr(engine, "fsync_tree", lambda p: False)
+        assert not engine.decrypt_path(enc, tmp_path / "no-tree-sync", PW).complete
+
+
+def test_extracted_files_and_folders_are_flushed(tmp_path, monkeypatch):
+    synced = []
+    real_fsync = os.fsync
+    monkeypatch.setattr(os, "fsync", lambda fd: (synced.append(os.fstat(fd).st_ino), real_fsync(fd))[1])
+    archive = _tar(tmp_path, [("d", None), ("d/x.txt", b"x"), ("d/e", None), ("d/e/y.txt", b"y")])
+    out = tmp_path / "out"
+    ext = engine.extract_archive(archive, out)
+    assert ext.flushed and not ext.skipped and not ext.renamed
+    expected = [out, out / "d", out / "d" / "x.txt", out / "d" / "e", out / "d" / "e" / "y.txt"]
+    if osutil.IS_WINDOWS:  # folders can't be fsynced there
+        expected = [p for p in expected if p.is_file()]
+    assert {p.stat().st_ino for p in expected} <= set(synced)
+
+
+def test_members_outside_the_top_folder_block_complete(tmp_path):
+    """A crafted "dir" file with entries beside its top folder: those are discarded, so reported."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        for name in ("folder/a.txt", "stray.txt", "/abs.txt"):
+            info = tarfile.TarInfo(name)
+            info.size = 1
+            tar.addfile(info, io.BytesIO(b"x"))
+    data = buf.getvalue()
+    frames = [_frame(engine.KIND_RAW, data[i:i + 4096]) for i in range(0, len(data), 4096)]
+    evil = _forge(tmp_path, frames, {"name": "folder", "kind": "dir", "comp": "none"})
+    res = engine.decrypt_path(evil, tmp_path / "out", PW)
+    assert (res.path / "a.txt").read_bytes() == b"x"
+    assert "stray.txt" in res.skipped and not res.complete
 
 
 # ── option validation: nothing unreadable may ever be written ────────────────
@@ -870,7 +918,7 @@ def test_windows_file_names(monkeypatch, tmp_path):
             tar.addfile(info, io.BytesIO(b"hi"))
     archive = tmp_path / "a.tar"
     archive.write_bytes(buf.getvalue())
-    skipped = engine.extract_archive(archive, tmp_path / "out")
+    skipped = engine.extract_archive(archive, tmp_path / "out").skipped
     assert sorted(skipped) == ["folder/CON", "folder/aux.txt", "folder/stream:hidden"]
     assert (tmp_path / "out" / "folder" / "ok.txt").read_bytes() == b"hi"
 
@@ -902,7 +950,7 @@ def test_names_differing_in_case_never_overwrite_on_windows(tmp_path, monkeypatc
     monkeypatch.setattr(engine, "IS_WINDOWS", True)
     archive = _tar(tmp_path, [("folder/Notes.txt", b"first"), ("folder/notes.txt", b"second"),
                               ("folder/NOTES.TXT", b"third"), ("folder/other.txt", b"other")])
-    skipped = engine.extract_archive(archive, tmp_path / "out")
+    skipped = engine.extract_archive(archive, tmp_path / "out").skipped
     assert skipped == ["folder/notes.txt", "folder/NOTES.TXT"]
     assert (tmp_path / "out" / "folder" / "Notes.txt").read_bytes() == b"first"
     assert sorted(p.name for p in (tmp_path / "out" / "folder").iterdir()) == ["Notes.txt", "other.txt"]
@@ -911,7 +959,7 @@ def test_names_differing_in_case_never_overwrite_on_windows(tmp_path, monkeypatc
 def test_exact_duplicate_names_never_overwrite(tmp_path):
     archive = _tar(tmp_path, [("a.txt", b"first"), ("dir", None), ("dir/b.txt", b"b"), ("a.txt", b"second"),
                               ("dir/b.txt", b"again")])
-    skipped = engine.extract_archive(archive, tmp_path / "out")
+    skipped = engine.extract_archive(archive, tmp_path / "out").skipped
     assert skipped == ["a.txt", "dir/b.txt"]
     assert (tmp_path / "out" / "a.txt").read_bytes() == b"first"
     assert (tmp_path / "out" / "dir" / "b.txt").read_bytes() == b"b"
@@ -921,9 +969,9 @@ def test_repeated_folders_merge_without_being_reported(tmp_path, monkeypatch):
     """A folder listed twice (or, on Windows, as Docs and docs) overwrites nothing."""
     archive = _tar(tmp_path, [("d", None), ("d/x.txt", b"x"), ("d", None), ("d/y.txt", b"y"),
                               ("Docs/a.txt", b"a"), ("docs/b.txt", b"b")])
-    assert engine.extract_archive(archive, tmp_path / "out") == []
+    assert engine.extract_archive(archive, tmp_path / "out").skipped == []
     monkeypatch.setattr(engine, "IS_WINDOWS", True)
-    assert engine.extract_archive(archive, tmp_path / "out-win") == []
+    assert engine.extract_archive(archive, tmp_path / "out-win").skipped == []
     assert (tmp_path / "out-win" / "d" / "x.txt").read_bytes() == b"x"
 
 
@@ -931,7 +979,7 @@ def test_folder_link_cannot_reach_an_earlier_file(tmp_path, needs_symlinks):
     """alias -> real, then alias/x.txt, would overwrite real/x.txt through the link."""
     archive = _tar(tmp_path, [("real/x.txt", b"first"), ("alias", None), ("alias/x.txt", b"second"),
                               ("alias/new.txt", b"new")], links={"alias": "real"})
-    skipped = engine.extract_archive(archive, tmp_path / "out")
+    skipped = engine.extract_archive(archive, tmp_path / "out").skipped
     assert skipped == ["alias/x.txt"]
     assert (tmp_path / "out" / "real" / "x.txt").read_bytes() == b"first"
     assert (tmp_path / "out" / "real" / "new.txt").read_bytes() == b"new"

@@ -158,7 +158,7 @@ def test_output_is_durable_before_shred_or_delete(tmp_path, window, monkeypatch)
 
     from locksmith.core import engine, tools
     events = []
-    monkeypatch.setattr(engine, "fsync_dir", lambda p: events.append(("sync", Path(p))))
+    monkeypatch.setattr(engine, "fsync_dir", lambda p: events.append(("sync", Path(p))) or True)
     real_shred, real_unlink = tools.shred, Path.unlink
     monkeypatch.setattr(tools, "shred", lambda p, **k: (events.append(("shred", p)), real_shred(p, **k))[1])
 
@@ -189,3 +189,33 @@ def test_output_is_durable_before_shred_or_delete(tmp_path, window, monkeypatch)
     wait(lambda: d.task is None)
     assert [ev[0] for ev in events] == ["sync", "delete"] and events[0][1] == tmp_path / "dec"
     assert (tmp_path / "dec" / "a.txt").read_text(encoding="utf-8") == "a"
+
+
+def test_delete_after_keeps_source_when_items_were_left_out(tmp_path, window, needs_symlinks):
+    """A folder with a link outside it can't be fully restored, so its only copy must survive."""
+    from locksmith.ui.widgets import Label
+    e, d = window.encrypt, window.decrypt
+    src = tmp_path / "proj"
+    src.mkdir()
+    (src / "data.txt").write_text("keep me", encoding="utf-8")
+    (src / "abs-link").symlink_to("/usr/bin")
+    e.add_paths([str(src)])
+    _set_password(e)
+    e.output._dir = str(tmp_path / "enc")
+    e.output._rebuild()
+    e.go.click()
+    wait(lambda: e.task is None)
+    (locked,) = (tmp_path / "enc").glob("*.locked")
+
+    d.add_paths([str(locked)])
+    _set_password(d)
+    d.delete_after.setChecked(True)
+    d.output._dir = str(tmp_path / "dec")
+    d.output._rebuild()
+    d.go.click()
+    wait(lambda: d.task is None)
+    assert locked.exists()
+    assert (tmp_path / "dec" / "proj" / "data.txt").read_text(encoding="utf-8") == "keep me"
+    texts = [lab.text() for lab in d.findChildren(Label)]
+    assert any("proj/abs-link" in t for t in texts)
+    assert any("was not deleted" in t for t in texts)

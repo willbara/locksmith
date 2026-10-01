@@ -56,7 +56,7 @@ from . import kdf as kdfmod
 from . import metadata
 from .ciphers import NONCE_SIZE, SUITES, SuiteCipher, layer_key_sizes
 from .errors import CancelledError, CorruptedError, LocksmithError, WrongKeyError
-from .osutil import IS_WINDOWS, copy_zone_identifier, fsync_dir, open_new, portable_name, windows_unsafe
+from .osutil import IS_WINDOWS, copy_zone_identifier, fsync_dir, fsync_tree, open_new, portable_name, windows_unsafe
 
 
 @dataclass(frozen=True)
@@ -176,6 +176,16 @@ class DecryptResult:
     meta: dict
     data: bytes | None = None
     skipped: list[str] = field(default_factory=list)  # unsafe archive members left out
+    # True only when everything was restored as stored and confirmed on disk, so the
+    # source can be deleted. Anything skipped, renamed or not flushed makes it False.
+    complete: bool = False
+
+
+@dataclass
+class Extraction:
+    skipped: list[str] = field(default_factory=list)  # members left out
+    renamed: list[str] = field(default_factory=list)  # members written under another name
+    flushed: bool = False                             # every file and folder fsynced
 
 
 # ── small helpers ────────────────────────────────────────────────────────────
@@ -1113,6 +1123,7 @@ def decrypt_path(path: Path, out_dir: Path | None, keys: DecryptKeys, threads: i
         name = safe_name(meta.get("name") or path.stem)
         tmp = out_dir / f".locksmith-{secrets.token_hex(6)}.part"
         skipped: list[str] = []
+        complete = True
         try:
             with create_private(tmp) as out:
                 _decrypt_stream(f, total, header, raw, k, meta, out, threads, chk)
@@ -1124,16 +1135,21 @@ def decrypt_path(path: Path, out_dir: Path | None, keys: DecryptKeys, threads: i
                 target = unique_path(out_dir / name)
                 if kind == "dir":
                     staging = out_dir / f".locksmith-{secrets.token_hex(6)}"
-                    skipped = extract_archive(tmp, staging)
+                    ext = extract_archive(tmp, staging)
                     # Unwrap the archive's top-level folder (stored under its original
                     # name, which may differ from the safe one). Only a real folder: a
                     # symlink moved out of staging would resolve against the output folder.
                     inner = next((e for e in staging.iterdir() if safe_name(e.name) == name
                                   and e.is_dir() and not e.is_symlink()), staging)
                     os.replace(inner, target)
+                    # Anything stored beside the top-level folder is discarded: report it.
+                    if staging.exists():
+                        ext.skipped += sorted(e.name for e in staging.iterdir())
                     shutil.rmtree(staging, ignore_errors=True)
                 else:
-                    skipped = extract_archive(tmp, target)
+                    ext = extract_archive(tmp, target)
+                skipped = ext.skipped
+                complete = ext.flushed and not ext.skipped and not ext.renamed
                 tmp.unlink(missing_ok=True)
             else:
                 target = unique_path(out_dir / name)
@@ -1144,13 +1160,14 @@ def decrypt_path(path: Path, out_dir: Path | None, keys: DecryptKeys, threads: i
                         os.utime(target, (time.time(), mtime))
                     except (OverflowError, OSError, ValueError):
                         pass
-            fsync_dir(out_dir)  # callers may delete the source as soon as this returns
+            # Callers may delete the source as soon as this returns.
+            complete = fsync_dir(out_dir) and complete
         except BaseException:
             tmp.unlink(missing_ok=True)
             raise
     copy_zone_identifier(path, target)
     chk.report(1.0, "Done")
-    return DecryptResult(target, meta, skipped=skipped)
+    return DecryptResult(target, meta, skipped=skipped, complete=complete)
 
 
 def decrypt_bytes(blob: bytes, keys: DecryptKeys) -> DecryptResult:
@@ -1188,11 +1205,13 @@ def _extracted_key(dest: str, name: str) -> str:
     return key.casefold() if IS_WINDOWS else key
 
 
-def extract_archive(archive: Path, dest: Path) -> list[str]:
+def extract_archive(archive: Path, dest: Path) -> Extraction:
     """Extract with the tarfile "data" filter. Members the filter rejects (such as
     links pointing outside the folder, or device files) are skipped and reported
-    instead of aborting, so one odd entry cannot make a whole folder unrecoverable."""
-    skipped: list[str] = []
+    instead of aborting, so one odd entry cannot make a whole folder unrecoverable.
+    Everything extracted is then fsynced."""
+    result = Extraction()
+    skipped = result.skipped
     extracted: dict[str, bool] = {}  # _extracted_key -> is a folder
 
     def keep_safe(member, path):
@@ -1216,6 +1235,8 @@ def extract_archive(archive: Path, dest: Path) -> list[str]:
             skipped.append(name)
             return None
         extracted[key] = member.isdir()
+        if member.name != name:  # e.g. a leading "/" stripped
+            result.renamed.append(name)
         return member
 
     dest.mkdir(mode=0o700, parents=True, exist_ok=False)
@@ -1225,7 +1246,8 @@ def extract_archive(archive: Path, dest: Path) -> list[str]:
     except (tarfile.TarError, OSError) as e:
         shutil.rmtree(dest, ignore_errors=True)
         raise LocksmithError(f"Could not unpack the archive: {e}") from e
-    return skipped
+    result.flushed = fsync_tree(dest)
+    return result
 
 
 def verify_path(path: Path, keys: DecryptKeys, threads: int = 0,

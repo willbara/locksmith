@@ -24,11 +24,13 @@ def open_new(path: Path | str, mode: int = 0o600) -> int:
     return os.open(path, NEW_FILE_FLAGS, mode)
 
 
-def fsync_dir(path: Path):
-    """Make a rename in ``path`` durable. Windows has no directory fsync; there the
-    rename itself is journaled by NTFS."""
-    if IS_WINDOWS or not hasattr(os, "O_DIRECTORY"):
-        return
+def fsync_dir(path: Path) -> bool:
+    """Make a rename in ``path`` durable, and say whether that was confirmed. Windows
+    has no directory fsync; there the rename itself is journaled by NTFS."""
+    if IS_WINDOWS:
+        return True
+    if not hasattr(os, "O_DIRECTORY"):
+        return False
     try:
         fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
         try:
@@ -36,7 +38,31 @@ def fsync_dir(path: Path):
         finally:
             os.close(fd)
     except OSError:
-        pass
+        return False
+    return True
+
+
+def fsync_tree(root: Path) -> bool:
+    """Flush every regular file and folder under ``root`` (links are not followed), and
+    say whether all of it was confirmed. Windows can only flush a file opened for writing."""
+    flags = (os.O_RDWR if IS_WINDOWS else os.O_RDONLY) | getattr(os, "O_NOFOLLOW", 0) \
+        | getattr(os, "O_BINARY", 0)
+    ok = True
+    for folder, _, files in os.walk(root):
+        for name in files:
+            path = os.path.join(folder, name)
+            if os.path.islink(path) or not os.path.isfile(path):
+                continue
+            try:
+                fd = os.open(path, flags)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            except OSError:
+                ok = False
+        ok = fsync_dir(Path(folder)) and ok
+    return ok
 
 
 def copy_zone_identifier(source: Path, target: Path):

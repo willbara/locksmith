@@ -223,9 +223,16 @@ class DecryptPage(Page):
                     results.append(self._decrypt_pasted(pasted[p], keys, out_dir))
                 else:
                     r = engine.decrypt_path(Path(p), out_dir, keys, threads, sub, cancel)
-                    results.append(("file", r.path, {**r.meta, "_skipped": r.skipped}))
-                if delete or p in pasted:
-                    Path(p).unlink(missing_ok=True)
+                    meta = {**r.meta, "_skipped": r.skipped}
+                    # The source may be the only copy: delete it only when the core
+                    # confirms everything was restored and is on disk.
+                    if delete and r.complete:
+                        Path(p).unlink(missing_ok=True)
+                    elif delete:
+                        meta["_kept"] = True
+                    results.append(("file", r.path, meta))
+                if p in pasted:
+                    Path(p).unlink(missing_ok=True)  # only a temporary copy of the paste
             return results
 
         self._clear_results()
@@ -272,7 +279,10 @@ class DecryptPage(Page):
             toast(f"All chunks authentic in {len(verified)} file{'s' if len(verified) != 1 else ''}",
                   "shield")
         else:
-            toast(f"Decrypted {len(results)} item{'s' if len(results) != 1 else ''}", "unlock")
+            kept = sum(1 for r in results if r[2].get("_kept"))
+            toast(f"Decrypted {len(results)} item{'s' if len(results) != 1 else ''}"
+                  + (f", kept {kept} encrypted file{'s' if kept != 1 else ''}" if kept else ""),
+                  "alert" if kept else "unlock", 4000 if kept else 3200)
         for kind, value, meta in results:
             self._add_result(kind, value, meta)
 
@@ -329,6 +339,10 @@ class DecryptPage(Page):
             shown = ", ".join(skipped[:5]) + ("…" if len(skipped) > 5 else "")
             card.add(label(f"Left out {len(skipped)} unsafe item{'s' if len(skipped) != 1 else ''} "
                            f"(links pointing outside the folder or device files): {shown}", "caption"))
+        if meta.get("_kept"):
+            why = ("some items were left out" if skipped else
+                   "the decrypted copy could not be confirmed as complete and saved to disk")
+            card.add(label(f"The encrypted file was not deleted because {why}.", "caption"))
         self.result_box.addWidget(card)
         fade_in(card, 300, rise=6)
         if dialogs_needed:

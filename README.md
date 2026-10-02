@@ -72,7 +72,7 @@ locksmith/
   assets/    app icon and bundled Inter font (OFL, see fonts/Inter-LICENSE.txt)
 packaging/   build script, PyInstaller spec, dependency lock, distro tests, .desktop file, MIME type
 tests/       tests, fuzzing (test_fuzz.py) and format test vectors (vectors/)
-docs/        file-format specification and threat model
+docs/        file-format specification
 ```
 
 ## Features

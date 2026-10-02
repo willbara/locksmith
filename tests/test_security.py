@@ -11,6 +11,7 @@ import io
 import json
 import os
 import random
+import shutil
 import stat
 import struct
 import sys
@@ -1243,3 +1244,384 @@ def test_mark_of_the_web_carries_over(tmp_path):
     res = engine.decrypt_path(enc, tmp_path / "dec", PW)
     with open(f"{res.path / 'sub' / 'run.exe'}:Zone.Identifier", "rb") as f:
         assert f.read() == mark
+
+
+# ── damaged config, decrypted permissions, crash leftovers ───────────────────
+
+def test_deeply_nested_key_file_is_backed_up(tmp_path):
+    (tmp_path / "keys.json").write_text("[" * 200_000, encoding="utf-8")
+    store = keys.KeyStore(tmp_path)
+    assert store.problem and store.identities == []
+    assert list(tmp_path.glob("keys.json.unreadable-*"))
+
+
+def test_mistyped_identity_is_kept_and_blocks_nothing(tmp_path):
+    store = keys.KeyStore(tmp_path)
+    good = store.generate("good", post_quantum=False)
+    store.generate("bad", post_quantum=False)
+    data = json.loads((tmp_path / "keys.json").read_text(encoding="utf-8"))
+    data["identities"][1].update(sealed=123, private=None)
+    (tmp_path / "keys.json").write_text(json.dumps(data), encoding="utf-8")
+    store = keys.KeyStore(tmp_path)
+    assert [i.name for i in store.identities] == ["good"] and store.problem
+    assert store.unlocked_private_keys() == [good.private_raw()]
+    store.save()  # the bad entry is written back untouched
+    assert json.loads((tmp_path / "keys.json").read_text(encoding="utf-8"))["identities"][1]["sealed"] == 123
+
+
+def test_share_with_oversized_numbers_is_reported():
+    with pytest.raises(LocksmithError, match="right format"):
+        tools.shamir_combine(["locksmithshare2-" + "9" * 5000 + "-1-00000000-aa-000000"] * 2)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX modes")
+def test_decrypted_folder_is_private(tmp_path):
+    src = tmp_path / "docs"
+    (src / "sub").mkdir(parents=True)
+    (src / "sub" / "a.txt").write_text("secret", encoding="utf-8")
+    (src / "run.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+    for p, mode in ((src, 0o755), (src / "sub", 0o755), (src / "sub" / "a.txt", 0o644), (src / "run.sh", 0o755)):
+        os.chmod(p, mode)
+    out = engine.decrypt_path(engine.encrypt_paths([src], tmp_path / "enc", EncryptOptions(password="pw", **FAST)),
+                              tmp_path / "dec", PW).path
+    modes = {p.relative_to(out).as_posix(): stat.S_IMODE(p.stat().st_mode) for p in [out, *out.rglob("*")]}
+    assert modes == {".": 0o700, "sub": 0o700, "sub/a.txt": 0o600, "run.sh": 0o700}
+
+
+def test_crash_leftovers_are_shredded_on_next_start(tmp_path, monkeypatch):
+    from locksmith.core import scratch
+    monkeypatch.setattr(scratch, "_journal", tmp_path / "scratch.json")
+    left = tmp_path / ".locksmith-0123456789ab.part"
+    staging = tmp_path / ".locksmith-ba9876543210"
+    (staging / "x").mkdir(parents=True)
+    (staging / "x" / "plain.txt").write_text("plain", encoding="utf-8")
+    other = tmp_path / "Documents"
+    other.mkdir()
+    for p in (left, staging, other):
+        scratch._update(lambda entries, p=p: [*entries, str(p)])  # as if a run was killed mid-way
+    left.write_text("plaintext", encoding="utf-8")
+    assert scratch.clean_leftovers() == 2
+    assert not left.exists() and not staging.exists()
+    assert other.exists()  # only Locksmith's own temporary names are ever removed
+    assert not (tmp_path / "scratch.json").exists()
+
+
+def test_decrypt_journals_its_temporary_files(tmp_path, monkeypatch):
+    from locksmith.core import scratch
+    journal = tmp_path / "scratch.json"
+    monkeypatch.setattr(scratch, "_journal", journal)
+    src = tmp_path / "docs"
+    src.mkdir()
+    (src / "a.txt").write_text("a", encoding="utf-8")
+    locked = engine.encrypt_paths([src], tmp_path / "enc", EncryptOptions(password="pw", **FAST))
+    seen = []
+    real = engine.extract_archive
+    monkeypatch.setattr(engine, "extract_archive",
+                        lambda a, d: (seen.append(json.loads(journal.read_text(encoding="utf-8"))), real(a, d))[1])
+    engine.decrypt_path(locked, tmp_path / "dec", PW)
+    assert [Path(p).name for p in seen[0]][0].endswith(".part") and len(seen[0]) == 2
+    assert not journal.exists()  # everything was cleaned up, so nothing is listed
+
+
+# ── archive headers (folder files) ───────────────────────────────────────────
+
+def _bare_header(tmp_path, kind: bytes, size: int) -> Path:
+    """An archive whose first header declares ``size`` bytes of metadata, followed by
+    that many zero bytes (sparse on disk) and an ordinary member."""
+    head = tarfile.TarInfo("x")
+    head.type, head.size = kind, size
+    path = tmp_path / "crafted.tar"
+    with open(path, "wb") as f:
+        f.write(head.tobuf(format=tarfile.GNU_FORMAT))
+        f.truncate(f.tell() + -(-size // 512) * 512)
+        f.seek(0, os.SEEK_END)
+        f.write(tarfile.TarInfo("y").tobuf(format=tarfile.GNU_FORMAT) + bytes(1024))
+    return path
+
+
+@pytest.mark.parametrize("kind", [tarfile.GNUTYPE_LONGNAME, tarfile.GNUTYPE_LONGLINK, tarfile.XHDTYPE,
+                                  tarfile.XGLTYPE])
+def test_oversized_archive_header_rejected_before_reading(tmp_path, kind):
+    import tracemalloc
+    archive = _bare_header(tmp_path, kind, 64 << 20)
+    tracemalloc.start()
+    try:
+        with pytest.raises(CorruptedError, match="oversized header"):
+            engine.extract_archive(archive, tmp_path / "out")
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < 4 << 20
+    assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize("pax", [
+    {"GNU.sparse.major": "1", "GNU.sparse.minor": "0", "GNU.sparse.name": "s", "GNU.sparse.realsize": "9"},
+    {"GNU.sparse.map": "0,5", "GNU.sparse.size": "5"},
+    None,  # the old GNU 'S' member type
+])
+def test_sparse_archive_members_rejected(tmp_path, pax):
+    path = tmp_path / "sparse.tar"
+    if pax is None:
+        path = _bare_header(tmp_path, tarfile.GNUTYPE_SPARSE, 0)
+    else:
+        # Format 1.0 would read as many map numbers as it declares from the member's data.
+        data = b"999999999\n" + b"1\n" * 4096
+        info = tarfile.TarInfo("s")
+        info.size, info.pax_headers = len(data), pax
+        with tarfile.open(path, "w", format=tarfile.PAX_FORMAT) as tar:
+            tar.addfile(info, io.BytesIO(data))
+    with pytest.raises(CorruptedError, match="sparse"):
+        engine.extract_archive(path, tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
+def test_folders_with_long_and_non_ascii_names_still_extract(tmp_path):
+    src = tmp_path / ("folder-" + "d" * 110)
+    deep = src / ("ü" * 60) / ("n" * 120 + ".txt")
+    deep.parent.mkdir(parents=True)
+    deep.write_text("long", encoding="utf-8")
+    locked = engine.encrypt_paths([src], tmp_path / "enc", EncryptOptions(password="pw", **FAST))
+    out = engine.decrypt_path(locked, tmp_path / "dec", PW).path
+    assert (out / deep.relative_to(src)).read_text(encoding="utf-8") == "long"
+
+
+# ── key commitment, decoy slots ──────────────────────────────────────────────
+
+def test_commitment_mismatch_reads_as_wrong_key():
+    """A slot that unwraps to a key failing the commitment counts as not opening."""
+    a = engine.encrypt_bytes(b"a", EncryptOptions(password="pw", **FAST))
+    b = engine.encrypt_bytes(b"b", EncryptOptions(password="other", **FAST))
+    ha, body = _split(a)
+    ha["slots"] = _split(b)[0]["slots"]          # b's slot unwraps b's key, which fails a's commitment
+    with pytest.raises(WrongKeyError, match="Wrong password"):
+        engine.decrypt_bytes(_join(ha, body), DecryptKeys(password="other"))
+
+
+def test_commitment_mismatch_moves_on_to_the_next_slot():
+    a = engine.encrypt_bytes(b"a", EncryptOptions(password="same", **FAST))
+    b = engine.encrypt_bytes(b"b", EncryptOptions(password="same", **FAST))
+    ha, body = _split(a)
+    ha["slots"] = _split(b)[0]["slots"] + ha["slots"]
+    # b's slot opens first but fails the commitment; a's own slot then opens. The header was
+    # changed, so the frames (which authenticate it) are what finally fail.
+    with pytest.raises(CorruptedError, match="Authentication failed at chunk 1"):
+        engine.decrypt_bytes(_join(ha, body), DecryptKeys(password="same"))
+
+
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_decoy_slots_hide_the_recipient_count(hybrid):
+    me = os.urandom(96 if hybrid else 32)
+    pub = keys.public_from_private(me)
+    blob = engine.encrypt_bytes(b"hi", EncryptOptions(recipients=[pub], hide_recipients=True, **FAST))
+    info = engine.inspect_bytes(blob)
+    assert info.recipient_slots == 8 and info.post_quantum_slots == (8 if hybrid else 0)
+    assert engine.decrypt_bytes(blob, DecryptKeys(identities=[me])).data == b"hi"
+    # Decoys look like real slots: same fields, same sizes, a valid ephemeral key.
+    slots = _split(blob)[0]["slots"]
+    assert len({tuple(sorted((k, len(v)) for k, v in s.items())) for s in slots}) == 1
+    assert all(base64.b64decode(s["epk"])[31] < 0x80 for s in slots)
+    stranger = os.urandom(96 if hybrid else 32)
+    with pytest.raises(WrongKeyError):
+        engine.decrypt_bytes(blob, DecryptKeys(identities=[stranger]))
+
+
+def test_decoy_slots_stay_within_the_slot_limit():
+    recipients = [keys.public_from_private(os.urandom(32)) for _ in range(40)]
+    blob = engine.encrypt_bytes(b"x", EncryptOptions(password="pw", recipients=recipients, hide_recipients=True,
+                                                     **FAST))
+    assert len(_split(blob)[0]["slots"]) == engine.MAX_SLOTS
+    assert engine.decrypt_bytes(blob, PW).data == b"x"
+    plain = engine.encrypt_bytes(b"x", EncryptOptions(password="pw", hide_recipients=True, **FAST))
+    assert len(_split(plain)[0]["slots"]) == 1   # no recipients: nothing to hide, no decoys
+
+
+# ── backup words, identity shares ────────────────────────────────────────────
+
+def test_backup_words_catch_typos_and_restore_nothing_else(tmp_path):
+    raw = os.urandom(96)
+    words = keys.backup_words(raw)
+    rng = random.Random(7)
+    for _ in range(200):   # any single changed word is caught by the checksum
+        typo = list(words)
+        i = rng.randrange(len(typo))
+        typo[i] = keys._proquint(rng.randrange(1 << 16))
+        if typo != words:
+            with pytest.raises(LocksmithError):
+                keys.private_from_words(" ".join(typo))
+    for bad in ("", " ".join(words[:-1]), " ".join(words + words[:1]), " ".join(["zzzzz"] * 18)):
+        with pytest.raises(LocksmithError):
+            keys.private_from_words(bad)
+
+
+def test_identity_and_password_shares_dont_mix():
+    raw = os.urandom(32)
+    id_shares = keys.identity_shares(raw, 2, 3)
+    assert keys.is_identity_secret(tools.shamir_combine(id_shares[:2]))
+    with pytest.raises(LocksmithError, match="not an identity"):
+        keys.private_from_shares(tools.shamir_split(b"x" * 36, 2, 3)[:2])
+    with pytest.raises(LocksmithError, match="different secrets"):
+        keys.private_from_shares([id_shares[0], keys.identity_shares(raw, 2, 3)[1]])
+
+
+def test_restore_refuses_duplicates_and_bad_keys(tmp_path):
+    store = keys.KeyStore(tmp_path)
+    ident = store.generate("me")
+    with pytest.raises(LocksmithError, match="already"):
+        store.restore("again", ident.private_raw())
+    with pytest.raises(LocksmithError, match="not a valid private key"):
+        store.restore("bad", b"\x00" * 33)
+    assert len(store.identities) == 1
+
+
+# ── minisign ─────────────────────────────────────────────────────────────────
+
+def _minisign(data: bytes, prehash=True, comment="timestamp:1\tfile:f", key_id=b"\x01" * 8):
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    sk = Ed25519PrivateKey.generate()
+    sig = sk.sign(hashlib.blake2b(data, digest_size=64).digest() if prehash else data)
+    text = (f"untrusted comment: <b>trust me</b>\n{base64.b64encode((b'ED' if prehash else b'Ed') + key_id + sig).decode()}"
+            f"\ntrusted comment: {comment}\n{base64.b64encode(sk.sign(sig + comment.encode())).decode()}\n")
+    pub = base64.b64encode(b"Ed" + key_id + sk.public_key().public_bytes_raw()).decode()
+    return text, pub
+
+
+def test_minisign_rejects_every_kind_of_mismatch(tmp_path):
+    from locksmith.core import minisign
+    f = tmp_path / "f"
+    f.write_bytes(b"release")
+    sig, pub = _minisign(b"release")
+    ok = minisign.verify_file(f, sig, f"untrusted comment: minisign public key\n{pub}\n")
+    assert ok.trusted_comment == "timestamp:1\tfile:f" and "trust me" not in ok.trusted_comment
+    other_sig, other_pub = _minisign(b"release", key_id=b"\x02" * 8)
+    cases = {
+        "different key": (sig, other_pub),
+        "same ID, other key": (sig, _minisign(b"release")[1]),
+        "altered comment": (sig.replace("file:f", "file:g"), pub),
+        "other file": (_minisign(b"other")[0], pub),
+        "unknown algorithm": (sig.replace(sig.splitlines()[1], base64.b64encode(
+            b"XX" + base64.b64decode(sig.splitlines()[1])[2:]).decode()), pub),
+        "not a signature": ("hello", pub),
+    }
+    for name, (s, p) in cases.items():
+        with pytest.raises(LocksmithError):
+            minisign.verify_file(f, s, p)
+        assert name
+
+
+def test_minisign_legacy_signatures_are_capped(tmp_path, monkeypatch):
+    from locksmith.core import minisign
+    f = tmp_path / "f"
+    f.write_bytes(b"x" * 2000)
+    sig, pub = _minisign(b"x" * 2000, prehash=False)
+    assert not minisign.verify_file(f, sig, pub).prehashed
+    monkeypatch.setattr(minisign, "MAX_LEGACY_FILE", 1000)
+    with pytest.raises(LocksmithError, match="old-style"):
+        minisign.verify_file(f, sig, pub)
+
+
+def test_minisign_reads_only_small_regular_files(tmp_path):
+    from locksmith.core import minisign
+    (tmp_path / "big.minisig").write_bytes(b"a" * (minisign.MAX_SIGNATURE_FILE + 1))
+    with pytest.raises(LocksmithError, match="too large"):
+        minisign.read_small(tmp_path / "big.minisig")
+    if hasattr(os, "mkfifo"):
+        os.mkfifo(tmp_path / "pipe")
+        with pytest.raises(LocksmithError, match="not a regular file"):
+            minisign.read_small(tmp_path / "pipe")   # would block forever if opened normally
+
+
+# ── checksum manifests, comparing files ──────────────────────────────────────
+
+def test_manifest_entries_cannot_leave_the_folder(tmp_path, needs_symlinks):
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    (folder / "a.txt").write_text("a", encoding="utf-8")
+    (tmp_path / "secret.txt").write_text("outside", encoding="utf-8")
+    (folder / "link").symlink_to(tmp_path / "secret.txt")
+    digest = hashlib.sha256(b"outside").hexdigest()
+    text = "".join(f"SHA256 ({name}) = {digest}\n" for name in
+                   ("../secret.txt", str(tmp_path / "secret.txt"), "link", "./a.txt", "a.txt/../../secret.txt"))
+    report = tools.verify_manifest(text, folder)
+    assert report.matched == [] and len(report.invalid) == 5 and not report.ok
+
+
+def test_manifest_reports_every_difference(tmp_path):
+    folder = tmp_path / "folder"
+    (folder / "sub").mkdir(parents=True)
+    for name in ("a.txt", "sub/b.txt", "c.txt"):
+        (folder / name).write_text(name, encoding="utf-8")
+    manifest = tools.make_manifest(folder, "blake2b")
+    assert tools.verify_manifest(manifest, folder).ok
+    (folder / "a.txt").write_text("changed", encoding="utf-8")
+    (folder / "c.txt").unlink()
+    (folder / "new.txt").write_text("new", encoding="utf-8")
+    md5 = "MD5 (sub/b.txt) = " + hashlib.md5(b"sub/b.txt").hexdigest() + "\n"
+    r = tools.verify_manifest(manifest + manifest.splitlines()[0] + "\n" + md5 + "garbage\n", folder)
+    assert (r.changed, r.missing, r.extra) == (["a.txt"], ["c.txt"], ["new.txt"])
+    assert len(r.invalid) == 3 and r.matched == ["sub/b.txt"]
+    with pytest.raises(LocksmithError):
+        tools.make_manifest(folder, "md5")
+
+
+@pytest.mark.skipif(sys.platform == "win32" or not shutil.which("sha256sum"), reason="needs GNU sha256sum")
+def test_manifest_is_checked_by_sha256sum(tmp_path):
+    import subprocess
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    for name in ("plain.txt", "with space.txt", "back\\slash", "new\nline", "paren) = x"):
+        (folder / name).write_text(name, encoding="utf-8")
+    (folder / "SHA256SUMS").write_text(tools.make_manifest(folder, "sha256"), encoding="utf-8")
+    out = subprocess.run(["sha256sum", "--strict", "-c", "SHA256SUMS"], cwd=folder, capture_output=True, text=True)
+    assert out.returncode == 0 and out.stdout.count(": OK") == 5, out.stdout + out.stderr
+    assert tools.verify_manifest((folder / "SHA256SUMS").read_text(encoding="utf-8"), folder,
+                                 exclude=folder / "SHA256SUMS").ok
+
+
+def test_compare_files(tmp_path):
+    a, b, c, d = (tmp_path / n for n in "abcd")
+    a.write_bytes(b"x" * 10_000_000)
+    b.write_bytes(b"x" * 10_000_000)
+    c.write_bytes(b"x" * 9_999_999 + b"y")
+    d.write_bytes(b"x")
+    assert tools.same_contents(a, b) and not tools.same_contents(a, c) and not tools.same_contents(a, d)
+    if hasattr(os, "mkfifo"):
+        os.mkfifo(tmp_path / "pipe")
+        with pytest.raises(LocksmithError):
+            tools.same_contents(a, tmp_path / "pipe")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows names are always Unicode")
+def test_manifest_keeps_names_that_are_not_utf8(tmp_path):
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    with open(os.path.join(os.fsencode(folder), b"caf\xe9.txt"), "wb") as f:
+        f.write(b"latin-1 name")
+    text = tools.make_manifest(folder, "sha256")
+    keys.write_secret_file(tmp_path / "SUMS", text.encode("utf-8", "surrogateescape"))
+    assert b"(caf\xe9.txt)" in (tmp_path / "SUMS").read_bytes()   # the name's own bytes, as sha256sum writes
+    again = tools.read_text(tmp_path / "SUMS", tools.MAX_MANIFEST, "a manifest")
+    assert tools.verify_manifest(again, folder).ok
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows device names")
+def test_manifest_never_opens_windows_devices(tmp_path):
+    text = "".join(f"SHA256 ({n}) = {'0' * 64}\n" for n in ("CON", "COM1", "nul.txt", "a:stream", "x\\y"))
+    assert len(tools.verify_manifest(text, tmp_path).invalid) == 5
+
+
+def test_minisign_comment_is_checked_byte_for_byte(tmp_path):
+    from locksmith.core import minisign
+    f = tmp_path / "f"
+    f.write_bytes(b"data")
+    # A trusted comment that isn't UTF-8 is signed, and must be checked, as raw bytes.
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    sk = Ed25519PrivateKey.generate()
+    s = sk.sign(hashlib.blake2b(b"data", digest_size=64).digest())
+    comment = b"caf\xe9"
+    raw = (b"untrusted comment: x\n" + base64.b64encode(b"ED" + bytes(8) + s) + b"\ntrusted comment: " + comment
+           + b"\n" + base64.b64encode(sk.sign(s + comment)) + b"\n")
+    (tmp_path / "f.minisig").write_bytes(raw)
+    pub = base64.b64encode(b"Ed" + bytes(8) + sk.public_key().public_bytes_raw()).decode()
+    v = minisign.verify_file(f, minisign.read_small(tmp_path / "f.minisig"), pub)
+    assert v.trusted_comment.encode("utf-8", "surrogateescape") == comment

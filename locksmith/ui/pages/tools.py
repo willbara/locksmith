@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import base64
 import os
 from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QFileDialog, QSlider
 
-from ...core import tools
+from ...core import minisign, tools
+from ...core.errors import LocksmithError
 from ...core.keys import write_secret_file
 from .. import dialogs
 from ..lock import mark_sensitive
@@ -25,11 +27,18 @@ from ..widgets import (
     StrengthMeter,
     ToggleRow,
     copy_secret,
+    divider,
     hrow,
     label,
     toast,
 )
 from ..workers import run_task
+
+
+def _shown(text: str) -> str:
+    """Text that may hold bytes that aren't UTF-8 (kept as surrogates), made displayable.
+    Qt would silently drop them, so "café" in Latin-1 would show as "caf"."""
+    return text.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
 
 
 class ToolsPage(Page):
@@ -38,6 +47,7 @@ class ToolsPage(Page):
         self._gen_card()
         self._tester_card()
         self._hash_card()
+        self._minisign_card()
         self._keyfile_card()
         self._shred_card()
         self.finish()
@@ -154,6 +164,24 @@ class ToolsPage(Page):
         c.add(self.hash_expect)
         self.hash_match = label("", "h2")
         c.add(self.hash_match)
+        c.add(divider())
+        c.add(label("COMPARE AND MANIFESTS", "label"))
+        compare = Button("Compare two files…", "file")
+        compare.clicked.connect(self._compare_files)
+        make = Button("Create folder manifest…", "folder")
+        make.clicked.connect(self._make_manifest)
+        check = Button("Verify folder manifest…", "check")
+        check.clicked.connect(self._verify_manifest)
+        c.add(hrow(compare, make, check, None))
+        c.add(label("A manifest lists a checksum for every file in a folder (sha256sum --tag format), so the "
+                    "whole folder can be checked later or on another computer. Uses the algorithm above; "
+                    "MD5 is not offered for manifests.", "faint"))
+        self.extra_progress = ProgressPanel()
+        self.extra_progress.cancel.connect(lambda: self._extra_task and self._extra_task.cancel())
+        c.add(self.extra_progress)
+        self.extra_result = label("", "h2")
+        c.add(self.extra_result)
+        self._extra_task = None
         self.add(c)
 
     def _pick_hash_file(self):
@@ -193,6 +221,180 @@ class ToolsPage(Page):
             self.hash_match.setText("✓  Checksums match")
         else:
             self.hash_match.setText("✕  Checksums do not match")
+
+    def _run_extra(self, work, done):
+        """Run one compare or manifest job at a time, with progress and cancel."""
+        if self._extra_task is not None:
+            return
+        self.extra_result.setText("")
+        self.extra_progress.start()
+
+        def end():
+            self.extra_progress.finish()
+            self._extra_task = None
+
+        self._extra_task = run_task(
+            lambda r, c: work(lambda x: r(x, "Working"), c), lambda res: (end(), done(res)),
+            lambda m, k: (end(), dialogs.error(m)), self.extra_progress.update_progress,
+            lambda: (end(), toast("Cancelled", "x")), parent=self)
+
+    def _compare_files(self):
+        a, _ = QFileDialog.getOpenFileName(self, "Choose the first file")
+        if not a:
+            return
+        b, _ = QFileDialog.getOpenFileName(self, "Choose the second file", str(Path(a).parent))
+        if not b:
+            return
+        self._run_extra(lambda p, c: tools.same_contents(Path(a), Path(b), p, c),
+                        lambda same: self.extra_result.setText(
+                            "✓  The files are identical" if same else "✕  The files differ"))
+
+    def _manifest_alg(self) -> str | None:
+        alg = self.hash_alg.value()
+        if alg not in tools.MANIFEST_TAGS:
+            dialogs.error("MD5 is broken: someone could swap a file for another with the same MD5. "
+                          "Choose SHA-256 or another algorithm above.", "Choose another algorithm")
+            return None
+        return alg
+
+    def _make_manifest(self):
+        alg = self._manifest_alg()
+        folder = alg and QFileDialog.getExistingDirectory(self, "Choose the folder to list")
+        if not folder:
+            return
+        default = Path(folder) / f"{tools.MANIFEST_TAGS[alg]}SUMS"
+        out, _ = QFileDialog.getSaveFileName(self, "Save manifest", str(default))
+        if not out:
+            return
+
+        def work(p, c):
+            text = tools.make_manifest(Path(folder), alg, exclude=Path(out), progress=p, cancel=c)
+            write_secret_file(Path(out), text.encode("utf-8", "surrogateescape"))
+            return text.count("\n")
+
+        self._run_extra(work, lambda n: self.extra_result.setText(
+            f"✓  Listed {n} file{'s' if n != 1 else ''} in {Path(out).name}"))
+
+    def _verify_manifest(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Choose the manifest")
+        if not path:
+            return
+        folder = QFileDialog.getExistingDirectory(self, "Choose the folder it lists", str(Path(path).parent))
+        if not folder:
+            return
+
+        def work(p, c):
+            text = tools.read_text(Path(path), tools.MAX_MANIFEST, "a manifest")
+            return tools.verify_manifest(text, Path(folder), exclude=Path(path), progress=p, cancel=c)
+
+        self._run_extra(work, self._manifest_done)
+
+    def _manifest_done(self, rep):
+        if rep.ok:
+            self.extra_result.setText(f"✓  All {len(rep.matched)} files match the manifest")
+            return
+        self.extra_result.setText(f"✕  {len(rep.matched)} match · {len(rep.changed)} changed · "
+                                  f"{len(rep.missing)} missing · {len(rep.extra)} not listed · "
+                                  f"{len(rep.invalid)} unusable lines")
+        sections = (("Changed", rep.changed), ("Missing or not a regular file", rep.missing),
+                    ("In the folder but not listed", rep.extra), ("Unusable lines", rep.invalid))
+        dialogs.text_view("Manifest differences", "\n\n".join(
+            f"{title}:\n" + "\n".join(f"  {_shown(n)}" for n in names) for title, names in sections if names))
+
+    # ── minisign ──
+
+    def _minisign_card(self):
+        c = Collapsible("Verify a minisign signature", "Check a download against its .minisig file",
+                        icon="fingerprint")
+        self.ms_file = self.ms_sig = None
+        self.ms_file_name = label("No file selected", "caption", False)
+        pick = Button("Choose file…", "file")
+        pick.clicked.connect(self._ms_pick_file)
+        c.add(hrow(pick, self.ms_file_name, None))
+        self.ms_sig_name = label("No signature selected", "caption", False)
+        pick_sig = Button("Signature…", "fingerprint")
+        pick_sig.clicked.connect(self._ms_pick_sig)
+        c.add(hrow(pick_sig, self.ms_sig_name, None))
+        self.ms_key = LineEdit("Public key, e.g. RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3", mono=True)
+        self.ms_key.add_action("file", "Load a .pub file", self._ms_load_key)
+        c.add(self.ms_key)
+        self.ms_go = Button("Verify", "check", "primary")
+        self.ms_go.clicked.connect(self._ms_verify)
+        c.add(hrow(self.ms_go, None))
+        self.ms_progress = ProgressPanel()
+        self.ms_progress.cancel_btn.setVisible(False)
+        c.add(self.ms_progress)
+        self.ms_result = label("", "h2")
+        c.add(self.ms_result)
+        self.ms_comment = label("", "caption")
+        c.add(self.ms_comment)
+        c.add(label("A valid signature proves the file was signed with this key. Get the key from a source "
+                    "you trust, such as the project's website, not from the same place as the download.",
+                    "faint"))
+        self.add(c)
+
+    def _ms_reset(self):
+        self.ms_result.setText("")
+        self.ms_comment.setText("")
+
+    def _ms_pick_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Choose the signed file")
+        if not path:
+            return
+        self.ms_file = Path(path)
+        self.ms_file_name.setText(self.ms_file.name)
+        sig = Path(path + ".minisig")
+        if sig.is_file():
+            self.ms_sig = sig
+            self.ms_sig_name.setText(sig.name)
+        self._ms_reset()
+
+    def _ms_pick_sig(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Choose the signature", "",
+                                              "Minisign signatures (*.minisig);;All files (*)")
+        if path:
+            self.ms_sig = Path(path)
+            self.ms_sig_name.setText(self.ms_sig.name)
+            self._ms_reset()
+
+    def _ms_load_key(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Choose the public key", "",
+                                              "Minisign public keys (*.pub);;All files (*)")
+        if not path:
+            return
+        try:
+            key_id, pk = minisign.parse_public_key(minisign.read_small(Path(path)))
+        except (LocksmithError, OSError) as e:
+            dialogs.error(str(e))
+            return
+        self.ms_key.setText(base64.b64encode(b"Ed" + key_id + pk).decode())
+        self._ms_reset()
+
+    def _ms_verify(self):
+        if not (self.ms_file and self.ms_sig and self.ms_key.text().strip()):
+            toast("Choose the file, its signature and the public key", "alert")
+            return
+        f, sig, key = self.ms_file, self.ms_sig, self.ms_key.text()
+        self._ms_reset()
+        self.ms_progress.start()
+        self.ms_go.setEnabled(False)
+
+        def end():
+            self.ms_progress.finish()
+            self.ms_go.setEnabled(True)
+
+        def done(v):
+            end()
+            self.ms_result.setText(f"✓  Valid signature from key {v.key_id}")
+            self.ms_comment.setText(f"Trusted comment: {_shown(v.trusted_comment)}")
+
+        def failed(m, k):
+            end()
+            self.ms_result.setText("✕  Not verified")
+            self.ms_comment.setText(m)
+
+        run_task(lambda r, c: minisign.verify_file(f, minisign.read_small(sig), key, lambda x: r(x, "Hashing"), c),
+                 done, failed, self.ms_progress.update_progress, parent=self)
 
     # ── keyfile ──
 

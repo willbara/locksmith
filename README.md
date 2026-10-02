@@ -62,6 +62,7 @@ python3 -m venv .venv        # Python 3.12+; older than 3.14 installs backports.
 .venv/bin/python run.py      # run from source
 .venv/bin/pytest             # tests
 .venv/bin/ruff check         # lint
+LOCKSMITH_FUZZ=20000 .venv/bin/pytest tests/test_fuzz.py   # a longer fuzzing run
 ```
 
 ```
@@ -70,7 +71,8 @@ locksmith/
   ui/        PySide6 interface: theme, custom widgets, dialogs, worker threads, pages/
   assets/    app icon and bundled Inter font (OFL, see fonts/Inter-LICENSE.txt)
 packaging/   build script, PyInstaller spec, dependency lock, distro tests, .desktop file, MIME type
-tests/       tests for core/
+tests/       tests, fuzzing (test_fuzz.py) and format test vectors (vectors/)
+docs/        file-format specification and threat model
 ```
 
 ## Features
@@ -82,8 +84,9 @@ tests/       tests for core/
   combination. Each one wraps the same random file key.
 - **Keys:** identities (your key pairs) and contacts (other people's public keys). New identities are hybrid
   post-quantum (X25519 + ML-KEM-768), and older classical ones can be upgraded. An identity can be protected
-  with a passphrase, sealed to the machine's TPM, exported as a backup, and shared as text or a QR code.
-  Recipients stay anonymous: a file doesn't say who it was encrypted for.
+  with a passphrase, sealed to the machine's TPM, exported as a backup, written down as backup words, split
+  into Shamir shares, and shared as text or a QR code. Recipients stay anonymous: a file doesn't say who it
+  was encrypted for, and decoy slots can hide how many recipients there are.
 - **Privacy:** optional lossless removal of photo metadata (JPEG, PNG, WebP: location, camera, dates), file
   times and archive owner names.
 - **Extras:** streaming chunked encryption with parallel per-chunk compression (Zstandard, zlib, LZMA,
@@ -92,7 +95,8 @@ tests/       tests for core/
 - **Share:** copy a file to the clipboard, email it, copy it as pasteable text, split it into size-limited
   parts and join them, send encrypted text messages, show a password as a QR code, split a password among
   people with Shamir secret sharing, publish your public key.
-- **Tools:** password and passphrase generator, strength tester, checksums, keyfile generator, shredder.
+- **Tools:** password and passphrase generator, strength tester, checksums, file comparison, folder
+  manifests (`sha256sum --tag` compatible), minisign signature verification, keyfile generator, shredder.
 - **Interface:** dark, light or system theme, monochrome throughout.
 
 ## File format
@@ -100,6 +104,10 @@ tests/       tests for core/
 ```
 "LOCKED\x00\x01" | u32 header_len | header JSON | { u32 len | AEAD frame }*
 ```
+
+The full specification is [docs/FORMAT.md](docs/FORMAT.md), with test vectors in
+[tests/vectors](tests/vectors). What Locksmith does and doesn't protect against is in
+[docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
 
 Locksmith 2.0 replaced the format of Cryptor 1.x (the app's former name). Cryptor files and keys are not read.
 
@@ -109,7 +117,7 @@ Locksmith 2.0 replaced the format of Cryptor 1.x (the app's former name). Crypto
   encapsulates to the recipient's ML-KEM-768 key and derives its key from both shared secrets plus the
   transcript, so breaking X25519 alone is not enough.
 - Layer keys, the metadata key and a key-commitment value are derived from the DEK with HKDF-SHA512.
-  The commitment is checked on open.
+  A slot only counts as opened when its key matches the commitment; a mismatch reads as a wrong key.
 - Frame `i` uses nonce `prefix(7) ‖ i(u32) ‖ final(u8)` and the SHA-256 of the header as associated data.
   Reordering, truncation, appended data and header tampering all fail authentication.
 - File name, size, type, compression method and note are stored in an encrypted metadata blob.
@@ -138,3 +146,5 @@ protected with a passphrase (Argon2id + AES-GCM).
 
 - Shredding is best effort. SSDs and copy-on-write filesystems such as btrfs can keep old copies.
 - Losing the password, keyfile or private key means losing the data. There is no recovery.
+- Senders are not authenticated. Decrypting proves a file was not changed after it was made, not who made
+  it: anyone with your public key can send you a file, and its name and note can claim anything.

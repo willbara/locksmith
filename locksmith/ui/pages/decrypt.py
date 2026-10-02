@@ -7,7 +7,7 @@ from pathlib import Path
 
 from PySide6.QtWidgets import QVBoxLayout
 
-from ...core import engine, kdf
+from ...core import engine, kdf, scratch
 from ...core.engine import DecryptKeys
 from ...core.errors import LocksmithError
 from .. import dialogs
@@ -254,11 +254,13 @@ class DecryptPage(Page):
         target = engine.unique_path(out_dir / name)
         if kind in ("dir", "bundle"):
             tmp = out_dir / f".locksmith-{secrets.token_hex(6)}.tar"
-            engine.write_private(tmp, res.data)
-            try:
-                engine.extract_archive(tmp, target)
-            finally:
-                tmp.unlink(missing_ok=True)
+            with scratch.tracked(tmp):
+                try:
+                    engine.write_private(tmp, res.data)
+                    ext = engine.extract_archive(tmp, target)
+                finally:
+                    tmp.unlink(missing_ok=True)
+            meta = {**meta, "_skipped": ext.skipped}
         else:
             engine.write_private(target, res.data)
         return ("file", target, meta)
@@ -333,7 +335,8 @@ class DecryptPage(Page):
             card.add(hrow(label(path.name, "mono", wrap=False), None, show, open_btn))
             dialogs_needed = False
         if meta.get("note"):
-            card.add(label(f"Note: {meta['note']}", "caption"))
+            # Whoever made the file wrote the note; nothing proves who that was.
+            card.add(label(f"Note from the sender (not verified): {meta['note']}", "caption"))
         skipped = meta.get("_skipped") or []
         if skipped:
             shown = ", ".join(skipped[:5]) + ("…" if len(skipped) > 5 else "")

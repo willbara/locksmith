@@ -174,6 +174,87 @@ def decode_public(text: str) -> bytes:
     return raw
 
 
+# ── backups of a raw private key: words and Shamir shares ────────────────────
+#
+# Backup words are proquints: each 16 bits of the key become one pronounceable
+# five-letter word (consonant, vowel, consonant, vowel, consonant). Two more words
+# carry a checksum, so a typo is caught instead of restoring the wrong key. A
+# classical key is 16 + 2 words, a post-quantum key 48 + 2. The words are the
+# private key itself, without any passphrase.
+
+_PQ_CONS, _PQ_VOW = "bdfghjklmnprstvz", "aiou"
+_WORDS_LABEL = b"locksmith/v1/backup-words"
+_SHARE_MAGIC = b"LSI1"   # identity shares split this prefix plus the raw private key
+
+
+def _proquint(n: int) -> str:
+    return (_PQ_CONS[n >> 12 & 15] + _PQ_VOW[n >> 10 & 3] + _PQ_CONS[n >> 6 & 15]
+            + _PQ_VOW[n >> 4 & 3] + _PQ_CONS[n & 15])
+
+
+def _unproquint(word: str) -> int | None:
+    if len(word) != 5:
+        return None
+    n = 0
+    for ch, alphabet, bits in zip(word, (_PQ_CONS, _PQ_VOW) * 2 + (_PQ_CONS,), (4, 2, 4, 2, 4), strict=True):
+        i = alphabet.find(ch)
+        if i < 0:
+            return None
+        n = n << bits | i
+    return n
+
+
+def _words_check(raw: bytes) -> bytes:
+    return hashlib.sha256(_WORDS_LABEL + raw).digest()[:4]
+
+
+def backup_words(raw: bytes) -> list[str]:
+    if len(raw) not in (X25519_LEN, HYBRID_PRIVATE_LEN):
+        raise LocksmithError("That private key can't be written as backup words.")
+    data = raw + _words_check(raw)
+    return [_proquint(int.from_bytes(data[i:i + 2], "big")) for i in range(0, len(data), 2)]
+
+
+def private_from_words(text: str) -> bytes:
+    """The raw private key written as backup words, checked against its checksum."""
+    words = text.lower().replace("-", " ").split()
+    if len(words) not in ((X25519_LEN + 4) // 2, (HYBRID_PRIVATE_LEN + 4) // 2):
+        raise LocksmithError(f"Backup words come in sets of {(X25519_LEN + 4) // 2} or "
+                             f"{(HYBRID_PRIVATE_LEN + 4) // 2}; this has {len(words)}.")
+    data = bytearray()
+    for i, word in enumerate(words, 1):
+        n = _unproquint(word)
+        if n is None:
+            raise LocksmithError(f"Word {i} (“{word[:12]}”) is not a backup word.")
+        data += n.to_bytes(2, "big")
+    raw, check = bytes(data[:-4]), bytes(data[-4:])
+    if not secrets.compare_digest(_words_check(raw), check):
+        raise LocksmithError("The words have a typo: their checksum doesn't match.")
+    return raw
+
+
+def identity_shares(raw: bytes, threshold: int, shares: int) -> list[str]:
+    """Split a raw private key into Shamir shares that only restore as an identity."""
+    from .tools import shamir_split
+    if len(raw) not in (X25519_LEN, HYBRID_PRIVATE_LEN):
+        raise LocksmithError("That private key can't be split.")
+    return shamir_split(_SHARE_MAGIC + raw, threshold, shares)
+
+
+def is_identity_secret(secret: bytes) -> bool:
+    """True for a secret recovered from identity shares (see ``identity_shares``)."""
+    return secret.startswith(_SHARE_MAGIC) and len(secret) - len(_SHARE_MAGIC) in (X25519_LEN, HYBRID_PRIVATE_LEN)
+
+
+def private_from_shares(texts: list[str]) -> bytes:
+    from .tools import shamir_combine
+    secret = shamir_combine(texts)
+    if not is_identity_secret(secret):
+        raise LocksmithError("These shares hold a password or other secret, not an identity. "
+                             "Combine them on the Share page.")
+    return secret[len(_SHARE_MAGIC):]
+
+
 def fingerprint(raw: bytes) -> str:
     h = hashlib.sha256(raw).hexdigest()[:20].upper()
     return " ".join(h[i:i + 4] for i in range(0, 20, 4))
@@ -298,7 +379,15 @@ def _from_dict(cls, data):
     obj = cls(**{k: v for k, v in data.items() if k in known})
     if not isinstance(obj.name, str) or not isinstance(obj.public, str):
         raise TypeError
-    if cls is Identity and sum(x is not None for x in (obj.private, obj.locked, obj.sealed)) != 1:
+    if cls is Identity:
+        if sum(x is not None for x in (obj.private, obj.locked, obj.sealed)) != 1:
+            raise TypeError
+        # A mistyped field would fail later, outside LocksmithError, and block every decrypt.
+        if not (isinstance(obj.private, str | None) and isinstance(obj.sealed, str | None)
+                and isinstance(obj.locked, dict | None) and isinstance(obj.sealed_locked, bool)):
+            raise TypeError
+    when = obj.created if cls is Identity else obj.added
+    if isinstance(when, bool) or not isinstance(when, int):
         raise TypeError
     decode_public(obj.public)
     return obj
@@ -324,7 +413,7 @@ class KeyStore:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 raise ValueError
-        except (OSError, ValueError, UnicodeDecodeError):
+        except (OSError, ValueError, UnicodeDecodeError, RecursionError):
             backup = self.path.with_name(f"keys.json.unreadable-{time.strftime('%Y%m%d-%H%M%S')}")
             shutil.copy2(self.path, backup)
             os.chmod(backup, 0o600)
@@ -471,6 +560,24 @@ class KeyStore:
             raise LocksmithError("That identity is already imported.")
         self.identities.append(ident)
         self.save()
+        return ident
+
+    def restore(self, name: str, raw: bytes, passphrase: str | None = None) -> Identity:
+        """Add an identity rebuilt from a raw private key (backup words or shares)."""
+        try:
+            public = encode_public(public_from_private(raw))
+        except ValueError:
+            raise LocksmithError("That is not a valid private key.") from None
+        if any(i.public == public for i in self.identities):
+            raise LocksmithError("That identity is already on this device.")
+        ident = Identity(name=name.strip() or "Restored key", public=public, created=int(time.time()))
+        self._store_private(ident, raw, passphrase)
+        self.identities.append(ident)
+        try:
+            self.save()
+        except BaseException:
+            self.identities.remove(ident)
+            raise
         return ident
 
     def unlocked_private_keys(self) -> list[bytes]:

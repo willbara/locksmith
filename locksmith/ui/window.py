@@ -6,6 +6,7 @@ from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QHBoxLayout, QMainWindow, QWidget
 
 from .. import __version__
+from ..core import scratch
 from ..core.engine import is_encrypted_name, looks_encrypted
 from ..core.keys import KeyStore
 from . import dialogs
@@ -19,6 +20,7 @@ from .pages.tools import ToolsPage
 from .settings import settings
 from .theme import app_icon
 from .widgets import AnimatedStack, Sidebar, Toaster, clear_clipboard_secret
+from .workers import run_task
 
 NAV = [("Encrypt", "lock"), ("Decrypt", "unlock"), ("Share", "share"), ("Keys", "key"),
        ("Tools", "tool"), ("-", ""), ("Settings", "settings")]
@@ -32,6 +34,9 @@ class MainWindow(QMainWindow):
         self.resize(1120, 800)
         self.setMinimumSize(820, 600)
         self.store = KeyStore()
+        # Plaintext temporary files a killed run left behind are shredded in the background.
+        scratch.enable(self.store.dir / "scratch.json")
+        run_task(lambda r, c: scratch.clean_leftovers())
 
         root = QWidget()
         root.setObjectName("root")
@@ -91,8 +96,8 @@ class MainWindow(QMainWindow):
         for key, dd in (("suite", e.suite), ("preset", e.preset), ("kdf", e.kdf), ("compression", e.comp),
                         ("padding", e.padding), ("threads", e.threads)):
             dd.set_value(settings[key])
-        for key, t in (("hide_name", e.hide_name), ("bundle", e.bundle), ("armor", e.armor),
-                       ("strip_metadata", e.strip)):
+        for key, t in (("hide_name", e.hide_name), ("hide_recipients", e.hide_recipients), ("bundle", e.bundle),
+                       ("armor", e.armor), ("strip_metadata", e.strip)):
             t.setChecked(settings[key])
         self.decrypt.delete_after.setChecked(settings["delete_after_decrypt"])
 

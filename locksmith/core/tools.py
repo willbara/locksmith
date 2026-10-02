@@ -13,10 +13,12 @@ import stat
 import string
 import threading
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import BinaryIO
 
 from .errors import CancelledError, LocksmithError
-from .osutil import fsync_dir, open_new
+from .osutil import IS_WINDOWS, fsync_dir, open_new, windows_unsafe
 
 
 def same_secret(a: str | bytes, b: str | bytes) -> bool:
@@ -138,13 +140,35 @@ HASHES = {
 }
 
 
+def open_regular(path: Path) -> BinaryIO:
+    """Open a regular file for reading, following links. Anything else (a FIFO, a device)
+    is refused: opening a FIFO would block forever and a device can read without end.
+    O_NONBLOCK makes the open itself return at once, before the type is checked."""
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise LocksmithError(f"{Path(path).name} is not a regular file.")
+    return os.fdopen(fd, "rb")
+
+
+def read_text(path: Path, limit: int, what: str) -> str:
+    """Read a small text file (a signature, a key, a manifest), refusing anything larger
+    than ``limit`` or not a regular file. Bytes that aren't UTF-8 are kept as surrogates
+    (``surrogateescape``), so file names and signed text survive byte for byte."""
+    with open_regular(path) as f:
+        data = f.read(limit + 1)
+    if len(data) > limit:
+        raise LocksmithError(f"{Path(path).name} is too large to be {what}.")
+    return data.decode("utf-8", "surrogateescape")
+
+
 def hash_file(path: Path, algorithm: str,
               progress: Callable[[float], None] | None = None,
               cancel: threading.Event | None = None) -> str:
     h = hashlib.new(algorithm)
-    size = max(os.path.getsize(path), 1)
-    done = 0
-    with open(path, "rb") as f:
+    with open_regular(path) as f:
+        size = max(os.fstat(f.fileno()).st_size, 1)
+        done = 0
         while block := f.read(4 << 20):
             if cancel and cancel.is_set():
                 raise CancelledError()
@@ -153,6 +177,169 @@ def hash_file(path: Path, algorithm: str,
             if progress:
                 progress(done / size)
     return h.hexdigest()
+
+
+def same_contents(a: Path, b: Path, progress: Callable[[float], None] | None = None,
+                  cancel: threading.Event | None = None) -> bool:
+    """Compare two files byte for byte (no hash, so no collision can fool it)."""
+    with open_regular(a) as fa, open_regular(b) as fb:
+        size = os.fstat(fa.fileno()).st_size
+        if size != os.fstat(fb.fileno()).st_size:
+            return False
+        done = 0
+        while True:
+            if cancel and cancel.is_set():
+                raise CancelledError()
+            x, y = fa.read(4 << 20), fb.read(4 << 20)
+            if x != y:
+                return False
+            if not x:
+                return True
+            done += len(x)
+            if progress:
+                progress(done / max(size, 1))
+
+
+# ── folder manifests ─────────────────────────────────────────────────────────
+#
+# One line per file in the BSD "tag" format that `sha256sum --tag` and `cksum` write
+# and check: "SHA256 (path/inside/folder) = hex". A name holding a backslash or a line
+# break is escaped as coreutils does: the line starts with "\" and those characters
+# become "\\", "\n" and "\r". MD5 is not offered: its collisions are cheap to make,
+# so an MD5 manifest cannot show that files were not swapped. File names on Linux are
+# bytes: names that aren't UTF-8 are carried as surrogates, so write a manifest with
+# ``manifest.encode("utf-8", "surrogateescape")`` and read it with ``read_text``.
+
+MANIFEST_TAGS = {"sha256": "SHA256", "sha512": "SHA512", "sha3_256": "SHA3-256", "sha3_512": "SHA3-512",
+                 "blake2b": "BLAKE2b", "blake2s": "BLAKE2s"}
+_TAG_ALGS = {v: k for k, v in MANIFEST_TAGS.items()}
+MAX_MANIFEST = 64 << 20
+_MANIFEST_LINE = re.compile(r"(\\)?([A-Za-z0-9-]+) \((.*)\) = ([0-9a-fA-F]+)")
+
+
+@dataclass
+class ManifestReport:
+    matched: list[str] = field(default_factory=list)
+    changed: list[str] = field(default_factory=list)   # contents differ from the manifest
+    missing: list[str] = field(default_factory=list)   # listed but not there, or not a regular file
+    extra: list[str] = field(default_factory=list)     # in the folder but not listed
+    invalid: list[str] = field(default_factory=list)   # lines that could not be used, with why
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.matched) and not (self.changed or self.missing or self.extra or self.invalid)
+
+
+def _escape(name: str) -> tuple[str, bool]:
+    if not any(c in name for c in "\\\n\r"):
+        return name, False
+    return name.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r"), True
+
+
+def _unescape(name: str) -> str | None:
+    out, i = [], 0
+    while i < len(name):
+        c = name[i]
+        if c == "\\":
+            nxt = name[i + 1:i + 2]
+            if nxt not in ("\\", "n", "r"):
+                return None
+            out.append({"\\": "\\", "n": "\n", "r": "\r"}[nxt])
+            i += 2
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def _folder_files(folder: Path, exclude: set[Path]) -> list[str]:
+    """Regular files under ``folder`` as relative POSIX paths. Links are not followed."""
+    found = []
+    exclude = {p.resolve() for p in exclude}
+    for root, dirs, files in os.walk(folder):
+        dirs.sort()
+        for name in sorted(files):
+            path = Path(root) / name
+            if path.is_symlink() or not path.is_file() or (exclude and path.resolve() in exclude):
+                continue
+            found.append(path.relative_to(folder).as_posix())
+    return found
+
+
+def make_manifest(folder: Path, algorithm: str = "sha256", exclude: Path | None = None,
+                  progress: Callable[[float], None] | None = None,
+                  cancel: threading.Event | None = None) -> str:
+    """Checksum every regular file under ``folder``. Links are left out: their target
+    may lie outside the folder. ``exclude`` is the manifest's own path, if inside."""
+    if algorithm not in MANIFEST_TAGS:
+        raise LocksmithError("Manifests use SHA-256, SHA-512, SHA-3 or BLAKE2.")
+    folder = Path(folder)
+    names = _folder_files(folder, {Path(exclude)} if exclude else set())
+    lines = []
+    for i, rel in enumerate(names):
+        digest = hash_file(folder / rel, algorithm, cancel=cancel)
+        name, escaped = _escape(rel)
+        lines.append(f"{'\\' if escaped else ''}{MANIFEST_TAGS[algorithm]} ({name}) = {digest}")
+        if progress:
+            progress((i + 1) / len(names))
+    return "".join(line + "\n" for line in lines)
+
+
+def _manifest_target(folder: Path, name: str) -> Path | None:
+    """The file a manifest entry names, or None if the entry could reach outside the folder."""
+    parts = name.split("/")
+    if (not name or "\x00" in name or name.startswith("/") or any(p in ("", ".", "..") for p in parts)
+            or (IS_WINDOWS and any(windows_unsafe(p) for p in parts))):   # drives, streams, devices
+        return None
+    target = folder.joinpath(*parts)
+    # A link inside the folder may point anywhere; only follow it if it stays inside.
+    if not os.path.realpath(target).startswith(os.path.join(os.path.realpath(folder), "")):
+        return None
+    return target
+
+
+def verify_manifest(text: str, folder: Path, exclude: Path | None = None,
+                    progress: Callable[[float], None] | None = None,
+                    cancel: threading.Event | None = None) -> ManifestReport:
+    """Check ``folder`` against a manifest that may come from anyone. Entries can only
+    name regular files inside the folder; anything else is reported, never read."""
+    if len(text) > MAX_MANIFEST:
+        raise LocksmithError(f"Manifests over {MAX_MANIFEST >> 20} MiB are not supported.")
+    folder = Path(folder)
+    report = ManifestReport()
+    entries: dict[str, tuple[str, str]] = {}
+    for n, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            continue
+        m = _MANIFEST_LINE.fullmatch(line)
+        name = m and (_unescape(m[3]) if m[1] else m[3])
+        alg = m and _TAG_ALGS.get(m[2])
+        if not m or name is None:
+            report.invalid.append(f"line {n}: not a checksum line")
+        elif alg is None:
+            report.invalid.append(f"line {n}: {m[2]} is not accepted" + (" (MD5 is broken)" if m[2] == "MD5" else ""))
+        elif len(m[4]) != hashlib.new(alg).digest_size * 2:
+            report.invalid.append(f"line {n}: the checksum has the wrong length")
+        elif _manifest_target(folder, name) is None:
+            report.invalid.append(f"line {n}: “{name}” is outside the folder")
+        elif name in entries:
+            report.invalid.append(f"line {n}: “{name}” is listed twice")
+        else:
+            entries[name] = (alg, m[4].lower())
+    for i, (name, (alg, expected)) in enumerate(entries.items()):
+        try:
+            actual = hash_file(_manifest_target(folder, name), alg, cancel=cancel)
+        except (OSError, LocksmithError) as e:
+            if isinstance(e, CancelledError):
+                raise
+            report.missing.append(name)
+        else:
+            (report.matched if same_secret(actual, expected) else report.changed).append(name)
+        if progress:
+            progress((i + 1) / len(entries))
+    listed = set(entries)
+    report.extra = [f for f in _folder_files(folder, {Path(exclude)} if exclude else set()) if f not in listed]
+    return report
 
 
 # ── Shamir secret sharing over GF(256) ───────────────────────────────────────
@@ -188,8 +375,8 @@ def _div(a, b):
 #   locksmithshare2-<k>-<x>-<id>-<data>-<check>    v2, written
 # v2 adds a random split ID shared by every share of one split, and splits the secret
 # followed by a tag (a hash of the ID and secret), so mixed or altered shares are caught.
-_SHARE_V1 = re.compile(r"locksmithshare-(\d+)-(\d+)-()([0-9a-f]+)-([0-9a-f]{6})")
-_SHARE_V2 = re.compile(r"locksmithshare2-(\d+)-(\d+)-([0-9a-f]{8})-([0-9a-f]+)-([0-9a-f]{6})")
+_SHARE_V1 = re.compile(r"locksmithshare-([0-9]{1,3})-([0-9]{1,3})-()([0-9a-f]+)-([0-9a-f]{6})")
+_SHARE_V2 = re.compile(r"locksmithshare2-([0-9]{1,3})-([0-9]{1,3})-([0-9a-f]{8})-([0-9a-f]+)-([0-9a-f]{6})")
 _SPLIT_ID = 4
 _TAG = 8
 

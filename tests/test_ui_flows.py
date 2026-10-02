@@ -240,3 +240,174 @@ def test_delete_after_keeps_source_when_items_were_left_out(tmp_path, window, ne
     texts = [lab.text() for lab in d.findChildren(Label)]
     assert any("proj/abs-link" in t for t in texts)
     assert any("was not deleted" in t for t in texts)
+
+
+def test_secret_qr_code_cannot_be_copied_as_an_image(window, monkeypatch):
+    from locksmith.ui import dialogs
+    from locksmith.ui.widgets import Button
+    sheets = []
+    monkeypatch.setattr(dialogs.Sheet, "exec", lambda self: (self.open(), sheets.append(self))[1])
+    window.share.secret.setText("vault-pass")
+    window.share._secret_qr()
+    dialogs.qr_view("Your public key", "locksmith1abc")
+    secret_qr, public_qr = ([b.text() for b in s.findChildren(Button)] for s in sheets)
+    assert "Copy image" not in secret_qr
+    assert "Copy image" in public_qr
+
+
+def test_shred_refuses_inputs_holding_the_key_store(tmp_path, window):
+    e = window.encrypt
+    window.store.generate("me", post_quantum=False)
+    window._keys_changed()
+    keys = window.store.path.read_bytes()
+    e.add_paths([str(tmp_path / "config")])
+    _set_password(e)
+    e.shred.setChecked(True)
+    e.output._dir = str(tmp_path / "out")
+    e.output._rebuild()
+    e.go.click()
+    wait(lambda: e.task is None)
+    assert any(a.startswith("ERROR: Locksmith’s own keys") for a in window.asked)
+    assert window.store.path.read_bytes() == keys
+    assert not list(tmp_path.glob("out/*.locked"))
+
+
+def test_pasted_folder_reports_left_out_items_and_unverified_note(tmp_path, window, monkeypatch,
+                                                                   needs_symlinks):
+    from locksmith.core import engine
+    from locksmith.core.engine import EncryptOptions
+    from locksmith.ui import dialogs
+    from locksmith.ui.widgets import Label
+    src = tmp_path / "proj"
+    src.mkdir()
+    (src / "data.txt").write_text("keep me", encoding="utf-8")
+    (src / "abs-link").symlink_to("/usr/bin")
+    opts = EncryptOptions(password="pw", kdf="pbkdf2-sha512", preset="fast", armor=True, note="From: Alice")
+    armored = engine.encrypt_paths([src], tmp_path / "enc", opts).read_text(encoding="utf-8")
+    monkeypatch.setattr(dialogs, "text_input", lambda *a, **k: armored)
+
+    d = window.decrypt
+    d.paste_text()
+    d.password.setText("pw")
+    (tmp_path / "dec").mkdir()  # a missing output folder would send pasted output to the home folder
+    d.output._dir = str(tmp_path / "dec")
+    d.output._rebuild()
+    d.go.click()
+    wait(lambda: d.task is None)
+    (data,) = (tmp_path / "dec").rglob("data.txt")
+    assert data.read_text(encoding="utf-8") == "keep me"
+    texts = [lab.text() for lab in d.findChildren(Label)]
+    assert any("Left out 1" in t and "abs-link" in t for t in texts)
+    assert any(t == "Note from the sender (not verified): From: Alice" for t in texts)
+
+
+def _capture_text_views(monkeypatch):
+    from locksmith.ui import dialogs
+    shown = []
+    monkeypatch.setattr(dialogs, "text_view", lambda title, text, *a, **k: shown.append((title, text, k)))
+    return shown
+
+
+def test_backup_words_and_shares_restore_the_identity(tmp_path, window, monkeypatch):
+    from PySide6.QtWidgets import QPlainTextEdit
+
+    from locksmith.core import keys
+    from locksmith.ui import dialogs
+    from locksmith.ui.widgets import Dropdown, LineEdit
+    shown = _capture_text_views(monkeypatch)
+    page, store = window.keys, window.store
+    ident = store.generate("me", passphrase="pass phrase")
+    page.reload()
+    monkeypatch.setattr(dialogs, "prompt", lambda *a, **k: "pass phrase")
+    page._backup_words(ident)
+    wait(lambda: shown)
+    title, words, opts = shown.pop()
+    assert opts["secret"] and len(words.split()) == 50
+
+    def split_sheet(self):
+        self.open()
+        k, n = self.findChildren(Dropdown)
+        k.set_value(3)
+        n.set_value(5)
+        return True
+    monkeypatch.setattr(dialogs.Sheet, "exec", split_sheet)
+    page._split_identity(ident)
+    wait(lambda: shown)
+    shares = shown.pop()[1].split()
+    assert len(shares) == 5
+
+    raw = ident.private_raw("pass phrase")
+    for source in (words, "\n".join(shares[1:4])):
+        store.identities.clear()   # as if on a new device
+        store.save()
+
+        def restore_sheet(self, source=source):
+            self.open()
+            self.findChild(QPlainTextEdit).setPlainText(source)
+            self.findChild(LineEdit).setText("restored")
+            return True
+        monkeypatch.setattr(dialogs.Sheet, "exec", restore_sheet)
+        page._restore()
+        wait(lambda: len(store.identities) == 1)
+        assert store.identities[0].private_raw() == raw and store.identities[0].name == "restored"
+    assert keys.KeyStore(store.dir).identities[-1].public == ident.public   # saved to disk
+
+
+def test_identity_shares_are_not_shown_as_a_password(window, monkeypatch):
+    import os
+
+    from locksmith.core import keys
+    from locksmith.ui import dialogs
+    shown = _capture_text_views(monkeypatch)
+    infos = []
+    monkeypatch.setattr(dialogs, "info", lambda title, *a, **k: infos.append(title))
+    shares = keys.identity_shares(os.urandom(32), 2, 2)
+    monkeypatch.setattr(dialogs, "text_input", lambda *a, **k: "\n".join(shares))
+    window.share._combine()
+    assert infos == ["These shares hold an identity"] and not shown
+
+
+def test_hide_recipients_option_reaches_the_engine(window):
+    e = window.encrypt
+    e.mode.setIndex(1)
+    e.hide_recipients.setChecked(True)
+    assert e.options().hide_recipients
+    e.mode.setIndex(0)
+    assert not e.options().hide_recipients   # password only: no recipients to hide
+
+
+def test_minisign_and_manifest_tools(tmp_path, window, monkeypatch):
+    import base64
+    import hashlib
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from PySide6.QtWidgets import QFileDialog
+    t = window.tools
+    f = tmp_path / "release.tar"
+    f.write_bytes(b"release")
+    sk = Ed25519PrivateKey.generate()
+    sig = sk.sign(hashlib.blake2b(b"release", digest_size=64).digest())
+    comment = "<b>timestamp</b>"
+    (tmp_path / "release.tar.minisig").write_text(
+        f"untrusted comment: x\n{base64.b64encode(b'ED' + bytes(8) + sig).decode()}\ntrusted comment: {comment}\n"
+        f"{base64.b64encode(sk.sign(sig + comment.encode())).decode()}\n", encoding="utf-8")
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", staticmethod(lambda *a, **k: (str(f), "")))
+    t._ms_pick_file()   # finds release.tar.minisig next to it
+    t.ms_key.setText(base64.b64encode(b"Ed" + bytes(8) + sk.public_key().public_bytes_raw()).decode())
+    t._ms_verify()
+    wait(lambda: t.ms_go.isEnabled() and t.ms_result.text())
+    assert t.ms_result.text().startswith("✓") and t.ms_comment.text() == f"Trusted comment: {comment}"
+
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    (folder / "a.txt").write_text("a", encoding="utf-8")
+    manifest = folder / "SHA256SUMS"
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: str(folder)))
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: (str(manifest), "")))
+    t._make_manifest()
+    wait(lambda: t._extra_task is None and t.extra_result.text())
+    assert manifest.read_text(encoding="utf-8").startswith("SHA256 (a.txt) = ")
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", staticmethod(lambda *a, **k: (str(manifest), "")))
+    t._verify_manifest()
+    wait(lambda: t._extra_task is None and "match" in t.extra_result.text())
+    assert t.extra_result.text() == "✓  All 1 files match the manifest"

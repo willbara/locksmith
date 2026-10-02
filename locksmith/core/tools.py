@@ -326,6 +326,46 @@ def shred(path: Path, passes: int = 1, cancel: threading.Event | None = None):
     scrambled.unlink()
 
 
+def covered_by(path: Path, inputs: list[Path]) -> bool:
+    """Whether ``path`` is one of ``inputs`` or inside one of them, also when it is
+    reached through a symlink or is a hard link to a file in an input folder.
+    Shredding the inputs would then destroy it."""
+    try:
+        target = Path(path).resolve()
+        st = target.stat()
+    except OSError:
+        return False
+    # Compare file identities as well as paths, so case-insensitive names and other
+    # spellings of the same folder still match.
+    chain = set()
+    for q in (target, *target.parents):
+        try:
+            s = q.stat()
+        except OSError:
+            continue
+        if s.st_ino:
+            chain.add((s.st_dev, s.st_ino))
+    for p in inputs:
+        p = Path(p)
+        try:
+            root, s = p.resolve(), p.stat()
+        except OSError:
+            continue
+        if target == root or target.is_relative_to(root) or (s.st_ino and (s.st_dev, s.st_ino) in chain):
+            return True
+        # Another name for the same file can sit anywhere in an input folder.
+        if st.st_nlink > 1 and st.st_ino and stat.S_ISDIR(s.st_mode):
+            for dirpath, _, files in os.walk(p):
+                for name in files:
+                    try:
+                        f = os.lstat(os.path.join(dirpath, name))
+                    except OSError:
+                        continue
+                    if (f.st_dev, f.st_ino) == (st.st_dev, st.st_ino):
+                        return True
+    return False
+
+
 # ── split / join ─────────────────────────────────────────────────────────────
 
 def split_file(path: Path, part_size: int, out_dir: Path | None = None) -> list[Path]:

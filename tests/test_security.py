@@ -1072,6 +1072,46 @@ def test_lzma_dictionary_bomb_rejected(tmp_path):
     assert compress.CODECS["lzma"].decompress(lzma.compress(b"ok", preset=6), 4096) == b"ok"
 
 
+def test_message_decompression_bomb_rejected(tmp_path, monkeypatch):
+    """Every chunk is within its own cap, but the total must not expand without limit in memory."""
+    src = tmp_path / "zeros"
+    with open(src, "wb") as f:
+        f.truncate(256 << 20)
+    opts = EncryptOptions(password="pw", compression="zstd", chunk_size=64 << 20, **FAST)
+    blob = engine.encrypt_paths([src], tmp_path / "enc", opts).read_bytes()
+    assert len(blob) < 1 << 20
+    zstd = compress.CODECS["zstd"]
+    opened = []
+    monkeypatch.setitem(compress.CODECS, "zstd", dataclasses.replace(
+        zstd, new_decompressor=lambda: (opened.append(1), zstd.new_decompressor())[1]))
+    with pytest.raises(CorruptedError, match="larger than"):
+        engine.decrypt_bytes(blob, PW)
+    assert len(opened) < 4  # stopped before building the full output
+
+
+def test_message_at_the_limit_round_trips():
+    opts = EncryptOptions(password="pw", compression="zstd", chunk_size=64 << 20, **FAST)
+    data = bytes(engine.MAX_ARMOR_INPUT)
+    assert engine.decrypt_bytes(engine.encrypt_bytes(data, opts), PW).data == data
+    with pytest.raises(LocksmithError, match="limited"):
+        engine.encrypt_bytes(data + b"x", opts)
+
+
+def test_armored_folder_limit_counts_archive_overhead(tmp_path, monkeypatch):
+    """Files under the limit can make an archive over it; that must not be written as
+    a message that cannot be opened again."""
+    folder = tmp_path / "many"
+    folder.mkdir()
+    for i in range(40):  # non-ASCII names need extra PAX headers in the archive
+        (folder / f"ü{i}.txt").write_bytes(b"")
+    assert engine._tree_size(folder) < 48 << 10
+    monkeypatch.setattr(engine, "MAX_ARMOR_INPUT", 48 << 10)
+    opts = EncryptOptions(password="pw", armor=True, chunk_size=256 << 10, **FAST)
+    with pytest.raises(LocksmithError, match="limited"):
+        engine.encrypt_paths([folder], tmp_path / "enc", opts)
+    assert not list((tmp_path / "enc").iterdir())
+
+
 @pytest.mark.parametrize("share", ["locksmithshare-2-300-ab-000000", "locksmithshare-999-1-ab-000000",
                                    "locksmithshare-2-0-ab-000000", "locksmithshare-2-1-abc-000000"])
 def test_malformed_shares_are_reported(share):
@@ -1135,6 +1175,45 @@ def test_shred_refuses_hard_linked_file(tmp_path):
     with pytest.raises(LocksmithError, match="hard links"):
         tools.shred(f)
     assert (tmp_path / "b").read_bytes() == b"plain"
+
+
+def test_keyfile_covered_by_inputs(tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "sub").mkdir(parents=True)
+    key = vault / "sub" / "key.bin"
+    key.write_bytes(b"k" * 32)
+    other = tmp_path / "other.txt"
+    other.write_text("x", encoding="utf-8")
+    assert tools.covered_by(key, [key])
+    assert tools.covered_by(key, [other, vault])
+    assert tools.covered_by(key, [tmp_path / "vault" / "sub" / ".." / "sub"])
+    assert not tools.covered_by(key, [other])
+    assert not tools.covered_by(other, [vault])
+    assert not tools.covered_by(tmp_path / "missing", [vault])
+
+
+def test_keyfile_covered_through_symlink(tmp_path, needs_symlinks):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "key.bin").write_bytes(b"k" * 32)
+    link = tmp_path / "key-link"
+    link.symlink_to(vault / "key.bin")
+    assert tools.covered_by(link, [vault])
+    assert tools.covered_by(link, [vault / "key.bin"])
+
+
+def test_keyfile_covered_through_hard_link(tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "deep").mkdir(parents=True)
+    key = tmp_path / "key.bin"
+    key.write_bytes(b"k" * 32)
+    try:
+        os.link(key, vault / "deep" / "copy")
+    except (OSError, NotImplementedError):
+        pytest.skip("hard links are not available")
+    assert tools.covered_by(key, [vault])
+    assert tools.covered_by(key, [vault / "deep" / "copy"])
+    assert not tools.covered_by(key, [tmp_path / "vault" / "deep" / "nothing"])
 
 
 def test_split_never_overwrites(tmp_path):

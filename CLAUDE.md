@@ -6,6 +6,11 @@ PySide6 desktop app for file encryption, packaged as an AppImage. It is built lo
 
 - Run from source: `.venv/bin/python run.py`
 - Tests: `.venv/bin/pytest`. Lint: `.venv/bin/ruff check`
+- Fuzzing: `tests/test_fuzz.py` runs a short budget with the suite; `LOCKSMITH_FUZZ=20000` for a long run. New parsers
+  of outside input get a target there.
+- `tests/vectors` are committed files checked by the engine and by `tests/spec_reader.py` (written from
+  `docs/FORMAT.md`). Never regenerate them to make a test pass: a failure means old files no longer open. A format
+  change adds new vectors and updates `docs/FORMAT.md`.
 - Build: `./packaging/build_appimage.sh` → `dist/Locksmith-<arch>.AppImage` (pinned uv + Python 3.14, hash-locked deps)
 - Check a build: `dist/Locksmith-x86_64.AppImage --self-test`; other distros: `./packaging/test_distros.sh` (podman)
 - Windows build (from Linux, via Wine): `./packaging/build_windows.sh` → `dist/Locksmith-windows-x64.exe`.

@@ -4,8 +4,9 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import Signal
-from PySide6.QtWidgets import QApplication, QFileDialog, QVBoxLayout
+from PySide6.QtWidgets import QApplication, QFileDialog, QPlainTextEdit, QVBoxLayout
 
+from ...core import keys
 from ...core.errors import LocksmithError
 from ...core.keys import fingerprint, tpm_available
 from ...core.osutil import IS_WINDOWS
@@ -15,6 +16,8 @@ from ..dialogs import Sheet
 from ..widgets import (
     Button,
     Card,
+    Dropdown,
+    Field,
     IconButton,
     LineEdit,
     Page,
@@ -72,9 +75,12 @@ class KeysPage(Page):
         head = hrow(label("Your identities", "h2", False), None)
         imp = Button("Import", "download", "ghost")
         imp.clicked.connect(self._import)
+        rest = Button("Restore", "refresh", "ghost")
+        rest.clicked.connect(self._restore)
         new = Button("New identity", "plus", "primary")
         new.clicked.connect(self._new_identity)
         head.addWidget(imp)
+        head.addWidget(rest)
         head.addWidget(new)
         self.add(head)
         self.ident_box = QVBoxLayout()
@@ -120,6 +126,8 @@ class KeysPage(Page):
             row.action("copy", "Copy public key", lambda _=0, i=ident: self._copy(i.public))
             row.action("qr", "Show public key as QR", lambda _=0, i=ident: dialogs.qr_view(i.name, i.public))
             row.action("download", "Export backup", lambda _=0, i=ident: self._export(i))
+            row.action("message", "Show backup words", lambda _=0, i=ident: self._backup_words(i))
+            row.action("scissors", "Split into Shamir shares", lambda _=0, i=ident: self._split_identity(i))
             row.action("trash", "Delete", lambda _=0, i=ident: self._delete_identity(i))
             self.ident_box.addWidget(row)
         if not self.store.contacts:
@@ -207,6 +215,88 @@ class KeysPage(Page):
             return
         self.reload(True)
         toast(f"Imported “{ident.name}”", "download")
+
+    # ── words and shares: the raw private key, for restoring on any device ──
+
+    _RAW_WARNING = ("They are this identity's private key, without its passphrase or TPM sealing: anyone "
+                    "who gets them can open every file sent to you. Keep them offline, and make sure "
+                    "nobody can see your screen.")
+
+    def _with_private_key(self, ident, then):
+        """Unlock the identity (passphrase, TPM) off the UI thread and hand its raw key to ``then``."""
+        passphrase = None
+        if ident.is_locked:
+            passphrase = dialogs.prompt("Identity passphrase", f"Unlock “{ident.name}” to back it up.",
+                                        "Passphrase", secret=True, ok="Unlock")
+            if not passphrase:
+                return
+        run_task(lambda r, c: ident.private_raw(passphrase), then, lambda m, k: dialogs.error(m), parent=self)
+
+    def _backup_words(self, ident):
+        if not dialogs.confirm("Show backup words?", "The words restore this identity on any device. "
+                               + self._RAW_WARNING, ok="Show words", icon="key"):
+            return
+
+        def show(raw):
+            words = keys.backup_words(raw)
+            rows = "\n".join(" ".join(words[i:i + 6]) for i in range(0, len(words), 6))
+            dialogs.text_view(f"Backup words for “{ident.name}”", rows,
+                              f"{len(words)} words. Restore them under Keys → Restore.", secret=True)
+        self._with_private_key(ident, show)
+
+    def _split_identity(self, ident):
+        s = Sheet("Split into Shamir shares", "Give each share to a different person or place. Any chosen "
+                  "number of them restores this identity; fewer reveal nothing.", icon="scissors")
+        k = Dropdown({i: f"{i} shares" for i in range(2, 11)})
+        n = Dropdown({i: f"{i} shares" for i in range(2, 16)})
+        k.set_value(2)
+        n.set_value(3)
+        s.add(hrow(Field("Needed to restore", k), Field("Made in total", n)))
+        s.add(label("Together, enough shares are the private key. " + self._RAW_WARNING, "caption"))
+        s.add_button("Cancel", None, "ghost")
+        s.add_button("Split", True, "primary")
+        if not s.exec():
+            return
+        threshold, total = k.value(), n.value()
+        if threshold > total:
+            dialogs.error("You can't need more shares than you make.", "Not enough shares")
+            return
+        self._with_private_key(ident, lambda raw: dialogs.text_view(
+            f"{total} shares of “{ident.name}”, any {threshold} restore it",
+            "\n\n".join(keys.identity_shares(raw, threshold, total)),
+            "Restore them under Keys → Restore.", secret=True))
+
+    def _restore(self):
+        s = Sheet("Restore an identity", "Type its backup words, or paste enough of its Shamir shares.",
+                  width=620, icon="refresh")
+        name = LineEdit("Name, e.g. “Work laptop”")
+        s.add(name)
+        box = QPlainTextEdit()
+        box.setPlaceholderText("Backup words, or one share per line")
+        box.setProperty("mono", "true")
+        box.setMinimumHeight(160)
+        s.add(box)
+        s.add(label("PASSPHRASE (OPTIONAL)", "label"))
+        pw = PasswordField("Protects the private key on this device", strength=True, generate=False)
+        s.add(pw)
+        again = PasswordField("Repeat passphrase", strength=False, generate=False)
+        s.add(again)
+        s.add_button("Cancel", None, "ghost")
+        s.add_button("Restore", True, "primary")
+        if not s.exec():
+            return
+        text, n, p = box.toPlainText(), name.text(), pw.text() or None
+        if not same_secret(pw.text(), again.text()):
+            dialogs.error("The passphrases don’t match, so nothing was restored.", "Passphrases don’t match")
+            return
+
+        def work(r, c):
+            raw = (keys.private_from_shares(text.split()) if "locksmithshare" in text
+                   else keys.private_from_words(text))
+            return self.store.restore(n, raw, p)
+
+        run_task(work, lambda ident: (self.reload(True), toast(f"Restored “{ident.name}”", "key")),
+                 lambda m, k: dialogs.error(m, "Could not restore"), parent=self)
 
     def _toggle_seal(self, ident):
         if ident.is_sealed:

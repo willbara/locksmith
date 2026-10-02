@@ -1,0 +1,136 @@
+{
+  "password": "correct horse battery staple ✓",
+  "keyfile": "be743504b49359bc927665db1e384306ba8727f64f76fbeb9b96f80ff10e3269b1fceb39236011bef8ba37a33985b0c6fc6de0cbc41a92b94ebdfb6a510f6307",
+  "identities": {
+    "classical": "128075dd2aa39bf2764a0dc0c10f3528d413aaa6d37b179b9ca7d0d2508a9af8",
+    "hybrid": "b129dbf44e58ef546add36d7ef6e647f9fe7d154d8a1878ead9592752d72ce2f6b761a8e8ac1af984edf7422da99316c28d2625b01b16aa868e132b94abb625172fd7a22f8deb98b342e1bbc831314ad0760f6e6732bf3523bd51bfcf399c102"
+  },
+  "files": [
+    {
+      "name": "password-aes256gcm-zstd",
+      "file": "password-aes256gcm-zstd.locked",
+      "unlock": {
+        "password": "correct horse battery staple ✓"
+      },
+      "suite": "aes-256-gcm",
+      "slots": 1,
+      "dek": "297c16a4d841c94d1e06abdcadd079c018cb07540b6f2e1647291800125fd46c",
+      "meta": {
+        "name": "password-aes256gcm-zstd.txt",
+        "kind": "text",
+        "comp": "zstd",
+        "size": 117
+      },
+      "content_sha256": "fc68f75b007bb7a1658bab133716eacbfa2c08f527f6a1e0914effdd78113e1f",
+      "content_size": 117
+    },
+    {
+      "name": "password-keyfile-chacha20-padme",
+      "file": "password-keyfile-chacha20-padme.locked",
+      "unlock": {
+        "password": "correct horse battery staple ✓",
+        "keyfile": true
+      },
+      "suite": "chacha20-poly1305",
+      "slots": 1,
+      "dek": "7b88dcaed24ea43c194130d34c10a73a738563296c24a3001ac18d7934326aae",
+      "meta": {
+        "name": "password-keyfile-chacha20-padme.txt",
+        "kind": "file",
+        "comp": "none",
+        "size": 3072
+      },
+      "content_sha256": "12adc9dff80688800f2f591f0da6ab2f8109d61d910697801f57669ec0d719d3",
+      "content_size": 3072
+    },
+    {
+      "name": "keyfile-only-aessiv-bz2",
+      "file": "keyfile-only-aessiv-bz2.locked",
+      "unlock": {
+        "keyfile": true
+      },
+      "suite": "aes-256-siv",
+      "slots": 1,
+      "dek": "cb0a7d167afc2083dde37d0eedca9e100d499062392f17c8f1c69acfac410e11",
+      "meta": {
+        "name": "keyfile-only-aessiv-bz2.txt",
+        "kind": "file",
+        "comp": "bz2",
+        "size": 3072
+      },
+      "content_sha256": "12adc9dff80688800f2f591f0da6ab2f8109d61d910697801f57669ec0d719d3",
+      "content_size": 3072
+    },
+    {
+      "name": "x25519-aesgcmsiv-zlib",
+      "file": "x25519-aesgcmsiv-zlib.locked",
+      "unlock": {
+        "identity": "classical"
+      },
+      "suite": "aes-256-gcm-siv",
+      "slots": 1,
+      "dek": "f3ac675b194255af28d9a36e549501669b5e36f12a6fff1256388d0b83342181",
+      "meta": {
+        "name": "x25519-aesgcmsiv-zlib.txt",
+        "kind": "file",
+        "comp": "zlib",
+        "size": 3072
+      },
+      "content_sha256": "12adc9dff80688800f2f591f0da6ab2f8109d61d910697801f57669ec0d719d3",
+      "content_size": 3072
+    },
+    {
+      "name": "hybrid-ocb3-lzma-hidden-recipients",
+      "file": "hybrid-ocb3-lzma-hidden-recipients.locked",
+      "unlock": {
+        "identity": "hybrid"
+      },
+      "suite": "aes-256-ocb3",
+      "slots": 8,
+      "dek": "aae141699bdda62a16096daded299684a09f3ad4faeb26f81f8177bf0f618d41",
+      "meta": {
+        "name": "hybrid-ocb3-lzma-hidden-recipients.txt",
+        "kind": "text",
+        "comp": "lzma",
+        "size": 117
+      },
+      "content_sha256": "fc68f75b007bb7a1658bab133716eacbfa2c08f527f6a1e0914effdd78113e1f",
+      "content_size": 117
+    },
+    {
+      "name": "cascade2-password-and-recipient-64k",
+      "file": "cascade2-password-and-recipient-64k.locked",
+      "unlock": {
+        "identity": "classical"
+      },
+      "suite": "cascade-2",
+      "slots": 2,
+      "dek": "4140163d5a340b354af10c0001ba3d7f0006a988d60673cac247aa26e4eab71a",
+      "meta": {
+        "name": "cascade2-password-and-recipient-64k.txt",
+        "kind": "text",
+        "comp": "none",
+        "size": 117
+      },
+      "content_sha256": "fc68f75b007bb7a1658bab133716eacbfa2c08f527f6a1e0914effdd78113e1f",
+      "content_size": 117
+    },
+    {
+      "name": "cascade3-folder-armored",
+      "file": "cascade3-folder-armored.locked.txt",
+      "unlock": {
+        "password": "correct horse battery staple ✓"
+      },
+      "suite": "cascade-3",
+      "slots": 1,
+      "dek": "078ce86ef8491b5d2b9af2c7369f183266c6ecfb51ff603ece1f8c70f820b26f",
+      "meta": {
+        "name": "Project",
+        "kind": "dir",
+        "comp": "zstd"
+      },
+      "content_sha256": "a5a9e91ccc6ffbf9804224469c2cfd20f8dc677ab831b1b78feeff42c9eb904b",
+      "content_size": 10240
+    }
+  ]
+}

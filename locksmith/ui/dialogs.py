@@ -308,7 +308,7 @@ class QRCode(QWidget):
         return img
 
 
-def qr_view(title, data: str, caption=""):
+def qr_view(title, data: str, caption="", secret=False):
     s = Sheet(title, caption, width=380, icon="qr")
     try:
         qr = QRCode(data, 300)
@@ -316,8 +316,11 @@ def qr_view(title, data: str, caption=""):
         s.add(label(f"Too much data for a QR code ({e}).", "caption"))
     else:
         s.body.addWidget(qr, 0, Qt.AlignmentFlag.AlignHCenter)
-        c = s.add_button("Copy image", None, "secondary", "copy", close=False)
-        c.clicked.connect(lambda: (QApplication.clipboard().setImage(qr.image()),
-                                   toast("QR code copied", "copy")))
+        # An image on the clipboard gets none of copy_secret's protections, so a secret's
+        # QR code cannot be copied; the secret itself can be, from its field.
+        if not secret:
+            c = s.add_button("Copy image", None, "secondary", "copy", close=False)
+            c.clicked.connect(lambda: (QApplication.clipboard().setImage(qr.image()),
+                                       toast("QR code copied", "copy")))
     s.add_button("Done", True, "primary")
     s.exec()

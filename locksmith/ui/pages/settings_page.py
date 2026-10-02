@@ -86,6 +86,7 @@ class SettingsPage(Page):
         defaults.add(g)
         for key, title, caption in (
             ("hide_name", "Hide file names", "Random names for encrypted files."),
+            ("hide_recipients", "Hide the number of recipients", "Add decoy recipient slots."),
             ("bundle", "Bundle multiple items", "Encrypt several items into one file."),
             ("armor", "ASCII armor", "Produce text output instead of binary."),
             ("strip_metadata", "Remove photo metadata", "Strip location and camera details from images."),

@@ -20,6 +20,7 @@ DEFAULTS = {
     "padding": "none",
     "threads": 0,
     "hide_name": False,
+    "hide_recipients": False,
     "bundle": False,
     "armor": False,
     "shred_after": False,
@@ -64,7 +65,7 @@ class Settings:
         self.data = dict(DEFAULTS)
         try:
             stored = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):
             stored = {}
         if isinstance(stored, dict):
             for key, value in stored.items():

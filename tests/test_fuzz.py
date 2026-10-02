@@ -1,0 +1,278 @@
+"""Mutation fuzzing of every parser that reads input from someone else.
+
+The invariant: any input may only produce a LocksmithError (or succeed), never another
+exception. Each target mutates a valid seed input with a fixed random seed, so a failure
+is reproducible from its target name and iteration number.
+
+The normal test run uses a small budget. For a long run:
+
+    LOCKSMITH_FUZZ=20000 .venv/bin/pytest tests/test_fuzz.py -x
+"""
+
+import base64
+import hashlib
+import io
+import json
+import os
+import random
+import struct
+import tarfile
+
+import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+from locksmith.core import engine, keys, metadata, minisign, tools
+from locksmith.core.engine import DecryptKeys, EncryptOptions
+from locksmith.core.errors import LocksmithError
+
+ITERATIONS = int(os.environ.get("LOCKSMITH_FUZZ", "150"))
+INTERESTING = [b"\x00\x00\x00\x00", b"\xff\xff\xff\xff", b"\x7f\xff\xff\xff", b"\x80\x00\x00\x00",
+               b"\x00\x00\x00\x01", b"\x00\x10\x00\x00"]
+
+
+def mutate(rng: random.Random, data: bytes) -> bytes:
+    b = bytearray(data)
+    for _ in range(rng.randint(1, 6)):
+        op = rng.randrange(7)
+        pos = rng.randrange(len(b) + 1)
+        if op == 0 and b:
+            b[min(pos, len(b) - 1)] ^= 1 << rng.randrange(8)
+        elif op == 1 and b:
+            b[min(pos, len(b) - 1)] = rng.randrange(256)
+        elif op == 2:
+            b[pos:pos] = rng.randbytes(rng.randint(1, 16))
+        elif op == 3 and b:
+            del b[pos:pos + rng.randint(1, 32)]
+        elif op == 4 and b:
+            start = rng.randrange(len(b))
+            b[pos:pos] = b[start:start + rng.randint(1, 64)]
+        elif op == 5:
+            b[pos:pos + 4] = rng.choice(INTERESTING)
+        else:
+            b[pos:] = b""   # truncate
+    return bytes(b)
+
+
+def mutate_text(rng: random.Random, text: str) -> str:
+    return mutate(rng, text.encode()).decode("utf-8", errors="replace")
+
+
+def fuzz(name: str, seed, fn, convert=mutate):
+    rng = random.Random(f"{name}-{ITERATIONS}")
+    for i in range(ITERATIONS):
+        sample = seed(rng) if callable(seed) else convert(rng, seed)
+        try:
+            fn(sample)
+        except LocksmithError:
+            pass
+        except Exception as e:  # noqa: BLE001
+            raise AssertionError(f"{name}, iteration {i}: {type(e).__name__}: {e}\ninput: {sample!r:.400}") from e
+
+
+# ── seeds ────────────────────────────────────────────────────────────────────
+
+FAST = dict(kdf="pbkdf2-sha512", preset="fast")
+
+
+@pytest.fixture(scope="module")
+def ident():
+    return os.urandom(32)
+
+
+@pytest.fixture(scope="module")
+def recipient_file(ident):
+    pub = keys.public_from_private(ident)
+    return engine.encrypt_bytes(b"hello fuzz " * 300, EncryptOptions(recipients=[pub], chunk_size=1024,
+                                                                   compression="zlib", **FAST))
+
+
+def _forge(ident: bytes, frames: list[bytes], meta_raw: bytes, chunk=1024) -> bytes:
+    """A correctly encrypted message whose frame plaintexts and metadata we choose."""
+    opts = EncryptOptions(recipients=[keys.public_from_private(ident)], chunk_size=chunk, **FAST)
+    header, k = engine._build_header(opts, {"kind": "file"}, engine._Checker(None, None))
+    h = json.loads(header)
+    n = os.urandom(12)
+    c = AESGCM(k.meta_key).encrypt(n, meta_raw, k.fmt.label + b"meta")
+    h["meta"] = {"n": base64.b64encode(n).decode(), "c": base64.b64encode(c).decode()}
+    header = json.dumps(h, separators=(",", ":")).encode()
+    prefix, aad = base64.b64decode(h["np"]), hashlib.sha256(header).digest()
+    out = io.BytesIO(engine.MAGIC + struct.pack(">I", len(header)) + header)
+    out.seek(0, 2)
+    for i, fr in enumerate(frames):
+        ct = k.cipher.seal(engine._nonce(prefix, i, i == len(frames) - 1), fr, aad)
+        out.write(struct.pack(">I", len(ct)) + ct)
+    return out.getvalue()
+
+
+def _tar(members: dict[str, bytes]) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT) as tar:
+        for name, data in members.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+# ── file format ──────────────────────────────────────────────────────────────
+
+def test_fuzz_header_parser(recipient_file):
+    fuzz("header", recipient_file[:2048], engine.inspect_bytes)
+
+
+def test_fuzz_header_json_structure(recipient_file):
+    """Swap header values for values of other types and shapes, keeping valid JSON."""
+    (hlen,) = struct.unpack(">I", recipient_file[8:12])
+    header = json.loads(recipient_file[12:12 + hlen])
+    odd = [None, True, 0, -1, 2**63, 1.5, "", "x" * 100, "AAAA", [], {}, [1, 2], {"t": "pw"}]
+
+    def sample(rng):
+        h = json.loads(json.dumps(header))
+        for _ in range(rng.randint(1, 3)):
+            target, key = h, rng.choice(list(h))
+            if isinstance(h[key], dict) and h[key] and rng.random() < 0.5:
+                target, key = h[key], rng.choice(list(h[key]))
+            elif isinstance(h[key], list) and h[key] and rng.random() < 0.5:
+                slot = rng.choice(h[key])
+                if isinstance(slot, dict) and slot:
+                    target, key = slot, rng.choice(list(slot))
+            target[key] = json.loads(json.dumps(rng.choice(odd)))  # a fresh copy each time
+        raw = json.dumps(h).encode()
+        return engine.MAGIC + struct.pack(">I", len(raw)) + raw
+
+    fuzz("header-json", sample, engine.inspect_bytes)
+
+
+def test_fuzz_whole_file_decrypt(recipient_file, ident):
+    fuzz("decrypt", recipient_file, lambda b: engine.decrypt_bytes(b, DecryptKeys(identities=[ident])))
+
+
+def test_fuzz_authenticated_plaintext(ident):
+    """A sender holding a valid key controls frame contents and metadata completely."""
+    frames = [engine.FRAME_HDR.pack(1, 0) + b"", engine.FRAME_HDR.pack(0, 5) + b"hello",
+              engine.FRAME_HDR.pack(2, 0) + bytes(16)]
+    zlib_frame = engine.FRAME_HDR.pack(1, 0) + tools.hashlib.sha256(b"").digest()
+    metas = [b'{"name":"a.txt","kind":"file","comp":"zlib","size":5}', b'{"kind":"dir","comp":"none"}']
+
+    def sample(rng):
+        fr = [mutate(rng, rng.choice(frames + [zlib_frame])) for _ in range(rng.randint(1, 3))]
+        meta = mutate(rng, rng.choice(metas)) if rng.random() < 0.5 else rng.choice(metas)
+        return _forge(ident, fr, meta)
+
+    fuzz("plaintext", sample, lambda b: engine.decrypt_bytes(b, DecryptKeys(identities=[ident])))
+
+
+def test_fuzz_folder_archive(tmp_path):
+    seed = _tar({"proj/a.txt": b"a" * 600, "proj/sub/b.txt": b"b", "proj/" + "n" * 150: b"long"})
+    counter = iter(range(10**9))
+
+    def run(data):
+        path = tmp_path / "x.tar"
+        path.write_bytes(data)
+        engine.extract_archive(path, tmp_path / f"out{next(counter)}")
+
+    fuzz("archive", seed, run)
+
+
+def test_fuzz_armor(recipient_file):
+    fuzz("armor", engine.armor(recipient_file[:600]), engine.dearmor, mutate_text)
+
+
+# ── keys, shares and backups ─────────────────────────────────────────────────
+
+def test_fuzz_public_keys():
+    for raw in (os.urandom(32), keys.public_from_private(os.urandom(96))):
+        fuzz("public-key", keys.encode_public(keys.public_from_private(raw) if len(raw) == 96 else raw),
+             keys.decode_public, mutate_text)
+
+
+def test_fuzz_shares_and_words():
+    shares = "\n".join(tools.shamir_split(b"secret password", 2, 3))
+    fuzz("shares", shares, lambda t: tools.shamir_combine(t.split()), mutate_text)
+    id_shares = "\n".join(keys.identity_shares(os.urandom(32), 2, 3))
+    fuzz("identity-shares", id_shares, lambda t: keys.private_from_shares(t.split()), mutate_text)
+    fuzz("words", " ".join(keys.backup_words(os.urandom(96))), keys.private_from_words, mutate_text)
+
+
+def test_fuzz_identity_backup(tmp_path):
+    store = keys.KeyStore(tmp_path / "src")
+    ident = store.generate("me", post_quantum=False)
+    store.export_identity(ident, tmp_path / "backup.json")
+    seed = (tmp_path / "backup.json").read_text(encoding="utf-8")
+    target = keys.KeyStore(tmp_path / "dst")
+
+    def run(text):
+        (tmp_path / "evil.json").write_text(text, encoding="utf-8")
+        try:
+            target.import_identity(tmp_path / "evil.json")
+        finally:
+            target.identities.clear()
+
+    fuzz("identity-backup", seed, run, mutate_text)
+
+
+def test_fuzz_key_store(tmp_path):
+    src = keys.KeyStore(tmp_path / "seed")
+    src.generate("me", post_quantum=False)
+    src.add_contact("friend", keys.encode_public(keys.public_from_private(os.urandom(32))))
+    seed = (tmp_path / "seed" / "keys.json").read_text(encoding="utf-8")
+    counter = iter(range(10**9))
+
+    def run(text):
+        d = tmp_path / f"s{next(counter)}"
+        d.mkdir()
+        (d / "keys.json").write_text(text, encoding="utf-8")
+        store = keys.KeyStore(d)
+        store.unlocked_private_keys()
+        store.save()
+
+    fuzz("key-store", seed, run, mutate_text)
+
+
+# ── tools ────────────────────────────────────────────────────────────────────
+
+def test_fuzz_minisign(tmp_path):
+    sk = Ed25519PrivateKey.generate()
+    key_id, f = os.urandom(8), tmp_path / "f"
+    f.write_bytes(b"signed data")
+    sig = sk.sign(hashlib.blake2b(b"signed data", digest_size=64).digest())
+    comment = "timestamp:1\tfile:f"
+    sig_text = ("untrusted comment: x\n" + base64.b64encode(b"ED" + key_id + sig).decode() + "\ntrusted comment: "
+                + comment + "\n" + base64.b64encode(sk.sign(sig + comment.encode())).decode() + "\n")
+    pub = base64.b64encode(b"Ed" + key_id + sk.public_key().public_bytes_raw()).decode()
+    assert minisign.verify_file(f, sig_text, pub).trusted_comment == comment
+    fuzz("minisign-sig", sig_text, lambda t: minisign.verify_file(f, t, pub), mutate_text)
+    fuzz("minisign-key", pub, lambda t: minisign.verify_file(f, sig_text, t), mutate_text)
+
+
+def test_fuzz_manifest(tmp_path):
+    folder = tmp_path / "folder"
+    (folder / "sub").mkdir(parents=True)
+    (folder / "a.txt").write_text("a", encoding="utf-8")
+    (folder / "sub" / "b.txt").write_text("b", encoding="utf-8")
+    seed = tools.make_manifest(folder, "sha256") + "\\SHA512 (x\\\\y) = " + "0" * 128 + "\n"
+    fuzz("manifest", seed, lambda t: tools.verify_manifest(t, folder), mutate_text)
+
+
+@pytest.mark.parametrize("kind", ["jpeg", "png", "webp"])
+def test_fuzz_image_metadata(tmp_path, kind):
+    seeds = {
+        "jpeg": (b"\xff\xd8" + b"\xff\xe0\x00\x10JFIF\x00\x01\x02\x00\x00\x01\x00\x01\x00\x00"
+                 + b"\xff\xe1\x00\x1eExif\x00\x00MM\x00\x2a\x00\x00\x00\x08\x00\x01\x01\x12\x00\x03\x00\x00"
+                 + b"\x00\x01\x00\x06\x00\x00" + b"\xff\xda\x00\x08\x01\x01\x00\x00\x3f\x00\x12\x34\xff\xd9"),
+        "png": (b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR" + bytes(13) + bytes(4)
+                + struct.pack(">I", 4) + b"tEXt" + b"abcd" + bytes(4) + struct.pack(">I", 0) + b"IEND" + bytes(4)),
+        "webp": (b"RIFF" + struct.pack("<I", 4 + 18 + 12) + b"WEBP" + b"VP8X" + struct.pack("<I", 10) + bytes(10)
+                 + b"EXIF" + struct.pack("<I", 4) + b"abcd"),
+    }
+    path = tmp_path / f"img.{kind}"
+
+    def run(data):
+        path.write_bytes(data)
+        plan = metadata.plan_for(path)
+        if plan is not None:
+            with metadata.PlanReader(path, plan.plan) as r:
+                r.read()
+
+    fuzz(f"image-{kind}", seeds[kind], run)

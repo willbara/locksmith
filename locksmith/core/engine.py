@@ -53,7 +53,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from . import compress as comp
 from . import kdf as kdfmod
-from . import metadata
+from . import metadata, scratch
 from .ciphers import NONCE_SIZE, SUITES, SuiteCipher, layer_key_sizes
 from .errors import CancelledError, CorruptedError, LocksmithError, WrongKeyError
 from .osutil import IS_WINDOWS, copy_zone_identifier, fsync_dir, fsync_tree, open_new, portable_name, windows_unsafe
@@ -144,6 +144,7 @@ class EncryptOptions:
     note: str = ""
     armor: bool = False
     strip_metadata: bool = False   # JPEG/PNG/WebP metadata, file times and archive owner names
+    hide_recipients: bool = False  # pad recipient slots with dummies so their number is hidden
 
 
 @dataclass
@@ -405,21 +406,11 @@ def _build_header(opts: EncryptOptions, meta: dict, chk: _Checker,
                       "kf": bool(kf_hash), "n": _b64(nonce), "w": _b64(wrapped)})
 
     for rpk in opts.recipients:
-        eph = X25519PrivateKey.generate()
-        epk = eph.public_key().public_bytes_raw()
-        ss_x = _x25519_exchange(eph, rpk[:X25519_LEN])
-        if len(rpk) == X25519_LEN:
-            nonce, wrapped = _wrap(_recipient_kek(ss_x, epk, rpk, fmt), dek, b"x25519", fmt)
-            slots.append({"t": "x25519", "epk": _b64(epk), "n": _b64(nonce), "w": _b64(wrapped)})
-        else:
-            try:
-                ss_m, kem_ct = MLKEM768PublicKey.from_public_bytes(rpk[X25519_LEN:]).encapsulate()
-            except ValueError:
-                raise LocksmithError("A recipient's post-quantum key is invalid.") from None
-            kek = _hybrid_kek(ss_x, ss_m, epk, kem_ct, rpk, fmt)
-            nonce, wrapped = _wrap(kek, dek, HYBRID.encode(), fmt)
-            slots.append({"t": HYBRID, "epk": _b64(epk), "kct": _b64(kem_ct),
-                          "n": _b64(nonce), "w": _b64(wrapped)})
+        slots.append(_recipient_slot(rpk, dek, fmt))
+    for rpk in _dummy_recipients(opts):
+        # A genuine slot for a key that is thrown away at once, wrapping a random value:
+        # it looks exactly like a real one, and nothing can ever open it.
+        slots.append(_recipient_slot(rpk, secrets.token_bytes(32), fmt))
 
     # Shuffle so slot order leaks nothing about who was added first.
     secrets.SystemRandom().shuffle(slots)
@@ -449,6 +440,46 @@ def _build_header(opts: EncryptOptions, meta: dict, chk: _Checker,
         raise LocksmithError("These settings would make a file that can't be opened. "
                              "Nothing was written.") from e
     return raw, keys
+
+
+def _recipient_slot(rpk: bytes, dek: bytes, fmt: Format) -> dict:
+    eph = X25519PrivateKey.generate()
+    epk = eph.public_key().public_bytes_raw()
+    ss_x = _x25519_exchange(eph, rpk[:X25519_LEN])
+    if len(rpk) == X25519_LEN:
+        nonce, wrapped = _wrap(_recipient_kek(ss_x, epk, rpk, fmt), dek, b"x25519", fmt)
+        return {"t": "x25519", "epk": _b64(epk), "n": _b64(nonce), "w": _b64(wrapped)}
+    try:
+        ss_m, kem_ct = MLKEM768PublicKey.from_public_bytes(rpk[X25519_LEN:]).encapsulate()
+    except ValueError:
+        raise LocksmithError("A recipient's post-quantum key is invalid.") from None
+    kek = _hybrid_kek(ss_x, ss_m, epk, kem_ct, rpk, fmt)
+    nonce, wrapped = _wrap(kek, dek, HYBRID.encode(), fmt)
+    return {"t": HYBRID, "epk": _b64(epk), "kct": _b64(kem_ct), "n": _b64(nonce), "w": _b64(wrapped)}
+
+
+def recipient_slot_target(real: int, password: bool) -> int:
+    """How many recipient slots a file with ``real`` recipients gets when their number is
+    hidden: the next of 8, 16, 32 or 64, keeping the whole file within MAX_SLOTS."""
+    target = 8
+    while target < real:
+        target *= 2
+    return max(real, min(target, MAX_SLOTS - password))
+
+
+def _dummy_recipients(opts: EncryptOptions) -> list[bytes]:
+    if not (opts.hide_recipients and opts.recipients):
+        return []
+    n = recipient_slot_target(len(opts.recipients), bool(opts.password or opts.keyfile)) - len(opts.recipients)
+    # Same kind as the real recipients (post-quantum if any is), so the slot types reveal nothing more.
+    hybrid = any(len(r) > X25519_LEN for r in opts.recipients)
+    keys = []
+    for _ in range(n):
+        raw = X25519PrivateKey.generate().public_key().public_bytes_raw()
+        if hybrid:
+            raw += MLKEM768PrivateKey.generate().public_key().public_bytes_raw()
+        keys.append(raw)
+    return keys
 
 
 def _read_header(f: BinaryIO) -> tuple[dict, bytes, Format]:
@@ -563,7 +594,17 @@ class _Identity:
 
 def _unlock(header: dict, keys: DecryptKeys, chk: _Checker, fmt: Format) -> _Keys:
     salt = _unb64(header["salt"])
+    commitment = _unb64(header["kc"])
     dek = None
+
+    def committed(candidate: bytes | None) -> bytes | None:
+        # A slot whose key fails the commitment is treated like a slot that didn't open:
+        # the search goes on, and a tampered header reads as a wrong key, not a separate
+        # error that tells a prober their slot unwrapped.
+        if candidate is None:
+            return None
+        ok = hmac.compare_digest(_hkdf(candidate, 32, salt, fmt.label + b"commit"), commitment)
+        return candidate if ok else None
 
     idents = [_Identity(raw) for raw in keys.identities]
     for slot in header["slots"]:
@@ -585,7 +626,7 @@ def _unlock(header: dict, keys: DecryptKeys, chk: _Checker, fmt: Format) -> _Key
                 kek, kind = _hybrid_kek(ss_x, ss_m, epk, kem_ct, ident.public, fmt), HYBRID.encode()
             else:
                 continue
-            dek = _unwrap(kek, _unb64(slot["n"]), _unb64(slot["w"]), kind, fmt)
+            dek = committed(_unwrap(kek, _unb64(slot["n"]), _unb64(slot["w"]), kind, fmt))
             if dek:
                 break
         if dek:
@@ -600,7 +641,7 @@ def _unlock(header: dict, keys: DecryptKeys, chk: _Checker, fmt: Format) -> _Key
             chk.report(None, "Deriving key")
             kek = _password_kek(keys.password, kf_hash, _unb64(slot["salt"]),
                                 slot["kdf"], slot["p"], fmt)
-            dek = _unwrap(kek, _unb64(slot["n"]), _unb64(slot["w"]), b"pw", fmt)
+            dek = committed(_unwrap(kek, _unb64(slot["n"]), _unb64(slot["w"]), b"pw", fmt))
             if dek:
                 break
 
@@ -613,10 +654,7 @@ def _unlock(header: dict, keys: DecryptKeys, chk: _Checker, fmt: Format) -> _Key
             raise WrongKeyError("None of your identities can open this file.")
         raise WrongKeyError("Wrong password, keyfile or identity.")
 
-    k = _Keys(dek, salt, header["suite"], fmt)
-    if not hmac.compare_digest(k.commitment, _unb64(header["kc"])):
-        raise CorruptedError("Key commitment check failed. The header was tampered with.")
-    return k
+    return _Keys(dek, salt, header["suite"], fmt)
 
 
 # Expected type of each metadata field. The sender chooses the metadata, so a
@@ -1144,47 +1182,49 @@ def decrypt_path(path: Path, out_dir: Path | None, keys: DecryptKeys, threads: i
         tmp = out_dir / f".locksmith-{secrets.token_hex(6)}.part"
         skipped: list[str] = []
         complete = True
-        try:
-            with create_private(tmp) as out:
-                _decrypt_stream(f, total, header, raw, k, meta, out, threads, chk)
-                out.flush()
-                os.fsync(out.fileno())
-            kind = meta.get("kind", "file")
-            if kind in ("dir", "bundle"):
-                chk.report(None, "Extracting")
-                target = unique_path(out_dir / name)
-                if kind == "dir":
-                    staging = out_dir / f".locksmith-{secrets.token_hex(6)}"
-                    ext = extract_archive(tmp, staging)
-                    # Unwrap the archive's top-level folder (stored under its original
-                    # name, which may differ from the safe one). Only a real folder: a
-                    # symlink moved out of staging would resolve against the output folder.
-                    inner = next((e for e in staging.iterdir() if safe_name(e.name) == name
-                                  and e.is_dir() and not e.is_symlink()), staging)
-                    os.replace(inner, target)
-                    # Anything stored beside the top-level folder is discarded: report it.
-                    if staging.exists():
-                        ext.skipped += sorted(e.name for e in staging.iterdir())
-                    shutil.rmtree(staging, ignore_errors=True)
+        with scratch.tracked(tmp):  # removed on the next start if this run is killed
+            try:
+                with create_private(tmp) as out:
+                    _decrypt_stream(f, total, header, raw, k, meta, out, threads, chk)
+                    out.flush()
+                    os.fsync(out.fileno())
+                kind = meta.get("kind", "file")
+                if kind in ("dir", "bundle"):
+                    chk.report(None, "Extracting")
+                    target = unique_path(out_dir / name)
+                    if kind == "dir":
+                        staging = out_dir / f".locksmith-{secrets.token_hex(6)}"
+                        with scratch.tracked(staging):
+                            ext = extract_archive(tmp, staging)
+                            # Unwrap the archive's top-level folder (stored under its original
+                            # name, which may differ from the safe one). Only a real folder: a
+                            # symlink moved out of staging would resolve against the output folder.
+                            inner = next((e for e in staging.iterdir() if safe_name(e.name) == name
+                                          and e.is_dir() and not e.is_symlink()), staging)
+                            os.replace(inner, target)
+                            # Anything stored beside the top-level folder is discarded: report it.
+                            if staging.exists():
+                                ext.skipped += sorted(e.name for e in staging.iterdir())
+                            shutil.rmtree(staging, ignore_errors=True)
+                    else:
+                        ext = extract_archive(tmp, target)
+                    skipped = ext.skipped
+                    complete = ext.flushed and not ext.skipped and not ext.renamed
+                    tmp.unlink(missing_ok=True)
                 else:
-                    ext = extract_archive(tmp, target)
-                skipped = ext.skipped
-                complete = ext.flushed and not ext.skipped and not ext.renamed
+                    target = unique_path(out_dir / name)
+                    os.replace(tmp, target)
+                    mtime = meta.get("mtime")
+                    if isinstance(mtime, int) and not isinstance(mtime, bool):
+                        try:
+                            os.utime(target, (time.time(), mtime))
+                        except (OverflowError, OSError, ValueError):
+                            pass
+                # Callers may delete the source as soon as this returns.
+                complete = fsync_dir(out_dir) and complete
+            except BaseException:
                 tmp.unlink(missing_ok=True)
-            else:
-                target = unique_path(out_dir / name)
-                os.replace(tmp, target)
-                mtime = meta.get("mtime")
-                if isinstance(mtime, int) and not isinstance(mtime, bool):
-                    try:
-                        os.utime(target, (time.time(), mtime))
-                    except (OverflowError, OSError, ValueError):
-                        pass
-            # Callers may delete the source as soon as this returns.
-            complete = fsync_dir(out_dir) and complete
-        except BaseException:
-            tmp.unlink(missing_ok=True)
-            raise
+                raise
     copy_zone_identifier(path, target)
     chk.report(1.0, "Done")
     return DecryptResult(target, meta, skipped=skipped, complete=complete)
@@ -1225,6 +1265,35 @@ def _extracted_key(dest: str, name: str) -> str:
     return key.casefold() if IS_WINDOWS else key
 
 
+# Long names, link targets and PAX records are a few KB at most. tarfile reads such a
+# header into memory whole, whatever size it declares, so a compressed archive could
+# otherwise expand one into gigabytes of memory.
+MAX_ARCHIVE_HEADER = 1 << 20
+_HEADER_TYPES = (tarfile.GNUTYPE_LONGNAME, tarfile.GNUTYPE_LONGLINK, tarfile.XHDTYPE, tarfile.XGLTYPE,
+                 tarfile.SOLARIS_XHDTYPE)
+_SPARSE = "The archive inside the file holds a sparse file, which Locksmith never writes."
+
+
+class _BoundedTarInfo(tarfile.TarInfo):
+    """Refuses oversized metadata headers and sparse members before tarfile reads them.
+    Locksmith never writes sparse members (tarfile cannot), and their maps are read
+    without limit, so only a crafted archive has them."""
+
+    def _proc_member(self, tar):
+        if self.type in _HEADER_TYPES and self.size > MAX_ARCHIVE_HEADER:
+            raise CorruptedError("The archive inside the file is damaged (an oversized header).")
+        if self.type == tarfile.GNUTYPE_SPARSE:
+            raise CorruptedError(_SPARSE)
+        member = super()._proc_member(tar)
+        if member.sparse is not None:  # sparse formats 0.0 and 0.1, declared in a PAX header
+            raise CorruptedError(_SPARSE)
+        return member
+
+    def _proc_gnusparse_10(self, next, pax_headers, tar):  # noqa: A002 (tarfile's signature)
+        # Format 1.0 reads its map from the member's data, as many numbers as it declares.
+        raise CorruptedError(_SPARSE)
+
+
 def extract_archive(archive: Path, dest: Path) -> Extraction:
     """Extract with the tarfile "data" filter. Members the filter rejects (such as
     links pointing outside the folder, or device files) are skipped and reported
@@ -1240,6 +1309,10 @@ def extract_archive(archive: Path, dest: Path) -> Extraction:
         # stream and "CON" is a device: skip anything Windows cannot create safely.
         if IS_WINDOWS and any(windows_unsafe(part) for part in name.split("/") if part):
             skipped.append(name)
+            return None
+        # No file system accepts a NUL in a name; the filter's path checks would raise.
+        if "\x00" in name or "\x00" in (member.linkname or ""):
+            skipped.append(name.replace("\x00", "\\0"))
             return None
         try:
             member = tarfile.data_filter(member, path)
@@ -1257,13 +1330,23 @@ def extract_archive(archive: Path, dest: Path) -> Extraction:
         extracted[key] = member.isdir()
         if member.name != name:  # e.g. a leading "/" stripped
             result.renamed.append(name)
+        # Owner only, like a decrypted file: the archived modes (often 0755/0644) would let
+        # other users read the plaintext wherever the output folder is reachable.
+        if member.isdir():
+            member = member.replace(mode=0o700, deep=False)
+        elif (member.isreg() or member.islnk()) and member.mode is not None:
+            member = member.replace(mode=member.mode & 0o700, deep=False)
         return member
 
     dest.mkdir(mode=0o700, parents=True, exist_ok=False)
     try:
-        with tarfile.open(archive, "r:") as tar:
+        with tarfile.open(archive, "r:", tarinfo=_BoundedTarInfo) as tar:
             tar.extractall(dest, filter=keep_safe)
-    except (tarfile.TarError, OSError) as e:
+    except CorruptedError:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
+    except (tarfile.TarError, OSError, ValueError) as e:
+        # ValueError: values tarfile itself cannot handle in a crafted header.
         shutil.rmtree(dest, ignore_errors=True)
         raise LocksmithError(f"Could not unpack the archive: {e}") from e
     result.flushed = fsync_tree(dest)

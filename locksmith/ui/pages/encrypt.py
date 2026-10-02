@@ -85,6 +85,11 @@ class EncryptPage(Page):
         self.recipients.changed.connect(self._update_state)
         self.recipients.manage.connect(self.keys_requested)
         rl.addWidget(self.recipients)
+        self.hide_recipients = ToggleRow(
+            "Hide the number of recipients",
+            "Adds decoy recipient slots, so the file shows 8, 16, 32 or 64 instead of how many people "
+            "can really open it.", settings["hide_recipients"])
+        rl.addWidget(self.hide_recipients)
         self.rcpt_box.setVisible(False)
         prot.add(self.rcpt_box)
         self.add(prot)
@@ -243,6 +248,7 @@ class EncryptPage(Page):
             keyfile=self.keyfile.path if mode in (0, 2) else None,
             recipients=self.recipients.selected() if mode in (1, 2) else [],
             hide_name=self.hide_name.isChecked(), note=self.note.text().strip(),
+            hide_recipients=mode in (1, 2) and self.hide_recipients.isChecked(),
             armor=self.armor.isChecked(), strip_metadata=self.strip.isChecked(),
         )
 
@@ -263,6 +269,11 @@ class EncryptPage(Page):
             dialogs.error("The keyfile is one of the items being shredded, or inside one of them. "
                           "Shredding would destroy it, and the encrypted files could never be opened. "
                           "Move the keyfile somewhere else or turn off shredding.", "Keyfile would be shredded")
+            return
+        if shred and tools.covered_by(self.store.path, paths):
+            dialogs.error("Locksmith’s own keys are inside one of the items being shredded. Shredding "
+                          "would destroy your private keys, and files encrypted to you could never be "
+                          "opened again. Leave that folder out or turn off shredding.", "Keys would be shredded")
             return
         own = {i.public_raw for i in self.store.identities}
         if shred and not (opts.password or opts.keyfile) and not own.intersection(opts.recipients):

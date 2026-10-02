@@ -8,7 +8,7 @@ from PySide6.QtWidgets import QApplication, QFileDialog, QGridLayout, QPlainText
 from ...core import engine, tools
 from ...core.engine import DecryptKeys, EncryptOptions
 from ...core.errors import LocksmithError
-from ...core.keys import fingerprint
+from ...core.keys import fingerprint, is_identity_secret
 from .. import dialogs, host
 from ..lock import mark_sensitive
 from ..settings import settings
@@ -293,7 +293,8 @@ class SharePage(Page):
             toast("Enter a secret first", "alert")
             return
         dialogs.qr_view("Scan to copy", self.secret.text(),
-                        "Only show this to people you trust. Anyone who sees it can read the secret.")
+                        "Only show this to people you trust. Anyone who sees it can read the secret.",
+                        secret=True)
 
     def _split_secret(self):
         secret, k, n = self.secret.text(), self.k.value(), self.n.value()
@@ -302,6 +303,11 @@ class SharePage(Page):
             return
         if k > n:
             toast("Need at least as many shares as people required", "alert")
+            return
+        if is_identity_secret(secret.encode()):
+            # Combining would take it for an identity and never show it.
+            dialogs.error("This secret has the exact shape of an identity backup, so its shares could only "
+                          "be restored as one. Change it slightly and split it again.", "Can't split this")
             return
         shares = tools.shamir_split(secret.encode(), k, n)
         dialogs.text_view(f"{n} shares — any {k} recover the secret", "\n\n".join(shares),
@@ -315,6 +321,10 @@ class SharePage(Page):
             secret = tools.shamir_combine(text.split())
         except LocksmithError as e:
             dialogs.error(str(e))
+            return
+        if is_identity_secret(secret):
+            # Never show a private key as text: it is restored, not read.
+            dialogs.info("These shares hold an identity", "Restore it under Keys → Restore.", icon="key")
             return
         dialogs.text_view("Recovered secret", secret.decode("utf-8", errors="replace"), secret=True)
 

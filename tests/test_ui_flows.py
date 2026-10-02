@@ -112,6 +112,27 @@ def test_recipients_only_shred_warns(tmp_path, window):
     assert window.asked[0] == "You won’t be able to open these"
 
 
+def test_shred_refuses_keyfile_inside_inputs(tmp_path, window):
+    e = window.encrypt
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "a.txt").write_text("hello\n", encoding="utf-8")
+    (vault / "key.bin").write_bytes(os.urandom(64))
+    key = (vault / "key.bin").read_bytes()
+    e.add_paths([str(vault)])
+    e.keyfile.set_path(str(vault / "key.bin"))
+    e.shred.setChecked(True)
+    e.output._dir = str(tmp_path / "out")
+    e.output._rebuild()
+    assert e.go.isEnabled()
+    e.go.click()
+    wait(lambda: e.task is None)
+    assert any(a.startswith("ERROR: The keyfile") for a in window.asked)
+    assert (vault / "key.bin").read_bytes() == key
+    assert (vault / "a.txt").read_text(encoding="utf-8") == "hello\n"
+    assert not list(tmp_path.glob("out/*.locked"))
+
+
 def test_lock_and_panic_clear_secrets(window):
     from locksmith.ui import dialogs
     from locksmith.ui.widgets import PasswordField, copy_secret

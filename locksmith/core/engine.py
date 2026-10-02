@@ -99,7 +99,7 @@ MIN_KEYFILE_ONLY = 32       # bytes a keyfile needs when it is the only secret
 MAX_FRAMES = 1 << 32        # the frame counter is 32 bits
 # ASCII armor is built and parsed in memory (peak about 4x the size), so it is
 # meant for messages and small files only.
-MAX_ARMOR_INPUT = 64 << 20        # plaintext size accepted for armored output
+MAX_ARMOR_INPUT = 64 << 20        # plaintext size accepted for armored output and in-memory messages
 MAX_ARMOR_TEXT = 128 << 20        # armored text accepted when decrypting
 NONCE_PREFIX = 7
 FRAME_HDR = struct.Struct(">BI")
@@ -646,7 +646,8 @@ def _nonce(prefix: bytes, index: int, final: bool) -> bytes:
 
 
 def _encrypt_stream(src: BinaryIO, total: int, out: BinaryIO, header: bytes,
-                    keys: _Keys, opts: EncryptOptions, codec_id: str, chk: _Checker):
+                    keys: _Keys, opts: EncryptOptions, codec_id: str, chk: _Checker,
+                    max_input: int | None = None):
     hdr = json.loads(header)
     prefix = _unb64(hdr["np"])
     aad = hashlib.sha256(header).digest()
@@ -696,6 +697,11 @@ def _encrypt_stream(src: BinaryIO, total: int, out: BinaryIO, header: bytes,
             if not blocks:
                 break
             done += sum(map(len, blocks))
+            # Checked on what is actually read: a folder's archive is larger than its
+            # files, and a file can grow while it is read.
+            if max_input is not None and done > max_input:
+                raise LocksmithError(f"Text (ASCII armor) output is limited to {max_input >> 20} MiB. "
+                                     "Turn off ASCII armor for larger files.")
 
             frames = list(pool.map(make_frame, blocks))
             # Adaptive compression: give up early on incompressible data.
@@ -762,7 +768,11 @@ def _frames(f: BinaryIO, limit: int):
 
 
 def _decrypt_stream(f: BinaryIO, total: int, header: dict, raw_header: bytes,
-                    keys: _Keys, meta: dict, out: BinaryIO, threads: int, chk: _Checker):
+                    keys: _Keys, meta: dict, out: BinaryIO, threads: int, chk: _Checker,
+                    max_output: int | None = None):
+    """Decrypt the frames after the header into ``out``. ``max_output`` caps the total
+    plaintext: chunks are capped one by one, but many small chunks can still expand
+    without limit, which matters when ``out`` is in memory."""
     prefix = _unb64(header["np"])
     aad = hashlib.sha256(raw_header).digest()
     chunk = header["chunk"]
@@ -799,6 +809,7 @@ def _decrypt_stream(f: BinaryIO, total: int, header: dict, raw_header: bytes,
         raise CorruptedError("A chunk is malformed.")
 
     index = 0
+    written = 0
     padding = False     # padding frames come only after the last data frame
     started = time.monotonic()
     it = _frames(f, limit)
@@ -818,6 +829,10 @@ def _decrypt_stream(f: BinaryIO, total: int, header: dict, raw_header: bytes,
                 elif padding:
                     raise CorruptedError("A chunk is malformed.")
                 else:
+                    written += len(plain)
+                    if max_output is not None and written > max_output:
+                        raise CorruptedError(f"The content is larger than {max_output >> 20} MiB, "
+                                             "the limit for messages opened in memory.")
                     out.write(plain)
             index += len(items)
             pos = f.tell() if f.seekable() else 0
@@ -1014,7 +1029,8 @@ def encrypt_paths(paths: list[Path], out_dir: Path | None, opts: EncryptOptions,
         with opener() as src:
             if opts.armor:
                 buf = io.BytesIO()
-                _encrypt_stream(src, total, buf, header, keys, opts, codec_id, chk)
+                _encrypt_stream(src, total, buf, header, keys, opts, codec_id, chk,
+                                max_input=MAX_ARMOR_INPUT)
                 write_private(tmp, armor(buf.getvalue()).encode())
             else:
                 with create_private(tmp) as out:
@@ -1056,6 +1072,10 @@ class _NullWriter(io.RawIOBase):
 
 def encrypt_bytes(data: bytes, opts: EncryptOptions, name: str = "message.txt",
                   kind: str = "text") -> bytes:
+    # decrypt_bytes refuses more than this, so every message written here can be read.
+    if len(data) > MAX_ARMOR_INPUT:
+        raise LocksmithError(f"Messages are limited to {MAX_ARMOR_INPUT >> 20} MiB. "
+                             "Encrypt larger content as a file.")
     chk = _Checker(None, None)
     codec_id = _codec_for(opts, [])
     meta = {"name": name, "kind": kind, "comp": codec_id, "created": int(time.time()),
@@ -1177,7 +1197,7 @@ def decrypt_bytes(blob: bytes, keys: DecryptKeys) -> DecryptResult:
     k = _unlock(header, keys, chk, fmt)
     meta = _read_meta(header, k)
     out = io.BytesIO()
-    _decrypt_stream(f, len(blob), header, raw, k, meta, out, 1, chk)
+    _decrypt_stream(f, len(blob), header, raw, k, meta, out, 1, chk, max_output=MAX_ARMOR_INPUT)
     return DecryptResult(None, meta, out.getvalue())
 
 

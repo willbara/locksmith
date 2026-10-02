@@ -259,6 +259,11 @@ class EncryptPage(Page):
                                    ok="Use anyway"):
                 return
         shred = self.shred.isChecked()
+        if shred and opts.keyfile and tools.covered_by(Path(opts.keyfile), paths):
+            dialogs.error("The keyfile is one of the items being shredded, or inside one of them. "
+                          "Shredding would destroy it, and the encrypted files could never be opened. "
+                          "Move the keyfile somewhere else or turn off shredding.", "Keyfile would be shredded")
+            return
         own = {i.public_raw for i in self.store.identities}
         if shred and not (opts.password or opts.keyfile) and not own.intersection(opts.recipients):
             if not dialogs.confirm(

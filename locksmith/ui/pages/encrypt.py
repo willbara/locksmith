@@ -32,7 +32,7 @@ from ..widgets import (
     toast,
 )
 from ..workers import run_task
-from .common import OutputPicker, RecipientPicker, reveal
+from .common import OutputPicker, RecipientPicker, reveal, signer_choices, unlock_signer
 
 THREADS = {0: "Automatic", 1: "1 thread", 2: "2 threads", 4: "4 threads", 8: "8 threads",
            16: "16 threads"}
@@ -174,7 +174,12 @@ class EncryptPage(Page):
         adv.add(Field("Note", self.note))
         self.add(adv)
 
-        # ── output & action ──
+        # ── signing, output & action ──
+        self.sign_as = Dropdown()
+        self.sign_field = Field("Sign as", self.sign_as, "Whoever opens the file can check it was signed with "
+                                "your key and hasn't changed since.")
+        self.add(self.sign_field)
+        self.reload_signers()
         self.output = OutputPicker("Save next to the originals")
         self.add(Field("Output", self.output))
         self.go = Button("Encrypt", "lock", "primary", large=True)
@@ -238,6 +243,12 @@ class EncryptPage(Page):
     def add_paths(self, paths):
         self.files.add(paths)
 
+    def reload_signers(self):
+        """Called when identities change."""
+        choices = signer_choices(self.store)
+        self.sign_as.set_items(choices)
+        self.sign_field.setVisible(len(choices) > 1)
+
     def options(self) -> EncryptOptions:
         mode = self.mode.index()
         return EncryptOptions(
@@ -288,11 +299,17 @@ class EncryptPage(Page):
                 "After encrypting, the original files will be overwritten and deleted. "
                 "This cannot be undone.", ok="Encrypt and shred"):
             return
+        signer = unlock_signer(self.store, self.sign_as.value())
+        if signer is None:
+            return
         out_dir = self.output.directory()
         bundle = self.bundle.isChecked() and len(paths) > 1
         groups = [paths] if bundle else [[p] for p in paths]
 
         def work(report, cancel):
+            ident, passphrase = signer
+            # Unlocking may run Argon2id, so it happens here, off the UI thread.
+            opts.signer = ident.private_raw(passphrase) if ident else None
             outputs, stats = [], {}
             n = len(groups)
             for i, group in enumerate(groups):

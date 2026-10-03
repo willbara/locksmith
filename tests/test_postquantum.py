@@ -2,9 +2,8 @@
 
 import base64
 import hashlib
-import json
-import struct
 
+import fileformat
 import pytest
 
 from locksmith.core import engine, keys
@@ -25,8 +24,7 @@ def _file(tmp_path, data=b"quantum-safe payload"):
 
 def _header(path):
     blob = path.read_bytes()
-    (n,) = struct.unpack(">I", blob[8:12])
-    return blob[:8], json.loads(blob[12:12 + n])
+    return blob[:8], fileformat.split(blob)[0]
 
 
 def test_new_identities_are_hybrid(store):
@@ -42,7 +40,7 @@ def test_hybrid_roundtrip(tmp_path, store):
     ident = store.generate("me")
     enc = engine.encrypt_paths([_file(tmp_path)], tmp_path / "e", EncryptOptions(recipients=[ident.public_raw]))
     magic, header = _header(enc)
-    assert magic == engine.LOCKED.magic and header["v"] == 1
+    assert magic == engine.LOCKED_V2.magic and header["v"] == 2
     assert [s["t"] for s in header["slots"]] == [engine.HYBRID]
     assert engine.inspect(enc).post_quantum_slots == 1
     out = engine.decrypt_path(enc, tmp_path / "d", DecryptKeys(identities=[ident.private_raw()]))
@@ -53,7 +51,7 @@ def test_classical_files_use_the_same_format(tmp_path, store):
     ident = store.generate("old", post_quantum=False)
     enc = engine.encrypt_paths([_file(tmp_path)], tmp_path / "e", EncryptOptions(recipients=[ident.public_raw]))
     magic, header = _header(enc)
-    assert magic == engine.LOCKED.magic and header["v"] == 1
+    assert magic == engine.LOCKED_V2.magic and header["v"] == 2
 
 
 def test_mixed_recipients_and_password(tmp_path, store):
@@ -85,13 +83,11 @@ def test_classical_half_alone_cannot_open_hybrid_slot(tmp_path, store):
 def test_tampered_hybrid_slot_rejected(tmp_path, store, field):
     me = store.generate("me")
     enc = engine.encrypt_paths([_file(tmp_path)], tmp_path / "e", EncryptOptions(recipients=[me.public_raw]))
-    magic, header = _header(enc)
+    header, body = fileformat.split(enc.read_bytes())
     raw = bytearray(base64.b64decode(header["slots"][0][field]))
     raw[5] ^= 1
     header["slots"][0][field] = base64.b64encode(bytes(raw)).decode()
-    blob = json.dumps(header).encode()
-    body = enc.read_bytes()[12 + struct.unpack(">I", enc.read_bytes()[8:12])[0]:]
-    enc.write_bytes(magic + struct.pack(">I", len(blob)) + blob + body)
+    enc.write_bytes(fileformat.join(header, body))
     with pytest.raises((WrongKeyError, CorruptedError)):
         engine.decrypt_path(enc, tmp_path / "d", DecryptKeys(identities=[me.private_raw()]))
 
@@ -101,7 +97,7 @@ def test_version_and_slot_type_must_agree(tmp_path, store):
     enc = engine.encrypt_paths([_file(tmp_path)], tmp_path / "e", EncryptOptions(recipients=[me.public_raw]))
     blob = enc.read_bytes()
     # A header version that contradicts the signature, or an unknown signature, is rejected.
-    for evil in (blob.replace(b'"v":1', b'"v":2', 1), b"LOCKED\x00\x02" + blob[8:]):
+    for evil in (blob.replace(b'"v":2', b'"v":1', 1), b"LOCKED\x00\x01" + blob[8:], b"LOCKED\x00\x03" + blob[8:]):
         enc.write_bytes(evil)
         with pytest.raises(CorruptedError):
             engine.inspect(enc)

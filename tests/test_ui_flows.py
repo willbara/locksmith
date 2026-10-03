@@ -8,7 +8,7 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import Qt  # noqa: E402
+from PySide6.QtCore import QEvent, Qt  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
@@ -42,6 +42,10 @@ def window(tmp_path, monkeypatch):
     w.show()
     yield w
     w.close()
+    # Destroy the window: closed ones stay alive, and theme.apply restyles every live widget,
+    # so each later test's setup would get slower.
+    w.deleteLater()
+    QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
     app.processEvents()
 
 
@@ -289,12 +293,11 @@ def test_pasted_folder_reports_left_out_items_and_unverified_note(tmp_path, wind
     d = window.decrypt
     d.paste_text()
     d.password.setText("pw")
-    (tmp_path / "dec").mkdir()  # a missing output folder would send pasted output to the home folder
-    d.output._dir = str(tmp_path / "dec")
+    d.output._dir = str(tmp_path / "dec")   # doesn't exist yet: it is created, as for files (N7)
     d.output._rebuild()
     d.go.click()
     wait(lambda: d.task is None)
-    (data,) = (tmp_path / "dec").rglob("data.txt")
+    data = tmp_path / "dec" / "proj" / "data.txt"   # unwrapped one level, not proj/proj/ (N7)
     assert data.read_text(encoding="utf-8") == "keep me"
     texts = [lab.text() for lab in d.findChildren(Label)]
     assert any("Left out 1" in t and "abs-link" in t for t in texts)
@@ -411,3 +414,249 @@ def test_minisign_and_manifest_tools(tmp_path, window, monkeypatch):
     t._verify_manifest()
     wait(lambda: t._extra_task is None and "match" in t.extra_result.text())
     assert t.extra_result.text() == "✓  All 1 files match the manifest"
+
+
+def test_ssh_signature_tool(tmp_path, window, monkeypatch):
+    import shutil
+    from pathlib import Path
+
+    from PySide6.QtWidgets import QFileDialog
+    t = window.tools
+    vectors = Path(__file__).resolve().parent / "interop" / "sshsig"
+    f = tmp_path / "message.bin"
+    shutil.copy(vectors / "message.bin", f)
+    shutil.copy(vectors / "ed25519.sig", tmp_path / "message.bin.sig")
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", staticmethod(lambda *a, **k: (str(f), "")))
+    t._ss_pick_file()   # finds message.bin.sig next to it
+    monkeypatch.setattr(QFileDialog, "getOpenFileName",
+                        staticmethod(lambda *a, **k: (str(vectors / "ed25519.pub"), "")))
+    t._ss_load_key()
+    assert t.ss_key.text().startswith("ssh-ed25519 ") and "locksmith-interop" not in t.ss_key.text()
+    t._ss_verify()
+    wait(lambda: t.ss_go.isEnabled() and t.ss_result.text())
+    assert t.ss_result.text() == "✓  Valid signature from key SHA256:xauNrprfcp4IDDUtjL6QVgiksKosYcaX2xHnrsnB1WU"
+    assert t.ss_detail.text() == "ED25519 key  ·  namespace “file”  ·  SHA512"
+
+    t.ss_namespace.setText("git")
+    t._ss_verify()
+    wait(lambda: t.ss_go.isEnabled() and t.ss_result.text())
+    assert t.ss_result.text() == "✕  Not verified" and "made for “file”, not “git”" in t.ss_detail.text()
+
+
+def test_sign_and_verify_through_the_tools_page(tmp_path, window, monkeypatch):
+    from PySide6.QtWidgets import QFileDialog
+
+    from locksmith.ui import dialogs
+    store, t = window.store, window.tools
+    assert not t.sg_go.isEnabled() and not t.sg_none.isHidden()   # no identity can sign yet
+    store.generate("old", post_quantum=False)
+    ident = store.generate("Alice", passphrase="pass phrase")
+    window.keys.reload()   # emits changed: the Tools page lists the identities that can sign
+    assert [t.sg_ident.itemText(i) for i in range(t.sg_ident.count())] == ["Alice"]
+    assert t.sg_go.isEnabled() and t.sg_none.isHidden()
+    f = tmp_path / "release.tar"
+    f.write_bytes(b"release\n" * 1000)
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", staticmethod(lambda *a, **k: (str(f), "")))
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: (str(f) + ".lsig", "")))
+    monkeypatch.setattr(dialogs, "prompt", lambda *a, **k: "pass phrase")
+    t._sg_pick_file()
+    t.sg_comment.setText("<b>Release</b> 1.0")
+    t._sign()
+    wait(lambda: t.sg_go.isEnabled() and (tmp_path / "release.tar.lsig").exists())
+
+    store.add_contact("Alice (contact)", ident.key_text)
+    t._ls_pick_file()   # finds release.tar.lsig next to it
+    t._ls_verify()
+    wait(lambda: t.ls_go.isEnabled() and t.ls_result.text())
+    assert t.ls_result.text() == "✓  Signed with the key you saved as Alice (you)"
+    assert t.ls_comment.text() == "Signed comment: <b>Release</b> 1.0"
+    assert t.ls_detail.text().startswith(f"Fingerprint {keys_fingerprint(ident.key_raw)}")
+
+    f.write_bytes(b"changed")
+    t._ls_verify()
+    wait(lambda: t.ls_go.isEnabled() and t.ls_result.text())
+    assert t.ls_result.text() == "✕  Not verified" and "does not match" in t.ls_detail.text()
+
+    f.write_bytes(b"release\n" * 1000)
+    other = store.generate("Bob")
+    t.ls_key.setText(other.key_text)   # only the pasted key is tried
+    t._ls_verify()
+    wait(lambda: t.ls_go.isEnabled() and t.ls_result.text())
+    assert "None of the keys" in t.ls_detail.text() and "Paste the signer's public key" in t.ls_detail.text()
+
+
+def keys_fingerprint(raw):
+    from locksmith.core.keys import fingerprint
+    return fingerprint(raw)
+
+
+def test_contact_upgrade_asks_and_shows_the_new_fingerprint(window, monkeypatch):
+    from PySide6.QtWidgets import QWidget
+
+    from locksmith.core import keys
+    from locksmith.ui import dialogs
+    from locksmith.ui.dialogs import Sheet
+    store, page = window.store, window.keys
+    source = keys.KeyStore(store.dir / "elsewhere")
+    alice = source.generate("Alice")
+    store.add_contact("Alice", alice.public)   # saved before signing existed
+    confirms = []
+    monkeypatch.setattr(dialogs, "confirm", lambda title, msg, **k: (confirms.append((title, msg)), True)[1])
+
+    def fill(sheet):
+        edits = [w for w in sheet.findChildren(QWidget) if w.__class__.__name__ == "LineEdit"]
+        edits[0].setText("ignored")
+        edits[1].setText(alice.key_text)
+        return True
+
+    monkeypatch.setattr(Sheet, "exec", fill)
+    page._add_contact()
+    assert len(store.contacts) == 1 and store.contacts[0].can_verify
+    title, msg = confirms[0]
+    assert title == "Update “Alice”?" and keys.fingerprint(alice.key_raw) in msg
+
+
+def test_share_page_shows_the_full_key_and_a_fingerprint_qr(window, monkeypatch):
+    from locksmith.core import keys
+    from locksmith.ui import dialogs
+    store, s = window.store, window.share
+    ident = store.generate("Me")
+    window.keys.reload()
+    s.reload()
+    assert s._pub_key == ident.key_text and s.pub_text.text().startswith("locksmith3") and "…" in s.pub_text.text()
+    s.pub_copy.click()
+    assert QApplication.clipboard().text() == ident.key_text
+    assert s.pub_fp.text() == f"Fingerprint  {keys.fingerprint(ident.key_raw)}"
+    shown = []
+    monkeypatch.setattr(dialogs, "qr_view", lambda title, data, caption="", **k: shown.append((data, caption)))
+    s._pub_qr()
+    assert shown[0][0] == keys.qr_text(ident.key_raw) and "fingerprint" in shown[0][1]
+
+
+def _visible_sheets(window):
+    from locksmith.ui.dialogs import Sheet
+    return [s for s in window.findChildren(Sheet) if s.isVisible() and not getattr(s, "_closing", False)]
+
+
+def test_results_that_arrive_after_a_lock_are_not_shown(tmp_path, window, monkeypatch):
+    """N3: a task that finishes after Ctrl+L must not put decrypted text back on screen."""
+    from locksmith.ui import lock
+    from locksmith.ui.widgets import Label
+    toasts = []
+    monkeypatch.setattr(lock, "toast", lambda text, *a, **k: toasts.append(text), raising=False)
+    d = window.decrypt
+    written = tmp_path / "report.pdf"
+    written.write_bytes(b"%PDF")
+    window.locker.lock()
+    d._done([("text", "top secret message", {}), ("file", written, {})])
+    QApplication.processEvents()
+    assert not _visible_sheets(window)
+    texts = [lab.text() for lab in d.findChildren(Label)]
+    assert not any("top secret" in t for t in texts)
+    assert any(t == "report.pdf" for t in texts)   # files already on disk are fine to list
+    window.locker.overlay.unlock()
+    assert toasts and "Decrypted message" in toasts[0] and "Open it again" in toasts[0]
+    assert not window.locker.locked
+
+
+def test_share_message_opened_while_locked_is_withheld(window, monkeypatch):
+    from locksmith.core import engine
+    from locksmith.core.engine import EncryptOptions
+    from locksmith.ui import dialogs, lock
+    toasts = []
+    monkeypatch.setattr(lock, "toast", lambda text, *a, **k: toasts.append(text), raising=False)
+    blob = engine.encrypt_bytes(b"meet at noon", EncryptOptions(password="pw", kdf="pbkdf2-sha512", preset="fast"),
+                                kind="text")
+    monkeypatch.setattr(dialogs, "text_input", lambda *a, **k: engine.armor(blob))
+    monkeypatch.setattr(dialogs, "prompt", lambda *a, **k: "pw")
+    window.share._open_message()   # the result arrives through the event loop, after this lock
+    window.locker.lock()
+    wait(lambda: window.locker.withheld)
+    assert not _visible_sheets(window)
+    window.locker.overlay.unlock()
+    assert "Decrypted message" in toasts[0]
+
+
+def test_sheets_opened_while_locked_stay_under_the_lock_screen(window):
+    from locksmith.ui import dialogs
+    from locksmith.ui.dialogs import Sheet
+    root = window.locker.root
+    window.locker.lock()
+    s = Sheet("Decryption failed")
+    s.open()
+    QApplication.processEvents()
+    order = [c for c in root.children() if c in (s, window.locker.overlay)]
+    assert order == [s, window.locker.overlay] and window.locker.overlay.hasFocus()
+    dialogs.text_view("Backup words for “me”", "secret words", secret=True)   # returns at once
+    assert window.locker.withheld == ["Backup words for “me”"]
+    s.done(None)
+
+
+def test_signed_file_through_encrypt_and_decrypt(tmp_path, window, monkeypatch):
+    from locksmith.core import keys
+    from locksmith.ui import dialogs
+    from locksmith.ui.widgets import Label
+    store, e, d = window.store, window.encrypt, window.decrypt
+    me = store.generate("Alice", passphrase="pass phrase")
+    store.generate("old", post_quantum=False)   # classical: not offered for signing
+    window.keys.reload()
+    choices = [e.sign_as.itemText(i) for i in range(e.sign_as.count())]
+    assert choices == ["Don't sign", "Alice"] and not e.sign_field.isHidden()
+    monkeypatch.setattr(dialogs, "prompt", lambda *a, **k: "pass phrase")
+    src = tmp_path / "invoice.txt"
+    src.write_text("pay 10", encoding="utf-8")
+    e.files.add([str(src)])
+    _set_password(e, "pw-Strong-enough-123")
+    e.note.setText("<b>from Alice</b>")
+    e.sign_as.set_value(store.identities.index(me))
+    e.output._dir = str(tmp_path / "enc")
+    e.output._rebuild()
+    e.start()
+    wait(lambda: e.task is None)
+    (enc,) = (tmp_path / "enc").glob("*.locked")
+
+    def decrypt_and_read():
+        d.files.add([str(enc)])
+        d.password.setText("pw-Strong-enough-123")
+        d.output._dir = str(tmp_path / "dec")
+        d.output._rebuild()
+        d.start()
+        wait(lambda: d.task is None)
+        return [lab.text() for lab in d.findChildren(Label)]
+
+    texts = decrypt_and_read()
+    assert "✓  Signed with the key you saved as Alice (you)" in texts
+    assert "Note (signed): <b>from Alice</b>" in texts
+
+    # The same file, read by someone who hasn't saved Alice's key.
+    store.remove_identity(me)
+    for f in (tmp_path / "dec").iterdir():
+        f.unlink()
+    texts = decrypt_and_read()
+    assert any(t.startswith("Signed by a key you haven't saved (fingerprint "
+                            f"{keys.fingerprint(me.key_raw)})") for t in texts)
+    assert "Note from the sender (not verified): <b>from Alice</b>" in texts
+
+
+def test_signed_message_through_the_share_page(window, monkeypatch):
+    from locksmith.core import engine
+    from locksmith.ui import dialogs
+    store, s = window.store, window.share
+    me = store.generate("Alice")
+    window.keys.reload()
+    assert s.msg_sign.value() == "none"   # signing a message is opt-in
+    s.msg.setPlainText("meet at noon")
+    s.msg_pw.setText("message password 123")
+    s.msg_sign.set_value(store.identities.index(me))
+    s._encrypt_message()
+    wait(lambda: s.msg_out.toPlainText())
+    armored = s.msg_out.toPlainText()
+    assert engine.decrypt_bytes(engine.dearmor(armored), engine.DecryptKeys(
+        password="message password 123", verifiers=[me.key_raw])).signature.verified
+    shown = []
+    monkeypatch.setattr(dialogs, "text_input", lambda *a, **k: armored)
+    monkeypatch.setattr(dialogs, "prompt", lambda *a, **k: "message password 123")
+    monkeypatch.setattr(dialogs, "text_view", lambda title, text, caption="", **k: shown.append((text, caption)))
+    s._open_message()
+    wait(lambda: shown)
+    assert shown[0] == ("meet at noon", "✓  Signed with the key you saved as Alice (you)")

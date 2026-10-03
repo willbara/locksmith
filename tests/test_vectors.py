@@ -61,10 +61,111 @@ def test_vector_opens_with_the_engine(v, tmp_path):
         assert (res.path / inside).read_bytes() == archive.extractfile(m).read()
 
 
-def test_every_suite_and_codec_has_a_vector():
+@pytest.mark.parametrize("vectors", ["v1", "v2"])
+def test_every_suite_and_codec_has_a_vector(vectors):
     from locksmith.core import compress
     from locksmith.core.ciphers import SUITES
-    covered = {v["suite"] for v in VECTORS["files"]}
-    codecs = {v["meta"]["comp"] for v in VECTORS["files"]}
+    files = (VECTORS if vectors == "v1" else V2)["files"]
+    covered = {v["suite"] for v in files}
+    codecs = {v["meta"]["comp"] for v in files}
     assert set(SUITES) <= covered, f"no vector for {set(SUITES) - covered}"
     assert set(compress.CODECS) <= codecs, f"no vector for {set(compress.CODECS) - codecs}"
+
+
+# ── format version 2 (FORMAT.md §1–7, §15) ───────────────────────────────────
+
+V2 = json.loads((HERE / "v2-vectors.json").read_text(encoding="utf-8"))
+
+
+def _signer_public() -> bytes:
+    return spec_reader.public3(bytes.fromhex(VECTORS["identities"][V2["signer"]]))
+
+
+@pytest.mark.parametrize("v", V2["files"], ids=[v["name"] for v in V2["files"]])
+def test_v2_vector_opens_with_the_specification(v, tmp_path):
+    spec, _ = _unlock(v, tmp_path)
+    blob = _blob(v)
+    assert blob[:8] == b"LOCKED\x00\x02"
+    r = spec_reader.read(blob, **spec, verifiers=(_signer_public(),))
+    assert r["dek"].hex() == v["dek"]
+    assert r["header"]["suite"] == v["suite"] and len(r["slots"]) == v["slots"]
+    assert {k: r["meta"][k] for k in v["meta"]} == v["meta"]
+    assert hashlib.sha256(r["content"]).hexdigest() == v["content_sha256"]
+    if v["signed_at"] is None:
+        assert r["signature"] is None
+    else:
+        assert r["signature"]["status"] == "valid" and r["signature"]["created"] == v["signed_at"]
+        assert spec_reader.read(blob, **spec)["signature"]["status"] == "unknown"   # signer not trusted
+
+
+@pytest.mark.parametrize("v", V2["files"], ids=[v["name"] for v in V2["files"]])
+def test_v2_vector_opens_with_the_engine(v, tmp_path):
+    spec, keys = _unlock(v, tmp_path)
+    keys.verifiers = [_signer_public()]
+    if v["meta"]["kind"] != "dir":
+        res = engine.decrypt_bytes(_blob(v), keys)
+        assert hashlib.sha256(res.data).hexdigest() == v["content_sha256"]
+    else:
+        res = engine.decrypt_path(HERE / v["file"], tmp_path / "out", keys)
+        assert (res.path / "readme.txt").exists() and (res.path / "docs" / "data.bin").exists()
+    if v["signed_at"] is None:
+        assert res.signature is None
+    else:
+        assert res.signature.verified and res.signature.key == _signer_public()
+        assert res.signature.created == v["signed_at"]
+
+
+# ── signing keys and detached signatures (FORMAT.md §9, §13, §14) ────────────
+
+SIGS = json.loads((HERE / "signatures.json").read_text(encoding="utf-8"))
+SIGNER = bytes.fromhex(VECTORS["identities"][SIGS["signer"]])
+
+
+def test_signing_keys_follow_the_specification():
+    ed_seed, ml_seed = spec_reader.signing_seeds(SIGNER)
+    assert (ed_seed.hex(), ml_seed.hex()) == (SIGS["ed25519_seed"], SIGS["ml_dsa_65_seed"])
+    public = spec_reader.public3(SIGNER)
+    assert public[1216:1248].hex() == SIGS["ed25519_public"]
+    assert hashlib.sha256(public[1248:]).hexdigest() == SIGS["ml_dsa_65_public_sha256"]
+    assert spec_reader.encode_public(public) == SIGS["public_key"]
+    assert spec_reader.decode_public(SIGS["public_key"]) == public
+    assert spec_reader.fingerprint(public) == SIGS["fingerprint"]
+    assert spec_reader.qr_payload(public) == SIGS["qr"]
+
+
+def test_signing_keys_derive_as_specified():
+    from locksmith.core import keys
+    ed, ml = keys.signing_keys(SIGNER)
+    assert (ed.private_bytes_raw().hex(), ml.private_bytes_raw().hex()) == (SIGS["ed25519_seed"],
+                                                                            SIGS["ml_dsa_65_seed"])
+    public = keys.public_from_private(SIGNER) + keys.verify_key(SIGNER)
+    assert keys.encode_public(public) == SIGS["public_key"]
+    assert keys.decode_public(SIGS["public_key"]) == public
+    assert keys.fingerprint(public) == SIGS["fingerprint"]
+    assert keys.qr_text(public) == SIGS["qr"]
+    assert keys.encryption_part(public) == keys.public_from_private(SIGNER)
+
+
+@pytest.mark.parametrize("s", SIGS["signatures"], ids=[s["file"] for s in SIGS["signatures"]])
+def test_signature_vector_verifies_with_the_specification(s):
+    text = (HERE / s["signature"]).read_text(encoding="utf-8")
+    key, sig = spec_reader.verify_signature(text, (HERE / s["file"]).read_bytes(),
+                                            [spec_reader.decode_public(SIGS["public_key"])])
+    assert (sig.comment, sig.created) == (s["comment"], s["created"])
+
+
+@pytest.mark.parametrize("s", SIGS["signatures"], ids=[s["file"] for s in SIGS["signatures"]])
+def test_signature_vector_verifies_with_locksmith(s):
+    from locksmith.core import keys, signing
+    text = signing.read_small(HERE / s["signature"])
+    v = signing.verify_file(HERE / s["file"], text, [keys.decode_public(SIGS["public_key"])])
+    assert (v.comment, v.created, v.fingerprint) == (s["comment"], s["created"], SIGS["fingerprint"])
+
+
+def test_locksmith_signatures_verify_with_the_specification(tmp_path):
+    from locksmith.core import signing
+    f = tmp_path / "f"
+    f.write_bytes(b"made by Locksmith\n")
+    text = signing.sign_file(f, SIGNER, "cross-check ✓", created=1234)
+    key, sig = spec_reader.verify_signature(text, f.read_bytes(), [spec_reader.public3(SIGNER)])
+    assert (sig.comment, sig.created) == ("cross-check ✓", 1234)

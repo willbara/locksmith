@@ -6,4 +6,5 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .ruff_cache/
-todo-list-checked.md
+todo-list.md
+scope-check.md

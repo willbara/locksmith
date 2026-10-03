@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import base64
 import os
+import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QFileDialog, QSlider
 
-from ...core import minisign, tools
+from ...core import keys, minisign, signing, sshsig, tools
 from ...core.errors import LocksmithError
 from ...core.keys import write_secret_file
 from .. import dialogs
@@ -33,6 +34,7 @@ from ..widgets import (
     toast,
 )
 from ..workers import run_task
+from .common import saved_signers
 
 
 def _shown(text: str) -> str:
@@ -42,15 +44,28 @@ def _shown(text: str) -> str:
 
 
 class ToolsPage(Page):
-    def __init__(self):
-        super().__init__("Tools", "Generators, checksums and secure deletion.")
+    def __init__(self, store):
+        super().__init__("Tools", "Generators, checksums, signatures and secure deletion.")
+        self.store = store
         self._gen_card()
         self._tester_card()
         self._hash_card()
+        self._sign_card()
+        self._lsig_card()
         self._minisign_card()
+        self._sshsig_card()
         self._keyfile_card()
         self._shred_card()
         self.finish()
+        self.reload()
+
+    def reload(self):
+        """Called when identities or contacts change."""
+        signers = {i: ident.name for i, ident in enumerate(self.store.identities) if ident.can_sign}
+        self.sg_ident.set_items(signers)
+        self.sg_ident.setVisible(bool(signers))
+        self.sg_go.setEnabled(bool(signers))
+        self.sg_none.setVisible(not signers)
 
     # ── generator ──
 
@@ -301,6 +316,185 @@ class ToolsPage(Page):
         dialogs.text_view("Manifest differences", "\n\n".join(
             f"{title}:\n" + "\n".join(f"  {_shown(n)}" for n in names) for title, names in sections if names))
 
+    # ── Locksmith signatures ──
+
+    def _sign_card(self):
+        c = Collapsible("Sign a file", "Make a detached signature with one of your identities", icon="fingerprint")
+        self.sg_file = None
+        self.sg_ident = Dropdown()
+        c.add(Field("Sign as", self.sg_ident))
+        self.sg_none = label("Signing needs a post-quantum identity. Create one, or upgrade a classical one, on "
+                             "the Keys page.", "caption")
+        c.add(self.sg_none)
+        self.sg_file_name = label("No file selected", "caption", False)
+        pick = Button("Choose file…", "file")
+        pick.clicked.connect(self._sg_pick_file)
+        c.add(hrow(pick, self.sg_file_name, None))
+        self.sg_comment = LineEdit("Comment (optional, signed with the file), e.g. “Release 1.0”")
+        c.add(self.sg_comment)
+        self.sg_go = Button("Sign…", "check", "primary")
+        self.sg_go.clicked.connect(self._sign)
+        c.add(hrow(self.sg_go, None))
+        self.sg_progress = ProgressPanel()
+        self.sg_progress.cancel_btn.setVisible(False)
+        c.add(self.sg_progress)
+        c.add(label("The signature is saved as a separate .lsig file. Anyone with your public key can check that "
+                    "the file was signed with your key and hasn't changed since.", "faint"))
+        self.add(c)
+
+    def _sg_pick_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Choose the file to sign")
+        if path:
+            self.sg_file = Path(path)
+            self.sg_file_name.setText(self.sg_file.name)
+
+    def _sign(self):
+        i = self.sg_ident.value()
+        if i is None or i >= len(self.store.identities) or not self.sg_file:
+            toast("Choose an identity and the file to sign", "alert")
+            return
+        ident, f, comment = self.store.identities[i], self.sg_file, self.sg_comment.text()
+        try:
+            signing.check_comment(comment)
+        except LocksmithError as e:
+            dialogs.error(str(e))
+            return
+        out, _ = QFileDialog.getSaveFileName(self, "Save signature", str(f) + signing.EXTENSION,
+                                             "Locksmith signatures (*.lsig);;All files (*)")
+        if not out:
+            return
+        passphrase = None
+        if ident.is_locked:
+            passphrase = dialogs.prompt("Identity passphrase", f"Unlock “{ident.name}” to sign.", "Passphrase",
+                                        secret=True, ok="Sign")
+            if not passphrase:
+                return
+        out = Path(out)
+
+        def work(r, c):
+            text = signing.sign_file(f, ident.private_raw(passphrase), comment, progress=lambda x: r(x, "Hashing"),
+                                     cancel=c)
+            write_secret_file(out, text)
+            return out
+
+        def end():
+            self.sg_progress.finish()
+            self.sg_go.setEnabled(True)
+
+        def done(path):
+            end()
+            toast(f"Signed. Saved {path.name}", "fingerprint")
+
+        def failed(m, k):
+            end()
+            dialogs.error(m, "Not signed")
+
+        self.sg_progress.start()
+        self.sg_go.setEnabled(False)
+        run_task(work, done, failed, self.sg_progress.update_progress, parent=self)
+
+    def _lsig_card(self):
+        c = Collapsible("Verify a Locksmith signature", "Check a file against its .lsig file", icon="shield")
+        self.ls_file = self.ls_sig = None
+        self.ls_file_name = label("No file selected", "caption", False)
+        pick = Button("Choose file…", "file")
+        pick.clicked.connect(self._ls_pick_file)
+        c.add(hrow(pick, self.ls_file_name, None))
+        self.ls_sig_name = label("No signature selected", "caption", False)
+        pick_sig = Button("Signature…", "fingerprint")
+        pick_sig.clicked.connect(self._ls_pick_sig)
+        c.add(hrow(pick_sig, self.ls_sig_name, None))
+        self.ls_key = LineEdit("Signer's public key (optional: otherwise your saved keys are tried)", mono=True)
+        c.add(self.ls_key)
+        self.ls_go = Button("Verify", "check", "primary")
+        self.ls_go.clicked.connect(self._ls_verify)
+        c.add(hrow(self.ls_go, None))
+        self.ls_progress = ProgressPanel()
+        self.ls_progress.cancel_btn.setVisible(False)
+        c.add(self.ls_progress)
+        self.ls_result = label("", "h2")
+        c.add(self.ls_result)
+        self.ls_detail = label("", "caption")
+        c.add(self.ls_detail)
+        self.ls_comment = label("", "caption")
+        c.add(self.ls_comment)
+        c.add(label("A valid signature proves the file was signed with that key and hasn't changed since. Whose key "
+                    "it is depends on having checked its fingerprint with its owner.", "faint"))
+        self.add(c)
+
+    def _ls_reset(self):
+        for w in (self.ls_result, self.ls_detail, self.ls_comment):
+            w.setText("")
+
+    def _ls_pick_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Choose the signed file")
+        if not path:
+            return
+        self.ls_file = Path(path)
+        self.ls_file_name.setText(self.ls_file.name)
+        sig = Path(path + signing.EXTENSION)
+        if sig.is_file():
+            self.ls_sig = sig
+            self.ls_sig_name.setText(sig.name)
+        self._ls_reset()
+
+    def _ls_pick_sig(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Choose the signature", "",
+                                              "Locksmith signatures (*.lsig);;All files (*)")
+        if path:
+            self.ls_sig = Path(path)
+            self.ls_sig_name.setText(self.ls_sig.name)
+            self._ls_reset()
+
+    def _ls_verify(self):
+        if not (self.ls_file and self.ls_sig):
+            toast("Choose the file and its signature", "alert")
+            return
+        self._ls_reset()
+        saved = saved_signers(self.store)
+        typed = self.ls_key.text().strip()
+        if typed:
+            try:
+                raw = keys.decode_public(typed)
+            except LocksmithError as e:
+                self.ls_result.setText("✕  Not verified")
+                self.ls_detail.setText(str(e))
+                return
+            candidates = {raw: saved.get(raw)}
+        else:
+            candidates = saved
+        f, sig = self.ls_file, self.ls_sig
+        self.ls_progress.start()
+        self.ls_go.setEnabled(False)
+
+        def end():
+            self.ls_progress.finish()
+            self.ls_go.setEnabled(True)
+
+        def done(v):
+            end()
+            name = candidates.get(v.key)
+            self.ls_result.setText(f"✓  Signed with the key you saved as {name}" if name else
+                                   "✓  Signed with the key you entered")
+            try:
+                when = time.strftime("%d %b %Y, %H:%M", time.localtime(v.created))
+            except (OverflowError, OSError, ValueError):
+                when = str(v.created)
+            self.ls_detail.setText(f"Fingerprint {v.fingerprint}  ·  signed {when} (by the signer's clock)")
+            self.ls_comment.setText(f"Signed comment: {v.comment}" if v.comment else "No comment")
+
+        def failed(m, k):
+            end()
+            self.ls_result.setText("✕  Not verified")
+            if k == "UnknownSignerError":
+                m += (" Paste the signer's public key above, or add them as a contact after checking that "
+                      "fingerprint with them.")
+            self.ls_detail.setText(m)
+
+        run_task(lambda r, c: signing.verify_file(f, signing.read_small(sig), list(candidates),
+                                                  lambda x: r(x, "Hashing"), c),
+                 done, failed, self.ls_progress.update_progress, parent=self)
+
     # ── minisign ──
 
     def _minisign_card(self):
@@ -395,6 +589,107 @@ class ToolsPage(Page):
 
         run_task(lambda r, c: minisign.verify_file(f, minisign.read_small(sig), key, lambda x: r(x, "Hashing"), c),
                  done, failed, self.ms_progress.update_progress, parent=self)
+
+    # ── SSH signatures ──
+
+    def _sshsig_card(self):
+        c = Collapsible("Verify an SSH signature", "Check a file against a signature made with ssh-keygen -Y sign",
+                        icon="key")
+        self.ss_file = self.ss_sig = None
+        self.ss_file_name = label("No file selected", "caption", False)
+        pick = Button("Choose file…", "file")
+        pick.clicked.connect(self._ss_pick_file)
+        c.add(hrow(pick, self.ss_file_name, None))
+        self.ss_sig_name = label("No signature selected", "caption", False)
+        pick_sig = Button("Signature…", "fingerprint")
+        pick_sig.clicked.connect(self._ss_pick_sig)
+        c.add(hrow(pick_sig, self.ss_sig_name, None))
+        self.ss_key = LineEdit("Public key, e.g. ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI…", mono=True)
+        self.ss_key.add_action("file", "Load a .pub file", self._ss_load_key)
+        c.add(self.ss_key)
+        self.ss_namespace = LineEdit("file", mono=True)
+        self.ss_namespace.setText("file")
+        c.add(Field("Namespace", self.ss_namespace,
+                    "What the signature is for: “file” for ssh-keygen -Y sign -n file, “git” for Git commits."))
+        self.ss_go = Button("Verify", "check", "primary")
+        self.ss_go.clicked.connect(self._ss_verify)
+        c.add(hrow(self.ss_go, None))
+        self.ss_progress = ProgressPanel()
+        self.ss_progress.cancel_btn.setVisible(False)
+        c.add(self.ss_progress)
+        self.ss_result = label("", "h2")
+        c.add(self.ss_result)
+        self.ss_detail = label("", "caption")
+        c.add(self.ss_detail)
+        c.add(label("A valid signature proves the file was signed with this key. Get the key from a source "
+                    "you trust, not from the same place as the file. Security-key (sk-) signatures, "
+                    "certificates and RSA keys under 2048 bits are not accepted.", "faint"))
+        self.add(c)
+
+    def _ss_reset(self):
+        self.ss_result.setText("")
+        self.ss_detail.setText("")
+
+    def _ss_pick_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Choose the signed file")
+        if not path:
+            return
+        self.ss_file = Path(path)
+        self.ss_file_name.setText(self.ss_file.name)
+        sig = Path(path + ".sig")
+        if sig.is_file():
+            self.ss_sig = sig
+            self.ss_sig_name.setText(sig.name)
+        self._ss_reset()
+
+    def _ss_pick_sig(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Choose the signature", "",
+                                              "SSH signatures (*.sig);;All files (*)")
+        if path:
+            self.ss_sig = Path(path)
+            self.ss_sig_name.setText(self.ss_sig.name)
+            self._ss_reset()
+
+    def _ss_load_key(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Choose the public key", "",
+                                              "SSH public keys (*.pub);;All files (*)")
+        if not path:
+            return
+        try:
+            key = sshsig.parse_public_key(sshsig.read_small(Path(path)))
+        except (LocksmithError, OSError) as e:
+            dialogs.error(str(e))
+            return
+        # The key file's comment is left out: nothing vouches for it.
+        self.ss_key.setText(f"{key.key_type} {base64.b64encode(key.blob).decode()}")
+        self._ss_reset()
+
+    def _ss_verify(self):
+        if not (self.ss_file and self.ss_sig and self.ss_key.text().strip()):
+            toast("Choose the file, its signature and the public key", "alert")
+            return
+        f, sig, key, namespace = self.ss_file, self.ss_sig, self.ss_key.text(), self.ss_namespace.text()
+        self._ss_reset()
+        self.ss_progress.start()
+        self.ss_go.setEnabled(False)
+
+        def end():
+            self.ss_progress.finish()
+            self.ss_go.setEnabled(True)
+
+        def done(v):
+            end()
+            self.ss_result.setText(f"✓  Valid signature from key {v.fingerprint}")
+            self.ss_detail.setText(f"{v.key_label} key  ·  namespace “{v.namespace}”  ·  {v.hash_algorithm.upper()}")
+
+        def failed(m, k):
+            end()
+            self.ss_result.setText("✕  Not verified")
+            self.ss_detail.setText(m)
+
+        run_task(lambda r, c: sshsig.verify_file(f, sshsig.read_small(sig), key, namespace,
+                                                 lambda x: r(x, "Hashing"), c),
+                 done, failed, self.ss_progress.update_progress, parent=self)
 
     # ── keyfile ──
 

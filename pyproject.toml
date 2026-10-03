@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "PySide6-Essentials>=6.8",
-    "cryptography>=44",
+    "cryptography>=48",  # first release whose OpenSSL wheels have ML-KEM and ML-DSA
     "segno>=1.6",
     "backports.zstd>=1.0; python_version < '3.14'",
 ]

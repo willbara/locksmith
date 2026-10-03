@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from . import lock
 from .theme import font, pixmap, theme
 from .widgets import Button, IconButton, Label, LineEdit, PasswordField, copy_secret, label, toast
 
@@ -162,6 +163,7 @@ class Sheet(QWidget):
         first = self.findChild(LineEdit) or self.findChild(QPlainTextEdit)
         if first:
             first.setFocus()
+        lock.keep_overlay_on_top()
 
     def exec(self):
         self.open()
@@ -238,6 +240,9 @@ def prompt(title, caption="", placeholder="", text="", secret=False, ok="OK") ->
 
 
 def text_view(title, text, caption="", mono=True, copy=True, width=620, secret=False):
+    if secret and lock.is_locked():
+        lock.withhold(title)   # a task finished after the lock: never show its secret over the lock screen
+        return
     s = Sheet(title, caption, width=width)
     box = QPlainTextEdit(text)
     box.setReadOnly(True)
@@ -309,6 +314,9 @@ class QRCode(QWidget):
 
 
 def qr_view(title, data: str, caption="", secret=False):
+    if secret and lock.is_locked():
+        lock.withhold(title)
+        return
     s = Sheet(title, caption, width=380, icon="qr")
     try:
         qr = QRCode(data, 300)

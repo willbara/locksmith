@@ -10,7 +10,11 @@ PySide6 desktop app for file encryption, packaged as an AppImage. It is built lo
   of outside input get a target there.
 - `tests/vectors` are committed files checked by the engine and by `tests/spec_reader.py` (written from
   `docs/FORMAT.md`). Never regenerate them to make a test pass: a failure means old files no longer open. A format
-  change adds new vectors and updates `docs/FORMAT.md`.
+  change adds new vectors and updates `docs/FORMAT.md`. Version 2 vectors come from
+  `tests/vectors/make_v2_vectors.py` and signature vectors from `make_signature_vectors.py`; each leaves the
+  others alone. Never rerun `make_vectors.py` (the version 1 files).
+- `tests/interop` holds signatures made by the real `ssh-keygen` and `minisign` (each folder's `make_vectors.sh`
+  records how). Same rule: never regenerate them to make a test pass.
 - Build: `./packaging/build_appimage.sh` → `dist/Locksmith-<arch>.AppImage` (pinned uv + Python 3.14, hash-locked deps)
 - Check a build: `dist/Locksmith-x86_64.AppImage --self-test`; other distros: `./packaging/test_distros.sh` (podman)
 - Windows build (from Linux, via Wine): `./packaging/build_windows.sh` → `dist/Locksmith-windows-x64.exe`.
@@ -49,12 +53,20 @@ PySide6 desktop app for file encryption, packaged as an AppImage. It is built lo
   `widgets.copy_secret`, and compare them with `tools.same_secret` (constant time).
 - Keys: raw public keys are 32 bytes (X25519) or 1216 (X25519 + ML-KEM-768); raw private keys 32 or 96
   (X25519 + ML-KEM seed). Classical and hybrid slots share one format. TPM sealing goes through `systemd-creds`.
+- Signing (`docs/FORMAT.md` §13–14): hybrid identities derive Ed25519 + ML-DSA-65 keys from their private key
+  (`keys.signing_keys`), so storage and backups are unchanged. Their full public key is `locksmith3` (3200
+  bytes: the 1216-byte encryption key plus the verify keys). `public_raw` is always the encryption part and the
+  only thing the engine takes; `key_raw` is the full key, for fingerprints and verifying. Identities keep a
+  `locksmith2` `public` (older versions read it) and cache the verify keys in `verify`.
 - `core/metadata.py` strips images with allowlists. Keep it that way: unknown data is dropped, not kept.
 
 ## Format and versioning
 
-- Files start with `LOCKED\x00\x01` and use `.locked`. `engine.Format` bundles a format's signature and its
-  key-derivation labels (`locksmith/v1/…`); a new format version adds a profile and keeps reading the old ones.
+- Files start with `LOCKED\x00\x02` (format version 2) and use `.locked`; version 1 (`\x01`) is still read.
+  `engine.Format` bundles a format's signature and its key-derivation labels (`locksmith/v2/…`, v1:
+  `locksmith/v1/…`); a new format version adds a profile and keeps reading the old ones. v2 keeps the key
+  slots outside what the commitment, the frames and signatures cover, so slots can change without
+  re-encrypting. `tests/fileformat.py` takes files apart for tests that craft them.
 - The app was called Cryptor before 2.0. Version 2.0 deliberately dropped Cryptor compatibility.
 - Versioning is SemVer: a major bump when files or keys made by the new version can't be read by older ones.
 

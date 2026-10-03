@@ -83,7 +83,8 @@ docs/        file-format specification
 - **Protection:** a password, a keyfile (second factor), public keys for any number of recipients, or any
   combination. Each one wraps the same random file key.
 - **Keys:** identities (your key pairs) and contacts (other people's public keys). New identities are hybrid
-  post-quantum (X25519 + ML-KEM-768), and older classical ones can be upgraded. An identity can be protected
+  post-quantum (X25519 + ML-KEM-768) and can sign files (Ed25519 + ML-DSA-65); older classical ones can be
+  upgraded. An identity can be protected
   with a passphrase, sealed to the machine's TPM, exported as a backup, written down as backup words, split
   into Shamir shares, and shared as text or a QR code. Recipients stay anonymous: a file doesn't say who it
   was encrypted for, and decoy slots can hide how many recipients there are.
@@ -96,31 +97,39 @@ docs/        file-format specification
   parts and join them, send encrypted text messages, show a password as a QR code, split a password among
   people with Shamir secret sharing, publish your public key.
 - **Tools:** password and passphrase generator, strength tester, checksums, file comparison, folder
-  manifests (`sha256sum --tag` compatible), minisign signature verification, keyfile generator, shredder.
+  manifests (`sha256sum --tag` compatible), detached signatures (sign and verify, `.lsig`), minisign and SSH
+  (`ssh-keygen -Y sign`) signature verification, keyfile generator, shredder.
 - **Interface:** dark, light or system theme, monochrome throughout.
 
 ## File format
 
 ```
-"LOCKED\x00\x01" | u32 header_len | header JSON | { u32 len | AEAD frame }*
+"LOCKED\x00\x02" | key commitment | u32 len | fixed header JSON | u32 len | key slots JSON | { u32 len | AEAD frame }*
 ```
 
 The full specification is [docs/FORMAT.md](docs/FORMAT.md), with test vectors in
 [tests/vectors](tests/vectors). What Locksmith does and doesn't protect against is in
 [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
 
-Locksmith 2.0 replaced the format of Cryptor 1.x (the app's former name). Cryptor files and keys are not read.
+This is format version 2. Files in version 1 (Locksmith 2.x) are still read. Locksmith 2.0 replaced the
+format of Cryptor 1.x (the app's former name); Cryptor files and keys are not read.
 
 - A random 256-bit data key (DEK) is wrapped with AES-256-GCM once per slot. A password slot uses KDF
   output, mixed with SHA-512(keyfile) through HKDF when a keyfile is set. A classical recipient slot uses
   an ephemeral X25519 exchange plus HKDF. A hybrid slot also
   encapsulates to the recipient's ML-KEM-768 key and derives its key from both shared secrets plus the
   transcript, so breaking X25519 alone is not enough.
-- Layer keys, the metadata key and a key-commitment value are derived from the DEK with HKDF-SHA512.
-  A slot only counts as opened when its key matches the commitment; a mismatch reads as a wrong key.
-- Frame `i` uses nonce `prefix(7) ‖ i(u32) ‖ final(u8)` and the SHA-256 of the header as associated data.
-  Reordering, truncation, appended data and header tampering all fail authentication.
+- Layer keys, the metadata key and a key commitment are derived from the DEK with HKDF-SHA512. The
+  commitment also covers the fixed header (cipher, chunk size, nonce prefix, salt, metadata), so changing
+  any of it makes the file refuse to open. A slot only counts as opened when its key matches the
+  commitment; a mismatch reads as a wrong key.
+- Frame `i` uses nonce `prefix(7) ‖ i(u32) ‖ final(u8)` and the SHA-256 of the fixed header as associated
+  data. Reordering, truncation, appended data and header tampering all fail authentication. The key slots
+  are bound only to the DEK, so they can change without re-encrypting the data.
 - File name, size, type, compression method and note are stored in an encrypted metadata blob.
+- A file can be signed (Encrypt → Sign as). The Ed25519 + ML-DSA-65 signature sits inside the encryption,
+  after the content, and covers the fixed header and the content but not the key slots. A file whose
+  signature doesn't verify is refused and nothing of it is written.
 - Output is written to a temporary file and moved into place only after every frame authenticates.
 
 ## Runtime protection
@@ -130,7 +139,8 @@ Locksmith 2.0 replaced the format of Cryptor 1.x (the app's former name). Crypto
 - **No network:** a seccomp filter on every thread stops Locksmith from creating any internet or other
   non-local socket. Programs it opens (file manager, mail) are started by systemd, outside the sandbox.
 - **Auto-lock and panic:** after inactivity (default 10 minutes), or with Ctrl+L, secrets are cleared from
-  the window and it is covered. Ctrl+Shift+L also minimizes it.
+  the window and it is covered. Ctrl+Shift+L also minimizes it. A task that finishes while locked doesn't
+  show its secret result; after unlocking, you're told to open it again.
 - **Clipboard:** copied passwords and decrypted text are hidden from clipboard managers and cleared after
   30 seconds, on lock and on quit.
 
@@ -146,5 +156,9 @@ protected with a passphrase (Argon2id + AES-GCM).
 
 - Shredding is best effort. SSDs and copy-on-write filesystems such as btrfs can keep old copies.
 - Losing the password, keyfile or private key means losing the data. There is no recovery.
-- Senders are not authenticated. Decrypting proves a file was not changed after it was made, not who made
-  it: anyone with your public key can send you a file, and its name and note can claim anything.
+- Unsigned files are not authenticated. Decrypting proves a file was not changed after it was made, not
+  who made it: anyone with your public key can send you a file, and its name and note can claim anything.
+  To show who made a file, sign it (Encrypt → Sign as, or a detached `.lsig` from Tools). A valid signature
+  means "signed with the key you saved as X", which is only as good as your fingerprint check. It says who
+  signed the content, not whom it was sent to: anyone who can open a signed file can pass it on, still
+  signed.

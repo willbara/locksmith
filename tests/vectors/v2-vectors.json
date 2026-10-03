@@ -1,0 +1,139 @@
+{
+  "signer": "hybrid",
+  "files": [
+    {
+      "name": "v2-password-aes256gcm-zstd",
+      "file": "v2-password-aes256gcm-zstd.locked",
+      "unlock": {
+        "password": "correct horse battery staple ✓"
+      },
+      "suite": "aes-256-gcm",
+      "slots": 1,
+      "dek": "50edb36c5fea7da8b495f9fb62dc21f55d0ca063de5eaac18590813dcbd6387c",
+      "meta": {
+        "name": "v2-password-aes256gcm-zstd.txt",
+        "kind": "text",
+        "comp": "zstd",
+        "size": 147
+      },
+      "content_sha256": "a4984aada01baf5ead76e4d5ef7884cb257e240d24cb58cf87d405011344742d",
+      "content_size": 147,
+      "signed_at": null
+    },
+    {
+      "name": "v2-signed-password-keyfile-chacha20-padme",
+      "file": "v2-signed-password-keyfile-chacha20-padme.locked",
+      "unlock": {
+        "password": "correct horse battery staple ✓",
+        "keyfile": true
+      },
+      "suite": "chacha20-poly1305",
+      "slots": 1,
+      "dek": "584c34c3615e07990f88fc2b2ee1984f39ed06cdc83c0e6c25006f6a52a5a491",
+      "meta": {
+        "name": "v2-signed-password-keyfile-chacha20-padme.txt",
+        "kind": "file",
+        "comp": "none",
+        "size": 3072
+      },
+      "content_sha256": "12adc9dff80688800f2f591f0da6ab2f8109d61d910697801f57669ec0d719d3",
+      "content_size": 3072,
+      "signed_at": 1791011606
+    },
+    {
+      "name": "v2-keyfile-only-aessiv-bz2",
+      "file": "v2-keyfile-only-aessiv-bz2.locked",
+      "unlock": {
+        "keyfile": true
+      },
+      "suite": "aes-256-siv",
+      "slots": 1,
+      "dek": "10fd09b01195753d5c59082e8aab968cbe20a7ff9c163288d213efe9bb9e677f",
+      "meta": {
+        "name": "v2-keyfile-only-aessiv-bz2.txt",
+        "kind": "file",
+        "comp": "bz2",
+        "size": 3072
+      },
+      "content_sha256": "12adc9dff80688800f2f591f0da6ab2f8109d61d910697801f57669ec0d719d3",
+      "content_size": 3072,
+      "signed_at": null
+    },
+    {
+      "name": "v2-signed-x25519-aesgcmsiv-zlib",
+      "file": "v2-signed-x25519-aesgcmsiv-zlib.locked",
+      "unlock": {
+        "identity": "classical"
+      },
+      "suite": "aes-256-gcm-siv",
+      "slots": 1,
+      "dek": "1a604d9ff271ff5eeae1ce52d78acb8ff15c15abbf65fdb74c50a7494809ea5b",
+      "meta": {
+        "name": "v2-signed-x25519-aesgcmsiv-zlib.txt",
+        "kind": "file",
+        "comp": "zlib",
+        "size": 3072
+      },
+      "content_sha256": "12adc9dff80688800f2f591f0da6ab2f8109d61d910697801f57669ec0d719d3",
+      "content_size": 3072,
+      "signed_at": 1791011606
+    },
+    {
+      "name": "v2-hybrid-ocb3-lzma-hidden-recipients",
+      "file": "v2-hybrid-ocb3-lzma-hidden-recipients.locked",
+      "unlock": {
+        "identity": "hybrid"
+      },
+      "suite": "aes-256-ocb3",
+      "slots": 8,
+      "dek": "1d623a6770db1a51b014ec6019f92ed23f8c27897e21038f369cd08f888a8672",
+      "meta": {
+        "name": "v2-hybrid-ocb3-lzma-hidden-recipients.txt",
+        "kind": "text",
+        "comp": "lzma",
+        "size": 147
+      },
+      "content_sha256": "a4984aada01baf5ead76e4d5ef7884cb257e240d24cb58cf87d405011344742d",
+      "content_size": 147,
+      "signed_at": null
+    },
+    {
+      "name": "v2-signed-cascade2-password-and-recipient-64k",
+      "file": "v2-signed-cascade2-password-and-recipient-64k.locked",
+      "unlock": {
+        "identity": "classical"
+      },
+      "suite": "cascade-2",
+      "slots": 2,
+      "dek": "64a1e3ff6de670634180141007ac6daaf33df0258fdca30d8668df21b9372fcb",
+      "meta": {
+        "name": "v2-signed-cascade2-password-and-recipient-64k.txt",
+        "kind": "text",
+        "comp": "none",
+        "size": 147,
+        "note": "Signed note ✓"
+      },
+      "content_sha256": "a4984aada01baf5ead76e4d5ef7884cb257e240d24cb58cf87d405011344742d",
+      "content_size": 147,
+      "signed_at": 1791011606
+    },
+    {
+      "name": "v2-signed-cascade3-folder-armored",
+      "file": "v2-signed-cascade3-folder-armored.locked.txt",
+      "unlock": {
+        "password": "correct horse battery staple ✓"
+      },
+      "suite": "cascade-3",
+      "slots": 1,
+      "dek": "78128da0e5b83207672f73e21b3dc60b4a29f430c57081953a2bc93efc59e36c",
+      "meta": {
+        "name": "Project",
+        "kind": "dir",
+        "comp": "zstd"
+      },
+      "content_sha256": "650bf419e96391adecbe0e9e0080e8816324a5fec115130bcd4893fa35707029",
+      "content_size": 10240,
+      "signed_at": 1791011606
+    }
+  ]
+}

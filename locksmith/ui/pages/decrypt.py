@@ -1,16 +1,16 @@
 from __future__ import annotations
 
 import os
-import secrets
 import tempfile
 from pathlib import Path
 
 from PySide6.QtWidgets import QVBoxLayout
 
-from ...core import engine, kdf, scratch
+from ...core import engine, kdf
 from ...core.engine import DecryptKeys
 from ...core.errors import LocksmithError
 from .. import dialogs
+from ..lock import is_locked, withhold
 from ..settings import settings
 from ..widgets import (
     Button,
@@ -32,7 +32,7 @@ from ..widgets import (
     toast,
 )
 from ..workers import run_task
-from .common import OutputPicker, open_url, reveal
+from .common import OutputPicker, open_url, reveal, saved_signers, signature_text
 from .encrypt import THREADS
 
 
@@ -190,11 +190,13 @@ class DecryptPage(Page):
         ident = self.store.identities[v] if isinstance(v, int) else None
         passphrase = self.passphrase.text() or None
         password, keyfile = self.password.text() or None, self.keyfile.path
+        self._signers = saved_signers(self.store)   # whose signatures count, and their names
+        verifiers = list(self._signers)
 
         def build() -> DecryptKeys:
             # Unlocking a passphrase-protected identity runs Argon2id, so keep it off the UI thread.
             identities = [ident.private_raw(passphrase)] if ident else self.store.unlocked_private_keys()
-            return DecryptKeys(password=password, keyfile=keyfile, identities=identities)
+            return DecryptKeys(password=password, keyfile=keyfile, identities=identities, verifiers=verifiers)
         return build
 
     def start(self):
@@ -217,13 +219,13 @@ class DecryptPage(Page):
                     report(None if frac is None else (i + frac) / n,
                            stage + (f"  ·  {i + 1} of {n}" if n > 1 else ""))
                 if verify:
-                    meta = engine.verify_path(Path(p), keys, threads, sub, cancel)
-                    results.append(("verified", p, meta))
+                    res = engine.verify_path(Path(p), keys, threads, sub, cancel)
+                    results.append(("verified", p, {**res.meta, "_signature": res.signature}))
                 elif p in pasted:
-                    results.append(self._decrypt_pasted(pasted[p], keys, out_dir))
+                    results.append(self._decrypt_pasted(pasted[p], keys, out_dir, threads, sub, cancel))
                 else:
                     r = engine.decrypt_path(Path(p), out_dir, keys, threads, sub, cancel)
-                    meta = {**r.meta, "_skipped": r.skipped}
+                    meta = {**r.meta, "_skipped": r.skipped, "_signature": r.signature}
                     # The source may be the only copy: delete it only when the core
                     # confirms everything was restored and is on disk.
                     if delete and r.complete:
@@ -242,28 +244,17 @@ class DecryptPage(Page):
         self._update_state()
 
     @staticmethod
-    def _decrypt_pasted(blob: bytes, keys: DecryptKeys, out_dir):
-        res = engine.decrypt_bytes(blob, keys)
-        meta, kind = res.meta, res.meta.get("kind", "file")
-        if kind == "text":
-            return ("text", res.data.decode("utf-8", errors="replace"), meta)
-        out_dir = Path(out_dir) if out_dir else Path.home() / "Downloads"
-        if not out_dir.is_dir():
-            out_dir = Path.home()
-        name = engine.safe_name(meta.get("name", "decrypted"))
-        target = engine.unique_path(out_dir / name)
-        if kind in ("dir", "bundle"):
-            tmp = out_dir / f".locksmith-{secrets.token_hex(6)}.tar"
-            with scratch.tracked(tmp):
-                try:
-                    engine.write_private(tmp, res.data)
-                    ext = engine.extract_archive(tmp, target)
-                finally:
-                    tmp.unlink(missing_ok=True)
-            meta = {**meta, "_skipped": ext.skipped}
-        else:
-            engine.write_private(target, res.data)
-        return ("file", target, meta)
+    def _decrypt_pasted(blob: bytes, keys: DecryptKeys, out_dir, threads, progress, cancel):
+        # Without a chosen folder, files from a paste go to Downloads (there is no source
+        # folder to put them next to). The core writes and marks them like any decrypted file.
+        if not out_dir:
+            out_dir = Path.home() / "Downloads"
+            if not out_dir.is_dir():
+                out_dir = Path.home()
+        res = engine.decrypt_pasted(blob, Path(out_dir), keys, threads, progress, cancel)
+        if res.path is None:
+            return ("text", res.data.decode("utf-8", errors="replace"), {**res.meta, "_signature": res.signature})
+        return ("file", res.path, {**res.meta, "_skipped": res.skipped, "_signature": res.signature})
 
     def _finish(self):
         self.task = None
@@ -286,6 +277,9 @@ class DecryptPage(Page):
                   + (f", kept {kept} encrypted file{'s' if kept != 1 else ''}" if kept else ""),
                   "alert" if kept else "unlock", 4000 if kept else 3200)
         for kind, value, meta in results:
+            if kind == "text" and is_locked():
+                withhold("Decrypted message")   # the lock already cleared the page: don't put it back
+                continue
             self._add_result(kind, value, meta)
 
     def _failed(self, msg, kind=""):
@@ -334,9 +328,12 @@ class DecryptPage(Page):
             open_btn.clicked.connect(lambda: open_url(path.resolve().as_uri()))
             card.add(hrow(label(path.name, "mono", wrap=False), None, show, open_btn))
             dialogs_needed = False
+        sig = meta.get("_signature")
+        card.add(label(signature_text(sig, getattr(self, "_signers", {})), "caption"))
         if meta.get("note"):
-            # Whoever made the file wrote the note; nothing proves who that was.
-            card.add(label(f"Note from the sender (not verified): {meta['note']}", "caption"))
+            # The signature covers the note; without a checked one, nothing proves who wrote it.
+            card.add(label(f"Note (signed): {meta['note']}" if sig is not None and sig.verified else
+                           f"Note from the sender (not verified): {meta['note']}", "caption"))
         skipped = meta.get("_skipped") or []
         if skipped:
             shown = ", ".join(skipped[:5]) + ("…" if len(skipped) > 5 else "")

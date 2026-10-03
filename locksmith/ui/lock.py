@@ -13,17 +13,39 @@ processes. The shortcuts work while Locksmith is focused.
 
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QObject, QPropertyAnimation, QRectF, Qt, QTimer
+from PySide6.QtCore import QEvent, QObject, QPropertyAnimation, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QFont, QKeySequence, QPainter, QShortcut
 from PySide6.QtWidgets import QApplication, QGraphicsOpacityEffect, QLineEdit, QPlainTextEdit, QWidget
 
 from .theme import EASE, font, pixmap, theme
-from .widgets import PasswordField, clear_clipboard_secret
+from .widgets import PasswordField, clear_clipboard_secret, toast
 
 LOCK_SHORTCUT = "Ctrl+L"
 PANIC_SHORTCUT = "Ctrl+Shift+L"
 INPUT_EVENTS = {QEvent.Type.KeyPress, QEvent.Type.MouseButtonPress, QEvent.Type.MouseMove,
                 QEvent.Type.Wheel, QEvent.Type.TouchBegin}
+
+_active: Locker | None = None
+
+
+def is_locked() -> bool:
+    """True while the lock screen covers the window. Tasks keep running while locked, so
+    anything that shows a secret result checks this first."""
+    return _active is not None and _active.locked
+
+
+def withhold(what: str):
+    """Note a secret result that arrived while locked and was not shown. It is reported
+    after unlock, so the user knows to open it again."""
+    if _active is not None:
+        _active.withheld.append(what)
+
+
+def keep_overlay_on_top():
+    """Backstop for sheets opened while locked: they go under the lock screen."""
+    if is_locked():
+        _active.overlay.raise_()
+        _active.overlay.setFocus()
 
 
 def mark_sensitive(widget: QWidget) -> QWidget:
@@ -49,6 +71,8 @@ def clear_secrets(root: QWidget):
 
 
 class LockOverlay(QWidget):
+    unlocked = Signal()
+
     def __init__(self, parent: QWidget):
         super().__init__(parent)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -79,6 +103,7 @@ class LockOverlay(QWidget):
 
     def unlock(self):
         self.hide()
+        self.unlocked.emit()
 
     def mousePressEvent(self, e):
         self.unlock()
@@ -110,8 +135,13 @@ class Locker(QObject):
 
     def __init__(self, window: QWidget, root: QWidget, minutes: int):
         super().__init__(window)
+        global _active
         self.window, self.root = window, root
+        self.locked = False
+        self.withheld: list[str] = []
         self.overlay = LockOverlay(root)
+        self.overlay.unlocked.connect(self._unlocked)
+        _active = self
         self.timer = QTimer(self)
         self.timer.setSingleShot(True)
         self.timer.timeout.connect(lambda: self.lock())
@@ -136,7 +166,18 @@ class Locker(QObject):
 
     def lock(self):
         clear_secrets(self.window)
+        self.locked = True
         self.overlay.show_locked()
+
+    def _unlocked(self):
+        self.locked = False
+        withheld, self.withheld = self.withheld, []
+        if len(withheld) == 1:
+            toast(f"“{withheld[0]}” arrived while Locksmith was locked, so it wasn't shown. Open it again.",
+                  "lock", 6000)
+        elif withheld:
+            toast(f"{len(withheld)} results arrived while Locksmith was locked, so they weren't shown. Open them "
+                  "again.", "lock", 6000)
 
     def panic(self):
         """Clear everything, lock and get the window off the screen at once."""

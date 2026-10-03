@@ -7,6 +7,10 @@ Two kinds of key exist:
   Files encrypted to them stay safe unless *both* algorithms are broken, which
   protects against "harvest now, decrypt later" by a future quantum computer.
 
+Hybrid identities also sign, with Ed25519 and ML-DSA-65 keys derived from their
+private key (docs/FORMAT.md §13). Their full public key adds the two verify keys and
+looks like ``locksmith3…``; files are still encrypted to its first 1216 bytes.
+
 Raw forms passed to the engine: public keys are 32 bytes (classical) or
 32 + 1184 bytes (hybrid); private keys are 32 bytes or 32 + 64 bytes (the X25519
 key followed by the ML-KEM seed).
@@ -28,9 +32,13 @@ from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 
 from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+from cryptography.hazmat.primitives.asymmetric.mldsa import MLDSA65PrivateKey, MLDSA65PublicKey
 from cryptography.hazmat.primitives.asymmetric.mlkem import MLKEM768PrivateKey, MLKEM768PublicKey
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from . import kdf
 from .errors import LocksmithError, WrongKeyError
@@ -39,15 +47,23 @@ from .sysenv import clean_env
 
 PUBKEY_PREFIX = "locksmith1"         # classical X25519
 HYBRID_PREFIX = "locksmith2"         # X25519 + ML-KEM-768
+SIGNING_PREFIX = "locksmith3"        # X25519 + ML-KEM-768 + Ed25519 + ML-DSA-65
 X25519_LEN = 32
 MLKEM_PUBLIC_LEN = 1184
 MLKEM_SEED_LEN = 64
+ED25519_LEN = 32
+MLDSA_PUBLIC_LEN = 1952
 HYBRID_PUBLIC_LEN = X25519_LEN + MLKEM_PUBLIC_LEN
 HYBRID_PRIVATE_LEN = X25519_LEN + MLKEM_SEED_LEN
+VERIFY_LEN = ED25519_LEN + MLDSA_PUBLIC_LEN
+SIGNING_PUBLIC_LEN = HYBRID_PUBLIC_LEN + VERIFY_LEN
+PREFIXES = {X25519_LEN: PUBKEY_PREFIX, HYBRID_PUBLIC_LEN: HYBRID_PREFIX, SIGNING_PUBLIC_LEN: SIGNING_PREFIX}
+QR_FINGERPRINT = "LOCKSMITH3:FP:"    # a locksmith3 key's QR code holds only its hash
 
 
 TPM_CREDENTIAL_NAME = "locksmith-identity"
 IDENTITY_LABEL = b"locksmith/v1/identity"
+SIGNING_LABEL = b"locksmith/v1/sig/"
 
 
 def tpm_available() -> bool:
@@ -85,7 +101,44 @@ def tpm_unseal(blob: bytes) -> bytes:
 
 
 def is_hybrid(raw: bytes) -> bool:
-    return len(raw) in (HYBRID_PUBLIC_LEN, HYBRID_PRIVATE_LEN)
+    return len(raw) in (HYBRID_PUBLIC_LEN, HYBRID_PRIVATE_LEN, SIGNING_PUBLIC_LEN)
+
+
+def signing_keys(raw: bytes) -> tuple[Ed25519PrivateKey, MLDSA65PrivateKey]:
+    """The Ed25519 and ML-DSA-65 keys derived from a hybrid private key (FORMAT.md §13).
+    A classical key has none: a quantum computer could recover it from its public key,
+    and with it any key derived from it."""
+    if len(raw) != HYBRID_PRIVATE_LEN:
+        raise LocksmithError("Only post-quantum identities can sign. Upgrade this identity on the Keys page "
+                             "first.")
+
+    def seed(name: bytes) -> bytes:
+        return HKDF(hashes.SHA512(), 32, b"", SIGNING_LABEL + name).derive(raw)
+
+    return Ed25519PrivateKey.from_private_bytes(seed(b"ed25519")), MLDSA65PrivateKey.from_seed_bytes(seed(b"ml-dsa-65"))
+
+
+def verify_key(raw: bytes) -> bytes:
+    """The raw Ed25519 + ML-DSA-65 public keys of a hybrid private key."""
+    ed, ml = signing_keys(raw)
+    return ed.public_key().public_bytes_raw() + ml.public_key().public_bytes_raw()
+
+
+def encryption_part(raw: bytes) -> bytes:
+    """The part of a raw public key that files are encrypted to."""
+    return raw[:HYBRID_PUBLIC_LEN] if len(raw) == SIGNING_PUBLIC_LEN else raw
+
+
+def can_verify(raw: bytes) -> bool:
+    return len(raw) == SIGNING_PUBLIC_LEN
+
+
+def qr_text(raw: bytes) -> str:
+    """What a public key's QR code holds: the key, or only the hash of a locksmith3 key,
+    which is too large for a QR code."""
+    if can_verify(raw):
+        return QR_FINGERPRINT + hashlib.sha256(raw).hexdigest().upper()
+    return encode_public(raw)
 
 
 def public_from_private(raw: bytes) -> bytes:
@@ -132,34 +185,37 @@ def _norm(passphrase: str) -> bytes:
 
 def check_public(raw: bytes):
     """Reject keys that are the wrong size, low-order X25519 points, or malformed
-    ML-KEM keys, which would make encryption to them fail or be insecure."""
-    if not isinstance(raw, bytes) or len(raw) not in (X25519_LEN, HYBRID_PUBLIC_LEN):
+    ML-KEM or ML-DSA keys, which would make encryption to them fail or be insecure."""
+    if not isinstance(raw, bytes) or len(raw) not in PREFIXES:
         raise LocksmithError("That public key is not valid.")
     try:
         X25519PrivateKey.generate().exchange(X25519PublicKey.from_public_bytes(raw[:X25519_LEN]))
     except ValueError:
         raise LocksmithError("That public key is not usable (low-order point).") from None
-    if len(raw) == HYBRID_PUBLIC_LEN:
+    if len(raw) >= HYBRID_PUBLIC_LEN:
         try:
-            MLKEM768PublicKey.from_public_bytes(raw[X25519_LEN:]).encapsulate()
+            MLKEM768PublicKey.from_public_bytes(raw[X25519_LEN:HYBRID_PUBLIC_LEN]).encapsulate()
         except ValueError:
             raise LocksmithError("That public key's post-quantum part is not valid.") from None
+    if len(raw) == SIGNING_PUBLIC_LEN:
+        try:
+            Ed25519PublicKey.from_public_bytes(raw[HYBRID_PUBLIC_LEN:HYBRID_PUBLIC_LEN + ED25519_LEN])
+            MLDSA65PublicKey.from_public_bytes(raw[HYBRID_PUBLIC_LEN + ED25519_LEN:])
+        except ValueError:
+            raise LocksmithError("That public key's signing part is not valid.") from None
 
 
 def encode_public(raw: bytes) -> str:
-    prefix = HYBRID_PREFIX if len(raw) == HYBRID_PUBLIC_LEN else PUBKEY_PREFIX
     check = hashlib.sha256(raw).digest()[:4]
-    return prefix + base64.urlsafe_b64encode(raw + check).decode().rstrip("=")
+    return PREFIXES[len(raw)] + base64.urlsafe_b64encode(raw + check).decode().rstrip("=")
 
 
 def decode_public(text: str) -> bytes:
     text = "".join(text.split())
-    if text.startswith(PUBKEY_PREFIX):
-        prefix, size = PUBKEY_PREFIX, X25519_LEN
-    elif text.startswith(HYBRID_PREFIX):
-        prefix, size = HYBRID_PREFIX, HYBRID_PUBLIC_LEN
-    else:
-        raise LocksmithError("Public keys start with “locksmith1” or “locksmith2”.")
+    found = [(size, prefix) for size, prefix in PREFIXES.items() if text.startswith(prefix)]
+    if not found:
+        raise LocksmithError("Public keys start with “locksmith1”, “locksmith2” or “locksmith3”.")
+    size, prefix = found[0]
     body = text[len(prefix):]
     if len(body) > 4 * (size + 4):
         raise LocksmithError("That public key is not valid.")
@@ -263,16 +319,44 @@ def fingerprint(raw: bytes) -> str:
 @dataclass
 class Identity:
     name: str
-    public: str               # encoded public key
+    public: str               # encoded encryption key (locksmith1/2), which older versions read
     created: int
     private: str | None = None  # base64 raw key when not protected
     locked: dict | None = None  # passphrase-protected private key
     sealed: str | None = None   # TPM-sealed {"private": ...} or {"locked": ...}, base64
     sealed_locked: bool = False # whether the sealed content is passphrase protected
+    # base64 Ed25519 + ML-DSA-65 public keys, so a locked or sealed identity can show its full
+    # public key. Only a cache: derived again whenever the private key is unlocked, and
+    # older versions drop it on save.
+    verify: str | None = None
 
     @property
     def public_raw(self) -> bytes:
+        """The key files are encrypted to."""
         return decode_public(self.public)
+
+    @property
+    def verify_raw(self) -> bytes | None:
+        if not self.verify or not self.is_post_quantum:
+            return None
+        try:
+            raw = base64.b64decode(self.verify, validate=True)
+        except (ValueError, binascii.Error):
+            return None
+        return raw if len(raw) == VERIFY_LEN else None
+
+    @property
+    def key_raw(self) -> bytes:
+        """The full public key to share: with the verify keys once they are known."""
+        return self.public_raw + (self.verify_raw or b"")
+
+    @property
+    def key_text(self) -> str:
+        return encode_public(self.key_raw)
+
+    @property
+    def can_sign(self) -> bool:
+        return self.is_post_quantum
 
     @property
     def is_locked(self) -> bool:
@@ -313,6 +397,8 @@ class Identity:
         else:
             raise LocksmithError(f"“{self.name}” has no private key.")
         self._check_pair(raw)
+        if len(raw) == HYBRID_PRIVATE_LEN:
+            self.verify = base64.b64encode(verify_key(raw)).decode()   # refresh the cache
         return raw
 
     def _unlock(self, passphrase: str, lk: dict) -> bytes:
@@ -346,12 +432,21 @@ class Identity:
 @dataclass
 class Contact:
     name: str
-    public: str
+    public: str               # encoded public key, including any verify keys (locksmith3)
     added: int
 
     @property
-    def public_raw(self) -> bytes:
+    def key_raw(self) -> bytes:
         return decode_public(self.public)
+
+    @property
+    def public_raw(self) -> bytes:
+        """The key files are encrypted to."""
+        return encryption_part(self.key_raw)
+
+    @property
+    def can_verify(self) -> bool:
+        return can_verify(self.key_raw)
 
 
 def _protect(raw: bytes, passphrase: str) -> dict:
@@ -386,6 +481,10 @@ def _from_dict(cls, data):
         if not (isinstance(obj.private, str | None) and isinstance(obj.sealed, str | None)
                 and isinstance(obj.locked, dict | None) and isinstance(obj.sealed_locked, bool)):
             raise TypeError
+        if not isinstance(obj.verify, str) or obj.verify_raw is None:
+            obj.verify = None   # only a cache: a bad one is dropped, not a reason to reject the identity
+        if len(decode_public(obj.public)) == SIGNING_PUBLIC_LEN:
+            raise TypeError     # an identity's stored public key is its encryption key
     when = obj.created if cls is Identity else obj.added
     if isinstance(when, bool) or not isinstance(when, int):
         raise TypeError
@@ -431,6 +530,13 @@ class KeyStore:
                     target.append(_from_dict(cls, entry))
                 except (TypeError, ValueError, LocksmithError):
                     self._unreadable[key].append(entry)
+        for ident in self.identities:
+            # Identities without a passphrase or TPM seal can always show their verify keys.
+            if ident.private and ident.is_post_quantum:
+                try:
+                    ident.private_raw()
+                except LocksmithError:
+                    pass   # reported when the identity is used
         bad = sum(map(len, self._unreadable.values()))
         if bad:
             self.problem = (f"{bad} saved key{'s' if bad != 1 else ''} could not be read and "
@@ -448,6 +554,7 @@ class KeyStore:
         ident = Identity(name=name.strip() or "My key", public=encode_public(public_from_private(raw)),
                          created=int(time.time()))
         self._store_private(ident, raw, passphrase)
+        self._remember_verify(ident, raw)
         self.identities.append(ident)
         self.save()
         return ident
@@ -466,6 +573,7 @@ class KeyStore:
         new = replace(ident, public=encode_public(public_from_private(raw)),
                       private=None, locked=None, sealed=None, sealed_locked=False)
         self._store_private(new, raw, passphrase if was_locked else None)
+        self._remember_verify(new, raw)
         if was_sealed:
             self._seal(new)
         old = replace(ident)
@@ -505,6 +613,17 @@ class KeyStore:
         ident.sealed_locked = ident.locked is not None
         ident.private = ident.locked = None
 
+    def remember_verify(self, ident: Identity, passphrase: str | None = None) -> Identity:
+        """Unlock a hybrid identity once so its full public key (with verify keys) is known."""
+        ident.private_raw(passphrase)
+        self.save()
+        return ident
+
+    @staticmethod
+    def _remember_verify(ident: Identity, raw: bytes):
+        if len(raw) == HYBRID_PRIVATE_LEN:
+            ident.verify = base64.b64encode(verify_key(raw)).decode()
+
     @staticmethod
     def _store_private(ident: Identity, raw: bytes, passphrase: str | None):
         if passphrase:
@@ -512,13 +631,41 @@ class KeyStore:
         else:
             ident.private = base64.b64encode(raw).decode()
 
+    def contact_with_encryption_key(self, raw: bytes) -> Contact | None:
+        """The saved contact whose key encrypts to the same key as ``raw``, if any."""
+        part = encryption_part(raw)
+        return next((c for c in self.contacts if c.public_raw == part), None)
+
     def add_contact(self, name: str, public_text: str) -> Contact:
         raw = decode_public(public_text)
         encoded = encode_public(raw)
-        if any(c.public == encoded for c in self.contacts):
-            raise LocksmithError("That contact is already saved.")
+        same = self.contact_with_encryption_key(raw)
+        if same is not None:
+            if same.public == encoded or (same.can_verify and not can_verify(raw)):
+                raise LocksmithError(f"That key is already saved as “{same.name}”.")
+            if same.can_verify:
+                raise LocksmithError(self._FORGED.format(same.name))
+            raise LocksmithError(f"“{same.name}” already has this key without its signing keys. Update that "
+                                 "contact instead.")
         contact = Contact(name=name.strip() or "Contact", public=encoded, added=int(time.time()))
         self.contacts.append(contact)
+        self.save()
+        return contact
+
+    _FORGED = ("This key encrypts to the same key as “{}” but has different signing keys, so it was not made "
+               "by the same identity. It was not saved.")
+
+    def update_contact_key(self, contact: Contact, public_text: str) -> Contact:
+        """Give a contact saved without signing keys its full locksmith3 key. Only the same
+        encryption key is accepted; the fingerprint changes and should be checked again."""
+        raw = decode_public(public_text)
+        if not can_verify(raw):
+            raise LocksmithError("That key has no signing keys.")
+        if encryption_part(raw) != contact.public_raw:
+            raise LocksmithError(f"That is not a key of “{contact.name}”: it encrypts to a different key.")
+        if contact.can_verify and contact.key_raw != raw:
+            raise LocksmithError(self._FORGED.format(contact.name))
+        contact.public = encode_public(raw)
         self.save()
         return contact
 
@@ -534,6 +681,7 @@ class KeyStore:
         """Write a portable backup. TPM-sealed keys are unsealed first, since a sealed
         key cannot be opened on any other machine."""
         data = asdict(ident)
+        data.pop("verify")   # derived from the private key; not part of the backup format
         if ident.is_sealed:
             inner = ident.unsealed()
             data.update(private=inner.get("private"), locked=inner.get("locked"), sealed=None,
@@ -553,6 +701,7 @@ class KeyStore:
         except (KeyError, ValueError, TypeError, AttributeError, LocksmithError, UnicodeDecodeError,
                 RecursionError) as e:
             raise LocksmithError("That is not a valid Locksmith identity backup.") from e
+        ident.verify = None   # never taken from the file: derived when the key is first unlocked
         if ident.private:
             ident.private_raw()  # raises if the pair does not match
         # Protected keys are checked against their public key when first unlocked.
@@ -572,6 +721,7 @@ class KeyStore:
             raise LocksmithError("That identity is already on this device.")
         ident = Identity(name=name.strip() or "Restored key", public=public, created=int(time.time()))
         self._store_private(ident, raw, passphrase)
+        self._remember_verify(ident, raw)
         self.identities.append(ident)
         try:
             self.save()

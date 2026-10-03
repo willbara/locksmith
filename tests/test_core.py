@@ -79,7 +79,9 @@ def test_tamper_detected(tmp_path, where):
     elif where == "drop_last":
         # remove the final frame entirely
         import struct
-        pos = 12 + struct.unpack(">I", blob[8:12])[0]
+
+        import fileformat
+        pos = len(blob) - len(fileformat.split(bytes(blob))[1])
         frames = []
         while pos < len(blob):
             n = struct.unpack(">I", blob[pos:pos + 4])[0]
@@ -164,7 +166,7 @@ def test_verify(tmp_path):
     src = tmp_path / "v"
     src.write_bytes(b"x" * 10)
     enc = engine.encrypt_paths([src], None, EncryptOptions(password="p", **FAST))
-    assert engine.verify_path(enc, DecryptKeys(password="p"))["name"] == "v"
+    assert engine.verify_path(enc, DecryptKeys(password="p")).meta["name"] == "v"
 
 
 def test_argon_and_scrypt(tmp_path):
@@ -216,7 +218,7 @@ def test_new_files_use_the_locksmith_format(tmp_path):
     src = tmp_path / "a.txt"
     src.write_text("new")
     enc = engine.encrypt_paths([src], tmp_path / "e", EncryptOptions(password="p", **FAST))
-    assert enc.name == "a.txt.locked" and enc.read_bytes().startswith(b"LOCKED\x00\x01")
+    assert enc.name == "a.txt.locked" and enc.read_bytes().startswith(b"LOCKED\x00\x02")
     assert engine.inspect(enc).format_name == "Locksmith"
     foreign = tmp_path / "old.cryptor"
     foreign.write_bytes(b"CRYPTOR\x01" + enc.read_bytes()[8:])

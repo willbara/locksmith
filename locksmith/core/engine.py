@@ -1,23 +1,28 @@
 """Streaming, chunked, authenticated encryption for files, folders and text.
 
-Container layout (all integers big-endian)::
+Container layout, version 2 (all integers big-endian; docs/FORMAT.md is the full spec)::
 
-    magic      8 bytes   b"LOCKED\\x00\\x01"
-    hdr_len    u32
-    header     hdr_len bytes of UTF-8 JSON
+    magic      8 bytes   b"LOCKED\\x00\\x02"
+    kc         32 bytes  key commitment, over the DEK and the fixed header
+    fixed_len  u32, fixed header (UTF-8 JSON: suite, chunk, nonce prefix, salt, metadata)
+    slots_len  u32, key slots (UTF-8 JSON array)
     frames     repeated [u32 ct_len][ct]
+
+Version 1 files (one JSON header holding the commitment and slots) are still read.
 
 A random 256-bit data key (DEK) encrypts the file. It is wrapped once per
 "slot": a password slot (KDF + optional keyfile) and/or one slot per
 recipient. Recipient slots are classical (X25519) or hybrid post-quantum
-(X25519 + ML-KEM-768); a hybrid slot's key needs both shared secrets. Per-layer keys, the metadata key and a key-commitment value are
-derived from the DEK with HKDF-SHA512.
+(X25519 + ML-KEM-768); a hybrid slot's key needs both shared secrets. Per-layer
+keys, the metadata key and the key commitment (which also covers the fixed header)
+are derived from the DEK with HKDF-SHA512.
 
 Each frame's plaintext is ``[u8 kind][u32 len][block][zero padding]`` where
-kind is 0 = raw, 1 = compressed, 2 = padding only. Frame ``i`` uses nonce
-``prefix(7) || i(u32) || final(u8)`` and the SHA-256 of the header as
-associated data, so frames cannot be reordered, dropped, truncated or moved
-between files without detection.
+kind is 0 = raw, 1 = compressed, 2 = padding only, 3 = part of the signature.
+Frame ``i`` uses nonce ``prefix(7) || i(u32) || final(u8)`` and the SHA-256 of
+the fixed header as associated data, so frames cannot be reordered, dropped,
+truncated or moved between files without detection. The key slots are bound to
+nothing but the DEK, so they can change without re-encrypting the frames.
 """
 
 from __future__ import annotations
@@ -53,10 +58,19 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from . import compress as comp
 from . import kdf as kdfmod
-from . import metadata, scratch
+from . import metadata, scratch, signing
 from .ciphers import NONCE_SIZE, SUITES, SuiteCipher, layer_key_sizes
 from .errors import CancelledError, CorruptedError, LocksmithError, WrongKeyError
-from .osutil import IS_WINDOWS, copy_zone_identifier, fsync_dir, fsync_tree, open_new, portable_name, windows_unsafe
+from .osutil import (
+    IS_WINDOWS,
+    copy_zone_identifier,
+    fsync_dir,
+    fsync_tree,
+    mark_untrusted,
+    open_new,
+    portable_name,
+    windows_unsafe,
+)
 
 
 @dataclass(frozen=True)
@@ -71,10 +85,12 @@ class Format:
     allows_hybrid: bool
 
 
-LOCKED = Format("Locksmith", b"LOCKED\x00\x01", 1, b"locksmith/v1/", b"locksmith/v1/x25519-mlkem768", True)
-FORMATS = {f.magic: f for f in (LOCKED,)}
-WRITE_FORMAT = LOCKED
-MAGIC = LOCKED.magic
+LOCKED_V1 = Format("Locksmith", b"LOCKED\x00\x01", 1, b"locksmith/v1/", b"locksmith/v1/x25519-mlkem768", True)
+LOCKED_V2 = Format("Locksmith", b"LOCKED\x00\x02", 2, b"locksmith/v2/", b"locksmith/v2/x25519-mlkem768", True)
+FORMATS = {f.magic: f for f in (LOCKED_V1, LOCKED_V2)}
+WRITE_FORMAT = LOCKED_V2
+MAGIC = WRITE_FORMAT.magic
+FIXED_FIELDS = {"v", "suite", "chunk", "np", "salt", "meta"}   # a v2 fixed header has exactly these
 
 
 def looks_encrypted(head: bytes) -> bool:
@@ -105,7 +121,7 @@ NONCE_PREFIX = 7
 FRAME_HDR = struct.Struct(">BI")
 U32 = struct.Struct(">I")
 
-KIND_RAW, KIND_COMPRESSED, KIND_PAD = 0, 1, 2
+KIND_RAW, KIND_COMPRESSED, KIND_PAD, KIND_SIG = 0, 1, 2, 3
 
 CHUNK_SIZES = {
     256 << 10: "256 KiB",
@@ -145,6 +161,7 @@ class EncryptOptions:
     armor: bool = False
     strip_metadata: bool = False   # JPEG/PNG/WebP metadata, file times and archive owner names
     hide_recipients: bool = False  # pad recipient slots with dummies so their number is hidden
+    signer: bytes | None = None    # raw hybrid private key: sign the file (FORMAT.md §15)
 
 
 @dataclass
@@ -152,6 +169,7 @@ class DecryptKeys:
     password: str | None = None
     keyfile: str | None = None
     identities: list[bytes] = field(default_factory=list)  # raw X25519 private
+    verifiers: list[bytes] = field(default_factory=list)   # raw locksmith3 keys whose signatures count
 
 
 @dataclass
@@ -180,6 +198,7 @@ class DecryptResult:
     # True only when everything was restored as stored and confirmed on disk, so the
     # source can be deleted. Anything skipped, renamed or not flushed makes it False.
     complete: bool = False
+    signature: signing.LockedSignature | None = None   # None: the file isn't signed
 
 
 @dataclass
@@ -308,6 +327,8 @@ def validate_options(opts: EncryptOptions):
     for rpk in opts.recipients:
         if not isinstance(rpk, bytes) or len(rpk) not in (X25519_LEN, X25519_LEN + MLKEM_PUBLIC_LEN):
             raise LocksmithError("A recipient's public key is invalid.")
+    if opts.signer is not None:
+        signing.check_signer(opts.signer)
     # The reader accepts at most MAX_SLOTS slots: never write a file it would refuse.
     opts.recipients = list(dict.fromkeys(opts.recipients))  # a repeated key adds nothing
     slots = len(opts.recipients) + bool(opts.password or opts.keyfile)
@@ -344,7 +365,13 @@ class _Keys:
         ]
         self.cipher = SuiteCipher(suite, layer_keys)
         self.meta_key = _hkdf(dek, 32, salt, fmt.label + b"meta")
-        self.commitment = _hkdf(dek, 32, salt, fmt.label + b"commit")
+
+
+def _commitment(dek: bytes, salt: bytes, fmt: Format, fixed: bytes) -> bytes:
+    """Version 2 commits to the DEK and the fixed header, so any change to it reads as a
+    wrong key; version 1 committed to the DEK alone."""
+    extra = hashlib.sha256(fixed).digest() if fmt.version >= 2 else b""
+    return _hkdf(dek, 32, salt, fmt.label + b"commit" + extra)
 
 
 def _password_kek(password: str | None, keyfile_hash: bytes | None, salt: bytes,
@@ -387,9 +414,20 @@ def _unwrap(kek: bytes, nonce: bytes, wrapped: bytes, kind: bytes, fmt: Format) 
 
 # ── header ───────────────────────────────────────────────────────────────────
 
+@dataclass
+class _Written:
+    """A new file's header: what goes before the frames, and what the frames authenticate."""
+    preamble: bytes
+    fixed: bytes        # version 2: the fixed header; version 1: the whole header
+    keys: _Keys
+    dek: bytes          # kept with the keys derived from it, for rewriting the commitment
+
+
 def _build_header(opts: EncryptOptions, meta: dict, chk: _Checker,
-                  fmt: Format = WRITE_FORMAT) -> tuple[bytes, _Keys]:
+                  fmt: Format = WRITE_FORMAT) -> _Written:
     validate_options(opts)
+    if opts.signer is not None and fmt.version < 2:
+        raise LocksmithError("Only version 2 files can be signed.")
     dek = secrets.token_bytes(32)
     salt = os.urandom(32)
     keys = _Keys(dek, salt, opts.suite, fmt)
@@ -425,21 +463,30 @@ def _build_header(opts: EncryptOptions, meta: dict, chk: _Checker,
         "chunk": opts.chunk_size,
         "np": _b64(os.urandom(NONCE_PREFIX)),
         "salt": _b64(salt),
-        "kc": _b64(keys.commitment),
-        "slots": slots,
         "meta": {"n": _b64(mnonce), "c": _b64(mct)},
     }
-    raw = json.dumps(header, separators=(",", ":")).encode()
+    too_long = LocksmithError("The note is too long to store in the file. Shorten it and try again.")
+    if fmt.version >= 2:
+        fixed = json.dumps(header, separators=(",", ":")).encode()
+        slots_raw = json.dumps(slots, separators=(",", ":")).encode()
+        if len(fixed) > MAX_HEADER or len(slots_raw) > MAX_HEADER:
+            raise too_long
+        kc = _commitment(dek, salt, fmt, fixed)
+        preamble = fmt.magic + kc + U32.pack(len(fixed)) + fixed + U32.pack(len(slots_raw)) + slots_raw
+    else:
+        header.update(kc=_b64(_commitment(dek, salt, fmt, b"")), slots=slots)
+        fixed = json.dumps(header, separators=(",", ":")).encode()
+        if len(fixed) > MAX_HEADER:
+            raise too_long
+        preamble = fmt.magic + U32.pack(len(fixed)) + fixed
     # Hold the new header to the reader's rules, so a mismatch between writer and
     # reader fails here, before anything is written, not when the file is opened.
-    if len(raw) > MAX_HEADER:
-        raise LocksmithError("The note is too long to store in the file. Shorten it and try again.")
     try:
-        _check_header(json.loads(raw), fmt)
-    except (ValueError, KeyError, TypeError, AttributeError) as e:
+        _read_header(io.BytesIO(preamble))
+    except CorruptedError as e:
         raise LocksmithError("These settings would make a file that can't be opened. "
                              "Nothing was written.") from e
-    return raw, keys
+    return _Written(preamble, fixed, keys, dek)
 
 
 def _recipient_slot(rpk: bytes, dek: bytes, fmt: Format) -> dict:
@@ -482,24 +529,40 @@ def _dummy_recipients(opts: EncryptOptions) -> list[bytes]:
     return keys
 
 
+def _read_sized(f: BinaryIO) -> bytes:
+    raw_len = f.read(4)
+    if len(raw_len) != 4:
+        raise CorruptedError("The file is truncated.")
+    (n,) = U32.unpack(raw_len)
+    if n > MAX_HEADER:
+        raise CorruptedError("The file header is damaged.")
+    raw = f.read(n)
+    if len(raw) != n:
+        raise CorruptedError("The file is truncated.")
+    return raw
+
+
 def _read_header(f: BinaryIO) -> tuple[dict, bytes, Format]:
+    """Parse the header. Returns its fields (for version 2, the fixed header plus "kc" and
+    "slots", so both versions look alike), the bytes the frames authenticate, and the format."""
     magic = f.read(8)
     fmt = FORMATS.get(magic)
     if fmt is None:
         if magic[:6] == b"LOCKED":
             raise CorruptedError("This file was made by a newer version of Locksmith.")
         raise CorruptedError("This is not a Locksmith file.")
-    raw_len = f.read(4)
-    if len(raw_len) != 4:
-        raise CorruptedError("The file is truncated.")
-    (hlen,) = U32.unpack(raw_len)
-    if hlen > MAX_HEADER:
-        raise CorruptedError("The file header is damaged.")
-    raw = f.read(hlen)
-    if len(raw) != hlen:
-        raise CorruptedError("The file is truncated.")
+    if fmt.version >= 2:
+        kc = f.read(32)
+        if len(kc) != 32:
+            raise CorruptedError("The file is truncated.")
+    raw = _read_sized(f)
+    slots_raw = _read_sized(f) if fmt.version >= 2 else None
     try:
         header = json.loads(raw)
+        if fmt.version >= 2:
+            if not isinstance(header, dict) or set(header) != FIXED_FIELDS:
+                raise ValueError
+            header = {**header, "kc": _b64(kc), "slots": json.loads(slots_raw)}
         _check_header(header, fmt)
     except CorruptedError:
         raise
@@ -592,7 +655,7 @@ class _Identity:
         self.public = self.x25519_public + (self.mlkem.public_key().public_bytes_raw() if self.mlkem else b"")
 
 
-def _unlock(header: dict, keys: DecryptKeys, chk: _Checker, fmt: Format) -> _Keys:
+def _unlock(header: dict, raw: bytes, keys: DecryptKeys, chk: _Checker, fmt: Format) -> _Keys:
     salt = _unb64(header["salt"])
     commitment = _unb64(header["kc"])
     dek = None
@@ -603,7 +666,7 @@ def _unlock(header: dict, keys: DecryptKeys, chk: _Checker, fmt: Format) -> _Key
         # error that tells a prober their slot unwrapped.
         if candidate is None:
             return None
-        ok = hmac.compare_digest(_hkdf(candidate, 32, salt, fmt.label + b"commit"), commitment)
+        ok = hmac.compare_digest(_commitment(candidate, salt, fmt, raw), commitment)
         return candidate if ok else None
 
     idents = [_Identity(raw) for raw in keys.identities]
@@ -660,7 +723,7 @@ def _unlock(header: dict, keys: DecryptKeys, chk: _Checker, fmt: Format) -> _Key
 # Expected type of each metadata field. The sender chooses the metadata, so a
 # field of the wrong type (e.g. a list as "comp") is dropped rather than trusted.
 _META_TYPES = {"name": str, "kind": str, "comp": str, "note": str, "size": int, "mtime": int,
-               "created": int, "items": int}
+               "created": int, "items": int, "to": list}
 
 
 def _read_meta(header: dict, keys: _Keys) -> dict:
@@ -683,12 +746,13 @@ def _nonce(prefix: bytes, index: int, final: bool) -> bytes:
     return prefix + U32.pack(index) + (b"\x01" if final else b"\x00")
 
 
-def _encrypt_stream(src: BinaryIO, total: int, out: BinaryIO, header: bytes,
-                    keys: _Keys, opts: EncryptOptions, codec_id: str, chk: _Checker,
+def _encrypt_stream(src: BinaryIO, total: int, out: BinaryIO, head: _Written,
+                    opts: EncryptOptions, codec_id: str, chk: _Checker,
                     max_input: int | None = None):
-    hdr = json.loads(header)
-    prefix = _unb64(hdr["np"])
-    aad = hashlib.sha256(header).digest()
+    keys = head.keys
+    prefix = _unb64(json.loads(head.fixed)["np"])
+    aad = hashlib.sha256(head.fixed).digest()
+    content_hash = hashlib.sha512()   # what a signature covers
     chunk = opts.chunk_size
     codec = comp.CODECS.get(codec_id)
     level = codec.levels[opts.level] if codec else 0
@@ -713,9 +777,7 @@ def _encrypt_stream(src: BinaryIO, total: int, out: BinaryIO, header: bytes,
         out.write(U32.pack(len(ct)))
         out.write(ct)
 
-    out.write(keys.fmt.magic)
-    out.write(U32.pack(len(header)))
-    out.write(header)
+    out.write(head.preamble)
 
     index = 0
     payload = 0
@@ -735,6 +797,8 @@ def _encrypt_stream(src: BinaryIO, total: int, out: BinaryIO, header: bytes,
             if not blocks:
                 break
             done += sum(map(len, blocks))
+            for b in blocks:
+                content_hash.update(b)
             # Checked on what is actually read: a folder's archive is larger than its
             # files, and a file can grow while it is read.
             if max_input is not None and done > max_input:
@@ -775,6 +839,12 @@ def _encrypt_stream(src: BinaryIO, total: int, out: BinaryIO, header: bytes,
         take = min(pad, frame_cap - FRAME_HDR.size)
         tail.append(FRAME_HDR.pack(KIND_PAD, 0) + bytes(take))
         pad -= take
+    if opts.signer is not None:
+        # Last of all, the signature, split into chunk-sized blocks (FORMAT.md §15).
+        chk.report(None, "Signing")
+        sig = signing.sign_locked(opts.signer, head.fixed, content_hash.digest())
+        tail += [FRAME_HDR.pack(KIND_SIG, len(part)) + part
+                 for part in (sig[i:i + chunk] for i in range(0, len(sig), chunk))]
     for i, fr in enumerate(tail):
         chk.check()
         write(seal((index + i, fr, i == len(tail) - 1)))
@@ -807,10 +877,12 @@ def _frames(f: BinaryIO, limit: int):
 
 def _decrypt_stream(f: BinaryIO, total: int, header: dict, raw_header: bytes,
                     keys: _Keys, meta: dict, out: BinaryIO, threads: int, chk: _Checker,
-                    max_output: int | None = None):
+                    max_output: int | None = None) -> tuple[bytes, bytes]:
     """Decrypt the frames after the header into ``out``. ``max_output`` caps the total
     plaintext: chunks are capped one by one, but many small chunks can still expand
-    without limit, which matters when ``out`` is in memory."""
+    without limit, which matters when ``out`` is in memory. Returns the SHA-512 of the
+    content and the signature frames' bytes (empty when the file isn't signed), which the
+    caller checks before anything is shown or moved into place."""
     prefix = _unb64(header["np"])
     aad = hashlib.sha256(raw_header).digest()
     chunk = header["chunk"]
@@ -842,13 +914,16 @@ def _decrypt_stream(f: BinaryIO, total: int, header: dict, raw_header: bytes,
             if codec is None:
                 raise CorruptedError("Unknown compression method.")
             return kind, codec.decompress(block, chunk)
-        if kind in (KIND_RAW, KIND_PAD):
+        if kind in (KIND_RAW, KIND_PAD) or (kind == KIND_SIG and keys.fmt.version >= 2):
             return kind, block
         raise CorruptedError("A chunk is malformed.")
 
     index = 0
     written = 0
-    padding = False     # padding frames come only after the last data frame
+    stage = 0           # frames come in order: content (0), padding (1), signature (2)
+    seen = 0
+    content_hash = hashlib.sha512()
+    signature = bytearray()
     started = time.monotonic()
     it = _frames(f, limit)
     with ThreadPoolExecutor(threads) as pool:
@@ -862,20 +937,27 @@ def _decrypt_stream(f: BinaryIO, total: int, header: dict, raw_header: bytes,
             if not items:
                 break
             for kind, plain in pool.map(open_frame, items):
-                if kind == KIND_PAD:
-                    padding = True
-                elif padding:
+                frame_stage = 2 if kind == KIND_SIG else 1 if kind == KIND_PAD else 0
+                if frame_stage < stage or (frame_stage and not seen):   # content always comes first
                     raise CorruptedError("A chunk is malformed.")
-                else:
+                seen += 1
+                stage = frame_stage
+                if kind == KIND_SIG:
+                    signature += plain
+                    if len(signature) > signing.LOCKED_LEN:
+                        raise CorruptedError("The file's signature is damaged.")
+                elif kind != KIND_PAD:
                     written += len(plain)
                     if max_output is not None and written > max_output:
                         raise CorruptedError(f"The content is larger than {max_output >> 20} MiB, "
                                              "the limit for messages opened in memory.")
+                    content_hash.update(plain)
                     out.write(plain)
             index += len(items)
             pos = f.tell() if f.seekable() else 0
             rate = pos / max(time.monotonic() - started, 1e-6)
             chk.report(min(pos / total, 1.0) if total else None, f"Decrypting · {_rate(rate)}")
+    return content_hash.digest(), bytes(signature)
 
 
 def _rate(bps: float) -> str:
@@ -1062,21 +1144,20 @@ def encrypt_paths(paths: list[Path], out_dir: Path | None, opts: EncryptOptions,
     target = unique_path(out_dir / _output_name(opts, name))
     tmp = out_dir / f".{target.name}.{secrets.token_hex(4)}.part"
 
-    header, keys = _build_header(opts, meta, chk)
+    head = _build_header(opts, meta, chk)
     try:
         with opener() as src:
             if opts.armor:
                 buf = io.BytesIO()
-                _encrypt_stream(src, total, buf, header, keys, opts, codec_id, chk,
-                                max_input=MAX_ARMOR_INPUT)
+                _encrypt_stream(src, total, buf, head, opts, codec_id, chk, max_input=MAX_ARMOR_INPUT)
                 write_private(tmp, armor(buf.getvalue()).encode())
             else:
                 with create_private(tmp) as out:
-                    _encrypt_stream(src, total, out, header, keys, opts, codec_id, chk)
+                    _encrypt_stream(src, total, out, head, opts, codec_id, chk)
                     out.flush()
                     os.fsync(out.fileno())
         if verify:
-            _verify_written(tmp, header, keys, meta, opts.threads, chk)
+            _verify_written(tmp, head, meta, opts, chk)
         chk.report(1.0, "Done")
         os.replace(tmp, target)
         fsync_dir(out_dir)  # callers may shred the originals as soon as this returns
@@ -1087,17 +1168,27 @@ def encrypt_paths(paths: list[Path], out_dir: Path | None, opts: EncryptOptions,
     return target
 
 
-def _verify_written(path: Path, header: bytes, keys: _Keys, meta: dict, threads: int, chk: _Checker):
+def _verify_written(path: Path, head: _Written, meta: dict, opts: EncryptOptions, chk: _Checker):
     """Read a freshly written file back and authenticate every chunk with the
-    in-memory keys, proving the bytes on disk decrypt."""
+    in-memory keys, proving the bytes on disk decrypt (and that a signature verifies)."""
     with _open_source(path) as f:
         total = f.seek(0, os.SEEK_END)
         f.seek(0)
         parsed, raw, _fmt = _read_header(f)
-        if raw != header:
+        if raw != head.fixed:
             raise LocksmithError("Verification failed: the header on disk does not match.")
         sub = _Checker(chk.cancel, lambda frac, _stage: chk.report(frac, "Verifying"))
-        _decrypt_stream(f, total, parsed, raw, keys, meta, _NullWriter(), threads, sub)
+        digest, sig = _decrypt_stream(f, total, parsed, raw, head.keys, meta, _NullWriter(), opts.threads, sub)
+    if bool(sig) != (opts.signer is not None):
+        raise LocksmithError("Verification failed: the signature is missing or unexpected.")
+    if sig and signing.check_locked(sig, raw, digest, [signing.public_key(opts.signer)]).key is None:
+        raise LocksmithError("Verification failed: the signature does not verify.")
+
+
+def _signature_status(sig: bytes, raw: bytes, digest: bytes, keys: DecryptKeys) -> signing.LockedSignature | None:
+    """Check a decrypted file's signature, if it has one, with the keys the reader trusts.
+    An invalid signature raises SignatureError: callers then show and keep nothing."""
+    return signing.check_locked(sig, raw, digest, keys.verifiers) if sig else None
 
 
 class _NullWriter(io.RawIOBase):
@@ -1120,9 +1211,9 @@ def encrypt_bytes(data: bytes, opts: EncryptOptions, name: str = "message.txt",
             "size": len(data)}
     if opts.note:
         meta["note"] = opts.note
-    header, keys = _build_header(opts, meta, chk)
+    head = _build_header(opts, meta, chk)
     out = io.BytesIO()
-    _encrypt_stream(io.BytesIO(data), len(data), out, header, keys, opts, codec_id, chk)
+    _encrypt_stream(io.BytesIO(data), len(data), out, head, opts, codec_id, chk)
     return out.getvalue()
 
 
@@ -1170,75 +1261,111 @@ def decrypt_path(path: Path, out_dir: Path | None, keys: DecryptKeys, threads: i
     chk = _Checker(cancel, progress)
     path = Path(path)
     out_dir = Path(out_dir) if out_dir else path.parent
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     with _open_source(path) as f:
         total = f.seek(0, os.SEEK_END)
         f.seek(0)
         header, raw, fmt = _read_header(f)
-        k = _unlock(header, keys, chk, fmt)
+        k = _unlock(header, raw, keys, chk, fmt)
         meta = _read_meta(header, k)
-        name = safe_name(meta.get("name") or path.stem)
-        tmp = out_dir / f".locksmith-{secrets.token_hex(6)}.part"
-        skipped: list[str] = []
-        complete = True
-        with scratch.tracked(tmp):  # removed on the next start if this run is killed
-            try:
-                with create_private(tmp) as out:
-                    _decrypt_stream(f, total, header, raw, k, meta, out, threads, chk)
-                    out.flush()
-                    os.fsync(out.fileno())
-                kind = meta.get("kind", "file")
-                if kind in ("dir", "bundle"):
-                    chk.report(None, "Extracting")
-                    target = unique_path(out_dir / name)
-                    if kind == "dir":
-                        staging = out_dir / f".locksmith-{secrets.token_hex(6)}"
-                        with scratch.tracked(staging):
-                            ext = extract_archive(tmp, staging)
-                            # Unwrap the archive's top-level folder (stored under its original
-                            # name, which may differ from the safe one). Only a real folder: a
-                            # symlink moved out of staging would resolve against the output folder.
-                            inner = next((e for e in staging.iterdir() if safe_name(e.name) == name
-                                          and e.is_dir() and not e.is_symlink()), staging)
-                            os.replace(inner, target)
-                            # Anything stored beside the top-level folder is discarded: report it.
-                            if staging.exists():
-                                ext.skipped += sorted(e.name for e in staging.iterdir())
-                            shutil.rmtree(staging, ignore_errors=True)
-                    else:
-                        ext = extract_archive(tmp, target)
-                    skipped = ext.skipped
-                    complete = ext.flushed and not ext.skipped and not ext.renamed
-                    tmp.unlink(missing_ok=True)
-                else:
-                    target = unique_path(out_dir / name)
-                    os.replace(tmp, target)
-                    mtime = meta.get("mtime")
-                    if isinstance(mtime, int) and not isinstance(mtime, bool):
-                        try:
-                            os.utime(target, (time.time(), mtime))
-                        except (OverflowError, OSError, ValueError):
-                            pass
-                # Callers may delete the source as soon as this returns.
-                complete = fsync_dir(out_dir) and complete
-            except BaseException:
-                tmp.unlink(missing_ok=True)
-                raise
-    copy_zone_identifier(path, target)
+        res = _decrypt_into(f, total, header, raw, k, meta, out_dir, path.stem, threads, chk, keys)
+    copy_zone_identifier(path, res.path)
     chk.report(1.0, "Done")
-    return DecryptResult(target, meta, skipped=skipped, complete=complete)
+    return res
+
+
+def decrypt_pasted(blob: bytes, out_dir: Path, keys: DecryptKeys, threads: int = 0,
+                   progress: Progress | None = None,
+                   cancel: threading.Event | None = None) -> DecryptResult:
+    """Open a pasted message (already dearmored). Text stays in memory, in ``data``. Files
+    and folders are written to ``out_dir`` exactly as ``decrypt_path`` writes them, and
+    marked as coming from the internet on Windows: pasted text comes from someone else.
+    Content is capped at MAX_ARMOR_INPUT, as for every in-memory message."""
+    chk = _Checker(cancel, progress)
+    f = io.BytesIO(blob)
+    header, raw, fmt = _read_header(f)
+    k = _unlock(header, raw, keys, chk, fmt)
+    meta = _read_meta(header, k)
+    if meta.get("kind", "file") == "text":
+        out = io.BytesIO()
+        digest, sig = _decrypt_stream(f, len(blob), header, raw, k, meta, out, 1, chk, max_output=MAX_ARMOR_INPUT)
+        return DecryptResult(None, meta, out.getvalue(), signature=_signature_status(sig, raw, digest, keys))
+    res = _decrypt_into(f, len(blob), header, raw, k, meta, Path(out_dir), "decrypted", threads, chk, keys,
+                        max_output=MAX_ARMOR_INPUT)
+    mark_untrusted(res.path)
+    chk.report(1.0, "Done")
+    return res
+
+
+def _decrypt_into(f: BinaryIO, total: int, header: dict, raw: bytes, k: _Keys, meta: dict, out_dir: Path,
+                  fallback_name: str, threads: int, chk: _Checker, keys: DecryptKeys,
+                  max_output: int | None = None) -> DecryptResult:
+    """Decrypt the frames after the header into ``out_dir``, creating it if needed: a file
+    is moved into place under its sanitised name, a folder or bundle is extracted (a
+    folder's top level unwrapped). Nothing is in place until every frame authenticated
+    and any signature verified."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    name = safe_name(meta.get("name") or fallback_name)
+    tmp = out_dir / f".locksmith-{secrets.token_hex(6)}.part"
+    skipped: list[str] = []
+    complete = True
+    with scratch.tracked(tmp):  # removed on the next start if this run is killed
+        try:
+            with create_private(tmp) as out:
+                digest, sig = _decrypt_stream(f, total, header, raw, k, meta, out, threads, chk,
+                                              max_output=max_output)
+                out.flush()
+                os.fsync(out.fileno())
+            signature = _signature_status(sig, raw, digest, keys)   # raises (and removes tmp) if invalid
+            kind = meta.get("kind", "file")
+            if kind in ("dir", "bundle"):
+                chk.report(None, "Extracting")
+                target = unique_path(out_dir / name)
+                if kind == "dir":
+                    staging = out_dir / f".locksmith-{secrets.token_hex(6)}"
+                    with scratch.tracked(staging):
+                        ext = extract_archive(tmp, staging)
+                        # Unwrap the archive's top-level folder (stored under its original
+                        # name, which may differ from the safe one). Only a real folder: a
+                        # symlink moved out of staging would resolve against the output folder.
+                        inner = next((e for e in staging.iterdir() if safe_name(e.name) == name
+                                      and e.is_dir() and not e.is_symlink()), staging)
+                        os.replace(inner, target)
+                        # Anything stored beside the top-level folder is discarded: report it.
+                        if staging.exists():
+                            ext.skipped += sorted(e.name for e in staging.iterdir())
+                        shutil.rmtree(staging, ignore_errors=True)
+                else:
+                    ext = extract_archive(tmp, target)
+                skipped = ext.skipped
+                complete = ext.flushed and not ext.skipped and not ext.renamed
+                tmp.unlink(missing_ok=True)
+            else:
+                target = unique_path(out_dir / name)
+                os.replace(tmp, target)
+                mtime = meta.get("mtime")
+                if isinstance(mtime, int) and not isinstance(mtime, bool):
+                    try:
+                        os.utime(target, (time.time(), mtime))
+                    except (OverflowError, OSError, ValueError):
+                        pass
+            # Callers may delete the source as soon as this returns.
+            complete = fsync_dir(out_dir) and complete
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
+    return DecryptResult(target, meta, skipped=skipped, complete=complete, signature=signature)
 
 
 def decrypt_bytes(blob: bytes, keys: DecryptKeys) -> DecryptResult:
     chk = _Checker(None, None)
     f = io.BytesIO(blob)
     header, raw, fmt = _read_header(f)
-    k = _unlock(header, keys, chk, fmt)
+    k = _unlock(header, raw, keys, chk, fmt)
     meta = _read_meta(header, k)
     out = io.BytesIO()
-    _decrypt_stream(f, len(blob), header, raw, k, meta, out, 1, chk, max_output=MAX_ARMOR_INPUT)
-    return DecryptResult(None, meta, out.getvalue())
+    digest, sig = _decrypt_stream(f, len(blob), header, raw, k, meta, out, 1, chk, max_output=MAX_ARMOR_INPUT)
+    return DecryptResult(None, meta, out.getvalue(), signature=_signature_status(sig, raw, digest, keys))
 
 
 def safe_name(name) -> str:
@@ -1355,15 +1482,16 @@ def extract_archive(archive: Path, dest: Path) -> Extraction:
 
 def verify_path(path: Path, keys: DecryptKeys, threads: int = 0,
                 progress: Progress | None = None,
-                cancel: threading.Event | None = None) -> dict:
-    """Authenticate every chunk without writing any plaintext to disk."""
+                cancel: threading.Event | None = None) -> DecryptResult:
+    """Authenticate every chunk, and any signature, without writing any plaintext to disk."""
     chk = _Checker(cancel, progress)
     with _open_source(Path(path)) as f:
         total = f.seek(0, os.SEEK_END)
         f.seek(0)
         header, raw, fmt = _read_header(f)
-        k = _unlock(header, keys, chk, fmt)
+        k = _unlock(header, raw, keys, chk, fmt)
         meta = _read_meta(header, k)
-        _decrypt_stream(f, total, header, raw, k, meta, _NullWriter(), threads, chk)
+        digest, sig = _decrypt_stream(f, total, header, raw, k, meta, _NullWriter(), threads, chk)
+    signature = _signature_status(sig, raw, digest, keys)
     chk.report(1.0, "Verified")
-    return meta
+    return DecryptResult(None, meta, signature=signature)

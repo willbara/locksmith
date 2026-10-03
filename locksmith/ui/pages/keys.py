@@ -28,6 +28,7 @@ from ..widgets import (
     toast,
 )
 from ..workers import run_task
+from .common import show_key_qr
 
 
 class _KeyRow(Card):
@@ -68,7 +69,8 @@ class KeysPage(Page):
             "     so files sent to you also resist future quantum computers).\n"
             "2.  Send your public key to friends. It only lets people encrypt files for you.\n"
             "3.  Add their public keys as contacts, then pick them under Encrypt → Public keys.\n"
-            "Only the matching private key can open the file. It never leaves this device.",
+            "Only the matching private key can open the file. It never leaves this device.\n"
+            "Post-quantum identities also sign files (Tools), and their public key verifies the signatures.",
             "caption"))
         self.add(how)
 
@@ -111,9 +113,11 @@ class KeysPage(Page):
         for ident in self.store.identities:
             created = time.strftime("%d %b %Y", time.localtime(ident.created))
             lock = "Passphrase protected" if ident.is_locked else "Not passphrase protected"
-            kind = "Post-quantum" if ident.is_post_quantum else "Classical"
+            needs_unlock = ident.can_sign and ident.verify_raw is None
+            kind = ("Post-quantum, unlock to add signing" if needs_unlock else
+                    "Post-quantum, signs" if ident.can_sign else "Classical")
             sealed = "  ·  sealed to this device's TPM" if ident.is_sealed else ""
-            row = _KeyRow(ident.name, fingerprint(ident.public_raw),
+            row = _KeyRow(ident.name, fingerprint(ident.key_raw),
                           f"{kind}  ·  {lock}{sealed}  ·  created {created}")
             if IS_WINDOWS:
                 row.action("chip", "TPM sealing: not available currently")
@@ -121,10 +125,13 @@ class KeysPage(Page):
                 row.action("chip", "Remove TPM sealing" if ident.is_sealed else "Seal to this device's TPM",
                            lambda _=0, i=ident: self._toggle_seal(i))
             if not ident.is_post_quantum:
-                row.action("shield", "Add post-quantum protection (ML-KEM-768)",
+                row.action("shield", "Add post-quantum protection and signing (ML-KEM-768, ML-DSA-65)",
                            lambda _=0, i=ident: self._upgrade(i))
-            row.action("copy", "Copy public key", lambda _=0, i=ident: self._copy(i.public))
-            row.action("qr", "Show public key as QR", lambda _=0, i=ident: dialogs.qr_view(i.name, i.public))
+            if needs_unlock:
+                row.action("fingerprint", "Unlock once to add its signing keys to the public key",
+                           lambda _=0, i=ident: self._remember_verify(i))
+            row.action("copy", "Copy public key", lambda _=0, i=ident: self._copy(i.key_text))
+            row.action("qr", "Show public key as QR", lambda _=0, i=ident: show_key_qr(i.name, i.key_raw))
             row.action("download", "Export backup", lambda _=0, i=ident: self._export(i))
             row.action("message", "Show backup words", lambda _=0, i=ident: self._backup_words(i))
             row.action("scissors", "Split into Shamir shares", lambda _=0, i=ident: self._split_identity(i))
@@ -135,8 +142,9 @@ class KeysPage(Page):
                                              "caption"))
         for c in self.store.contacts:
             added = time.strftime("%d %b %Y", time.localtime(c.added))
-            kind = "Post-quantum" if len(c.public_raw) > 32 else "Classical"
-            row = _KeyRow(c.name, fingerprint(c.public_raw), f"{kind}  ·  added {added}")
+            kind = ("Post-quantum, verifies signatures" if c.can_verify else
+                    "Post-quantum" if len(c.public_raw) > 32 else "Classical")
+            row = _KeyRow(c.name, fingerprint(c.key_raw), f"{kind}  ·  added {added}")
             row.action("copy", "Copy public key", lambda _=0, c=c: self._copy(c.public))
             row.action("trash", "Remove", lambda _=0, c=c: self._delete_contact(c))
             self.contact_box.addWidget(row)
@@ -175,7 +183,7 @@ class KeysPage(Page):
     def _add_contact(self):
         s = Sheet("Add contact", "Paste the public key someone shared with you.", icon="user")
         name = LineEdit("Name")
-        key = LineEdit("locksmith1…", mono=True)
+        key = LineEdit("locksmith…", mono=True)
         key.add_action("paste", "Paste", lambda: key.setText(QApplication.clipboard().text().strip()))
         s.add(name)
         s.add(key)
@@ -184,12 +192,25 @@ class KeysPage(Page):
         if not s.exec():
             return
         try:
-            c = self.store.add_contact(name.text(), key.text())
+            raw = keys.decode_public(key.text())
+            same = self.store.contact_with_encryption_key(raw)
+            if same is not None and not same.can_verify and keys.can_verify(raw):
+                if not dialogs.confirm(
+                        f"Update “{same.name}”?",
+                        f"This is the key you saved as “{same.name}”, with its signing keys added, so you can "
+                        f"verify their signatures. Its fingerprint changes to {fingerprint(raw)}. Check the new "
+                        "fingerprint with them before trusting any signature.", ok="Update", icon="user"):
+                    return
+                c = self.store.update_contact_key(same, key.text())
+                done = f"Updated {c.name}"
+            else:
+                c = self.store.add_contact(name.text(), key.text())
+                done = f"Added {c.name}"
         except LocksmithError as e:
             dialogs.error(str(e))
             return
         self.reload(True)
-        toast(f"Added {c.name}", "user")
+        toast(done, "user")
 
     def _export(self, ident):
         path, _ = QFileDialog.getSaveFileName(self, "Export identity backup",
@@ -321,12 +342,23 @@ class KeysPage(Page):
             job, done = (lambda r, c: self.store.seal(ident)), "Sealed to this device's TPM. Backup saved."
         run_task(job, lambda _: (self.reload(), toast(done, "chip")), lambda m, k: dialogs.error(m), parent=self)
 
+    def _remember_verify(self, ident):
+        passphrase = None
+        if ident.is_locked:
+            passphrase = dialogs.prompt("Identity passphrase", f"Unlock “{ident.name}” once to add its signing "
+                                        "keys to its public key.", "Passphrase", secret=True, ok="Unlock")
+            if not passphrase:
+                return
+        run_task(lambda r, c: self.store.remember_verify(ident, passphrase),
+                 lambda i: (self.reload(), toast(f"“{i.name}” can sign. Share its new public key.", "fingerprint")),
+                 lambda m, k: dialogs.error(m), parent=self)
+
     def _upgrade(self, ident):
         if not dialogs.confirm(
                 "Add post-quantum protection?",
                 "Adds an ML-KEM-768 key to this identity, so files sent to it resist future quantum "
-                "computers. Everything already encrypted to it still opens. Your public key changes: "
-                "share the new one with your contacts.", ok="Upgrade", icon="shield"):
+                "computers, and lets it sign files. Everything already encrypted to it still opens. Your "
+                "public key changes: share the new one with your contacts.", ok="Upgrade", icon="shield"):
             return
         passphrase = None
         if ident.is_locked:

@@ -1,45 +1,53 @@
-# Locksmith file format, version 1
+# Locksmith file format, version 2
 
 This document specifies everything needed to read and write Locksmith files and the related text
-formats (armor, public keys, Shamir shares, identity backups, checksum manifests) without Locksmith's
-code. The test vectors in [`tests/vectors`](../tests/vectors) are files made to this specification;
+formats (armor, public keys, Shamir shares, identity backups, checksum manifests, signing keys and
+detached signatures) without Locksmith's code. The test vectors in [`tests/vectors`](../tests/vectors) are files made to this specification;
 [`tests/spec_reader.py`](../tests/spec_reader.py) is an independent reader written from it, and
 `tests/test_vectors.py` checks the two against each other.
 
+Locksmith writes version 2 and still reads version 1 (section 16).
+
 Conventions: integers are unsigned big-endian. `||` is concatenation. Base64 is the standard alphabet
-with padding (RFC 4648 §4), and readers reject anything else. Strings in labels are ASCII. `LABEL` is
-`locksmith/v1/`. `HKDF(ikm, length, salt, info)` is HKDF with SHA-512 (RFC 5869).
+with padding (RFC 4648 §4), and readers reject anything else. Strings in labels are ASCII. In sections
+1–8 and 15, `LABEL` is `locksmith/v2/`; the other sections spell out their labels in full.
+`HKDF(ikm, length, salt, info)` is HKDF with SHA-512 (RFC 5869).
 
 ## 1. Container
 
 ```
-magic      8 bytes   "LOCKED" 0x00 0x01
-hdr_len    u32       at most 1 MiB
-header     hdr_len bytes of UTF-8 JSON
+magic      8 bytes   "LOCKED" 0x00 0x02
+kc         32 bytes  key commitment (section 4)
+fixed_len  u32       at most 1 MiB
+fixed      fixed_len bytes of UTF-8 JSON: the fixed header (section 2)
+slots_len  u32       at most 1 MiB
+slots      slots_len bytes of UTF-8 JSON: an array of 1 to 64 key slots (section 3)
 frames     one or more of: u32 ct_len || ct
 ```
 
-A reader that sees `LOCKED` with a different version byte must say the file comes from a newer
-version. Files use the extension `.locked`, or `.locked.txt` when armored (section 8).
+Everything except the slots is fixed when the file is written: the commitment and every frame are
+bound to the fixed header, not to the slots. Changing who can open a file (a password, a keyfile, a
+recipient) rewrites only the slots section, so the data is not re-encrypted.
 
-## 2. Header
+A reader that sees `LOCKED` with a version byte other than 1 or 2 must say the file comes from a
+newer version. Files use the extension `.locked`, or `.locked.txt` when armored (section 8).
 
-The header is a JSON object. Readers check every field's type and size before using any of them and
-reject the file if any check fails.
+## 2. Fixed header
+
+The fixed header is a JSON object with exactly these fields. Readers check every field's type and size
+before using any of them and reject the file if any check fails or any other field is present.
 
 | Field   | Value |
 |---------|-------|
-| `v`     | `1` |
+| `v`     | `2` |
 | `suite` | cipher suite id (section 5) |
 | `chunk` | plaintext bytes per frame, an integer from 1024 to 67,108,864 (64 MiB) |
 | `np`    | base64 of the 7-byte nonce prefix |
 | `salt`  | base64 of the 32-byte file salt |
-| `kc`    | base64 of the 32-byte key commitment |
-| `slots` | 1 to 64 key slots (section 3) |
 | `meta`  | `{"n": base64 of a 12-byte nonce, "c": base64 of the encrypted metadata}` |
 
-The writer serialises the header with no whitespace (`separators=(",", ":")`); readers must use the
-exact bytes they read, never a re-serialisation, because their hash is authenticated (section 6).
+The writer serialises it with no whitespace (`separators=(",", ":")`); readers must use the exact
+bytes they read, never a re-serialisation, because their hash is authenticated (sections 4 and 6).
 
 ## 3. Key slots
 
@@ -88,7 +96,7 @@ is base64 of the ML-KEM-768 ciphertext (1088 bytes).
 ss_x       = X25519(ephemeral private, x25519_pk)
 ss_m, kct  = ML-KEM-768.Encaps(mlkem768_pk)
 transcript = SHA-256(epk || kct || rpk)
-KEK        = HKDF(ss_m || ss_x, 32, salt = transcript, "locksmith/v1/x25519-mlkem768")
+KEK        = HKDF(ss_m || ss_x, 32, salt = transcript, LABEL || "x25519-mlkem768")
 ```
 
 The KEK stays secret unless both X25519 and ML-KEM-768 are broken.
@@ -107,11 +115,14 @@ A reader tries the slots its keys can open. A slot "opens" only if the AES-GCM u
 the result matches the key commitment:
 
 ```
-kc == HKDF(DEK, 32, salt, LABEL || "commit")
+kc == HKDF(DEK, 32, salt, LABEL || "commit" || SHA-256(fixed header bytes))
 ```
 
 Otherwise it moves on to the next slot. A failed commitment is reported exactly like a wrong key.
-The commitment stops a file from opening to different contents under different keys.
+The commitment stops a file from opening to different contents under different keys, and because it
+covers the fixed header, any change to the suite, chunk size, nonce prefix, salt or metadata makes the
+file refuse to open at all, before a single frame is read. It does not cover the slots, so slots can be
+added, removed or replaced without touching it.
 
 From the DEK and the file salt:
 
@@ -143,11 +154,11 @@ Each layer is an AEAD with a 16-byte tag, its own key, and the frame's nonce and
 ```
 frame plaintext = kind (u8) || len (u32) || block (len bytes) || zero bytes
 nonce           = np (7) || index (u32) || final (u8: 1 for the last frame, else 0)
-aad             = SHA-256(header bytes exactly as stored)
+aad             = SHA-256(fixed header bytes exactly as stored)
 ```
 
 Frame `index` counts from 0 and must stay below 2^32. A frame's ciphertext is at most
-`chunk + 5 + 16 × layers` bytes. The final flag and the authenticated header mean frames can't be
+`chunk + 5 + 16 × layers` bytes. The final flag and the authenticated fixed header mean frames can't be
 reordered, dropped, truncated, appended or moved to another file.
 
 | kind | Meaning |
@@ -155,11 +166,14 @@ reordered, dropped, truncated, appended or moved to another file.
 | 0 | raw: `block` is content, at most `chunk` bytes |
 | 1 | compressed: `block` is one complete stream of the codec named in the metadata, decoding to at most `chunk` bytes |
 | 2 | padding: `len` is 0 |
+| 3 | signature: `block` is the next part of the file's signature (section 15), at most `chunk` bytes |
 
-Rules a reader enforces: everything after `block` is zero bytes; padding frames come only after the
-last content frame; a compressed frame needs a codec. Writers compress a block only when that makes it
-smaller, emit at least one frame (empty content is one raw frame with an empty block), and add padding
-(zero bytes in the last frame, then padding frames) to reach the chosen padded size.
+Frames come in this order: one or more content frames (kinds 0 and 1), then any padding frames, then
+any signature frames. Rules a reader enforces: everything after `block` is zero bytes; the order above;
+a compressed frame needs a codec. Writers compress a block only when that makes it smaller, emit at
+least one content frame (empty content is one raw frame with an empty block), and add padding (zero
+bytes in the last content frame, then padding frames) to reach the chosen padded size. Padding is
+computed over the content only, so a signature adds its own fixed size on top.
 
 Codecs: `zstd` (Zstandard frame), `zlib` (RFC 1950), `lzma` (`.xz` container, dictionary within
 128 MiB of decoder memory), `bz2`.
@@ -178,9 +192,17 @@ hold:
 | `mtime`   | the file's modification time (Unix seconds), omitted when metadata is stripped |
 | `created` | when the file was encrypted (Unix seconds) |
 | `items`   | number of items in a bundle |
-| `note`    | the sender's free text, which nothing verifies |
+| `note`    | the sender's free text. Only a valid signature (section 15) vouches for it |
+| `to`      | reserved: the signer's intended recipients (see below) |
 
-Readers ignore unknown fields and fields of the wrong type. For `dir` and `bundle`, the content is a
+Readers ignore unknown fields and fields of the wrong type.
+
+`to`, reserved for a later version of Locksmith, lists the recipients the signer addressed a signed
+file to: an array of base64 32-byte entries, each `SHA-256("locksmith/v2/recipient" || 0x00 || key)`
+where `key` is a recipient's raw encryption key exactly as in section 9 (the 32-byte X25519 key, or the
+1216-byte X25519 || ML-KEM-768 key, with no prefix or checksum). A reader tests every one of its own
+identities' encryption keys against it. It means something only in a signed file, because anyone who
+can open a file can rewrite its metadata; readers ignore it in unsigned files. For `dir` and `bundle`, the content is a
 POSIX (PAX) tar stream. A `dir` archive holds one top-level folder. Readers must extract only regular
 files, folders and links that stay inside the destination, and must refuse metadata headers over
 1 MiB and sparse members, which Locksmith never writes.
@@ -199,10 +221,24 @@ content.
 
 ## 9. Public keys
 
-`prefix || base64url(raw || SHA-256(raw)[0..4])` without padding, where the prefix is `locksmith1`
-for a 32-byte X25519 key and `locksmith2` for a 1216-byte hybrid key. Readers reject low-order X25519
-points and malformed ML-KEM keys. A fingerprint is the first 20 hex digits of SHA-256(raw), in groups
-of four.
+`prefix || base64url(raw || SHA-256(raw)[0..4])` without padding. The prefix says what `raw` holds:
+
+| Prefix       | `raw` | Bytes |
+|--------------|-------|-------|
+| `locksmith1` | X25519 public key | 32 |
+| `locksmith2` | X25519 key (32) \|\| ML-KEM-768 key (1184) | 1216 |
+| `locksmith3` | X25519 key (32) \|\| ML-KEM-768 key (1184) \|\| Ed25519 key (32) \|\| ML-DSA-65 key (1952) | 3200 |
+
+A `locksmith3` key also verifies signatures (sections 13 and 14). Encrypting to it uses its first 1216
+bytes exactly as a `locksmith2` key: in a hybrid slot, `rpk` is those 1216 bytes. Readers reject
+low-order X25519 points and malformed ML-KEM keys. The fingerprint is the first 20 hex digits of
+SHA-256(raw), in groups of four, so it covers every key in `raw`. Adding signing keys to an identity
+therefore gives it a new fingerprint, which contacts check once.
+
+A `locksmith3` key is too large for a QR code. Its QR code holds only its hash, as
+`LOCKSMITH3:FP:` followed by the 64 uppercase hex digits of SHA-256(raw). The key itself travels as
+text; whoever receives it compares its SHA-256 with the scanned hash (the first 20 digits are the
+fingerprint). `locksmith1` and `locksmith2` QR codes hold the whole key text.
 
 ## 10. Identity backups
 
@@ -217,6 +253,9 @@ written as proquints: each 16 bits, big-endian, becomes consonant-vowel-consonan
 hybrid one. The words are the private key, with no passphrase.
 
 **Identity shares**: Shamir shares (section 11) of `"LSI1" || raw private key`.
+
+Signing keys are derived from the raw private key (section 13), so backups, words and shares hold
+nothing extra and restore them too.
 
 ## 11. Shamir shares
 
@@ -241,3 +280,117 @@ One line per file, in the BSD tag format of `sha256sum --tag`: `ALG (path) = hex
 and never contain `.` or `..` components. A name holding a backslash, line feed or carriage return is
 escaped as `\\`, `\n` and `\r`, and its line starts with a backslash. MD5 is not accepted. Links are
 not listed.
+
+## 13. Signing keys
+
+Only hybrid identities sign. Their two signing keys are derived from the 96-byte raw private key
+(section 10):
+
+```
+ed25519 seed   = HKDF(raw, 32, salt = empty, "locksmith/v1/sig/ed25519")
+ml-dsa-65 seed = HKDF(raw, 32, salt = empty, "locksmith/v1/sig/ml-dsa-65")
+```
+
+The Ed25519 seed is an RFC 8032 private key. The ML-DSA-65 seed is the 32-byte FIPS 204 key
+generation seed ξ (`ML-DSA.KeyGen_internal`). The identity's `locksmith3` public key (section 9) is its
+`locksmith2` key followed by the two public keys. The labels carry the version: a different derivation
+would use new labels and a new key prefix.
+
+A classical identity (32-byte raw key) has no signing keys. Its raw key is only an X25519 key, which a
+quantum computer could recover from the public key, together with every key derived from it: an
+ML-DSA key made that way would be no stronger than X25519. Writers refuse to sign with one: it must be upgraded to a
+hybrid identity first.
+
+## 14. Detached signatures
+
+A signature is a separate file, by convention the signed file's name plus `.lsig`. It holds:
+
+```
+magic     8 bytes   "LOCKSIG" 0x01
+alg       u8        1 = Ed25519 + ML-DSA-65
+created   u64       when it was signed (Unix seconds), as the signer's clock said
+key_id    32 bytes  SHA-256 of the signer's locksmith3 raw key (section 9)
+clen      u16       comment length, at most 1024
+comment   clen bytes of UTF-8
+sig_ed    64 bytes  Ed25519 signature
+sig_ml    3309 bytes ML-DSA-65 signature
+```
+
+Its text form, which is what Locksmith writes and reads:
+
+```
+-----BEGIN LOCKSMITH SIGNATURE-----
+base64 of the signature, in lines of 64 characters
+-----END LOCKSMITH SIGNATURE-----
+```
+
+`head` is every byte before `sig_ed` (magic through comment). Both parts sign the same message:
+
+```
+M      = "locksmith/v1/sig/file" || 0x00 || head || SHA-512(signed file)
+sig_ed = Ed25519.Sign(ed25519 key, M)                                   (RFC 8032, pure)
+sig_ml = ML-DSA-65.Sign(ml-dsa-65 key, M, ctx = "locksmith/v1/sig")     (FIPS 204, hedged or deterministic)
+```
+
+Because `head` contains `key_id`, each part is bound to the whole `locksmith3` key, so neither can be
+moved to a key that shares only one of its halves.
+
+The comment is one line chosen by the signer (it may be empty): valid UTF-8 with no characters in
+the Unicode categories Cc, Cf, Zl or Zp.
+
+A reader:
+
+1. Accepts at most 16 KiB of text, ignores whitespace inside the body, and decodes the base64.
+2. Rejects the signature unless the magic matches, `alg` is 1, `clen` is at most 1024, the comment
+   follows the rule above, and the length is exactly `3424 + clen` bytes.
+3. Finds the `locksmith3` key whose SHA-256 equals `key_id`. Without it, the signature can't be
+   checked, and the reader says so (it may show `key_id`'s first 20 hex digits as the signer's
+   fingerprint). A key of any other kind never verifies a signature, whatever `alg` says.
+4. Accepts the signature only if both `sig_ed` and `sig_ml` verify over `M`.
+
+A valid signature shows that the file was signed with that key. `created` is only the signer's claim.
+`key_id` is in the clear, so a detached signature always says which key made it.
+
+## 15. Signed files
+
+A file may carry its signer's signature inside the encryption, so only those who can open it see who
+signed it. The signature is the structure of section 14 with `clen = 0`, exactly 3424 bytes, split in
+order across the signature frames (kind 3, section 6), each block at most `chunk` bytes. It signs:
+
+```
+M      = LABEL || "sig/locked" || 0x00 || head || SHA-256(fixed header bytes) || SHA-512(content)
+sig_ed = Ed25519.Sign(ed25519 key, M)
+sig_ml = ML-DSA-65.Sign(ml-dsa-65 key, M, ctx = LABEL || "sig")
+```
+
+`head` is the signature's first 51 bytes (magic through `clen`) and `content` is the plaintext the
+content frames decrypt to: the file, the text, or the tar stream of a folder. The signature therefore
+covers the cipher suite, chunk size, nonce prefix, salt and metadata (name, kind, note, `to`) as well as
+the content, but **not the key slots**: recipients, passwords and keyfiles can change without a new
+signature. The other side of that is that anyone who can open a signed file can let someone else open
+it too, and it still verifies; a signature says who signed the content, not whom it was sent to.
+
+A reader, after every frame has authenticated:
+
+1. Joins the signature blocks; anything but exactly 3424 bytes that parse as section 14 with `alg` 1
+   and `clen` 0 makes the file invalid.
+2. Looks for the `locksmith3` key whose SHA-256 equals `key_id` among the keys it trusts (its contacts
+   and its own identities). Without one, the file still opens and the reader says it was signed by an
+   unknown key, showing the fingerprint from `key_id`.
+3. With the key, requires both `sig_ed` and `sig_ml` to verify over `M`. If either fails, the file is
+   invalid: the reader reports it and writes or shows none of its content.
+
+An unsigned file has no signature frames.
+
+## 16. Reading version 1
+
+Version 1 files are still read, never written. They differ from version 2 as follows:
+
+- `magic` ends in 0x01, and the container is `magic || hdr_len (u32) || header || frames`. The header is
+  one JSON object holding the fields of section 2 with `v = 1`, plus `kc` (base64 of the 32-byte key
+  commitment) and `slots` (the array of section 3).
+- `LABEL` is `locksmith/v1/` in every derivation and AEAD label of sections 3–7, including the hybrid
+  slot's (`locksmith/v1/x25519-mlkem768`).
+- `kc == HKDF(DEK, 32, salt, LABEL || "commit")`: the commitment covers only the DEK.
+- Frames use `aad = SHA-256(header bytes exactly as stored)`, so they are bound to the slots too.
+- Frame kinds are 0–2 only: version 1 files are never signed.

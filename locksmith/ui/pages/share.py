@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QMimeData, Qt, QUrl
+from PySide6.QtCore import QMimeData, QUrl
 from PySide6.QtWidgets import QApplication, QFileDialog, QGridLayout, QPlainTextEdit, QVBoxLayout
 
 from ...core import engine, tools
@@ -29,7 +29,7 @@ from ..widgets import (
     toast,
 )
 from ..workers import run_task
-from .common import reveal
+from .common import reveal, saved_signers, show_key_qr, signature_text, signer_choices, unlock_signer
 
 PART_SIZES = {
     8 * 1000 * 1000: "8 MB (chat apps)",
@@ -179,6 +179,10 @@ class SharePage(Page):
         self.msg_rcpt_field.setVisible(False)
         card.add(self.msg_rcpt_field)
         self.msg_mode.changed.connect(self._msg_mode)
+        self.msg_sign = Dropdown()   # opt-in per message: signed messages can't be denied later
+        self.msg_sign_field = Field("Sign as", self.msg_sign, "Off by default: a signed message proves you "
+                                    "wrote it to anyone it's shown to.")
+        card.add(self.msg_sign_field)
         enc = Button("Encrypt & copy", "lock", "primary")
         enc.clicked.connect(self._encrypt_message)
         dec = Button("Open a message…", "unlock", "secondary")
@@ -217,6 +221,14 @@ class SharePage(Page):
                 toast("Add a contact on the Keys page first", "alert")
                 return
             opts.recipients = [self.msg_rcpt.value()]
+        signer = unlock_signer(self.store, self.msg_sign.value())
+        if signer is None:
+            return
+
+        def work(r, c):
+            ident, passphrase = signer
+            opts.signer = ident.private_raw(passphrase) if ident else None
+            return engine.encrypt_bytes(text.encode(), opts)
 
         def done(blob):
             armored = engine.armor(blob)
@@ -227,8 +239,7 @@ class SharePage(Page):
             QApplication.clipboard().setText(armored)
             toast("Encrypted message copied", "lock")
 
-        run_task(lambda r, c: engine.encrypt_bytes(text.encode(), opts), done,
-                 lambda m, k: dialogs.error(m), parent=self)
+        run_task(work, done, lambda m, k: dialogs.error(m), parent=self)
 
     def _open_message(self):
         text = dialogs.text_input("Open a message", "Paste the encrypted text you received.", ok="Open")
@@ -247,12 +258,13 @@ class SharePage(Page):
                                       "Password", secret=True, ok="Decrypt")
             if password is None:
                 return
-        keys = DecryptKeys(password=password, identities=identities)
+        names = saved_signers(self.store)
+        keys = DecryptKeys(password=password, identities=identities, verifiers=list(names))
 
         def done(res):
             if res.meta.get("kind") == "text":
-                dialogs.text_view("Decrypted message", res.data.decode("utf-8", errors="replace"), mono=False,
-                                  secret=True)
+                dialogs.text_view("Decrypted message", res.data.decode("utf-8", errors="replace"),
+                                  signature_text(res.signature, names), mono=False, secret=True)
             else:
                 dialogs.info("This is a file", "Use the Decrypt page to save files and folders.")
 
@@ -332,22 +344,29 @@ class SharePage(Page):
 
     def _build_pubkey_card(self):
         card = Card("Your public key",
-                    "Share this so people can encrypt files that only you can open. It is safe to publish.")
+                    "Share this so people can encrypt files that only you can open, and verify files you sign. "
+                    "It is safe to publish.")
         self.pub_ident = Dropdown()
         self.pub_ident.currentIndexChanged.connect(self._show_pub)
         card.add(self.pub_ident)
-        self.pub_text = label("", "mono")
-        self.pub_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._pub_key = ""
+        # A preview only: a locksmith3 key is over 4,000 characters. Copy and Show give all of it.
+        self.pub_text = label("", "mono", wrap=False)
         card.add(self.pub_text)
         self.pub_fp = label("", "caption")
         card.add(self.pub_fp)
+        self.pub_note = label("", "caption")
+        card.add(self.pub_note)
         self.pub_copy = Button("Copy", "copy")
-        self.pub_copy.clicked.connect(lambda: (QApplication.clipboard().setText(self.pub_text.text()),
+        self.pub_copy.clicked.connect(lambda: (QApplication.clipboard().setText(self._pub_key),
                                                toast("Public key copied", "copy")))
+        self.pub_show = Button("Show", "eye")
+        self.pub_show.clicked.connect(lambda: dialogs.text_view(
+            "Your public key", self._pub_key, "Send all of it. Whoever receives it checks the fingerprint with you."))
         self.pub_qr = Button("QR code", "qr")
-        self.pub_qr.clicked.connect(lambda: dialogs.qr_view("Your public key", self.pub_text.text()))
+        self.pub_qr.clicked.connect(self._pub_qr)
         self.pub_link = LinkButton("Create an identity on the Keys page")
-        card.add(hrow(self.pub_copy, self.pub_qr, None))
+        card.add(hrow(self.pub_copy, self.pub_show, self.pub_qr, None))
         card.add(self.pub_link)
         self.pubkey_card = card
         self.add(card)
@@ -355,13 +374,17 @@ class SharePage(Page):
     def reload(self):
         self.pub_ident.set_items({i: ident.name for i, ident in enumerate(self.store.identities)})
         has = bool(self.store.identities)
-        for w in (self.pub_ident, self.pub_text, self.pub_fp, self.pub_copy, self.pub_qr):
+        for w in (self.pub_ident, self.pub_text, self.pub_fp, self.pub_note, self.pub_copy, self.pub_show,
+                  self.pub_qr):
             w.setVisible(has)
         self.pub_link.setVisible(not has)
         self._show_pub()
         rc = {i.public_raw: f"{i.name} (you)" for i in self.store.identities}
         rc.update({c.public_raw: c.name for c in self.store.contacts})
         self.msg_rcpt.set_items(rc)
+        signers = signer_choices(self.store)
+        self.msg_sign.set_items(signers)
+        self.msg_sign_field.setVisible(len(signers) > 1)
         self._update_file()
 
     def _show_pub(self):
@@ -369,5 +392,18 @@ class SharePage(Page):
         if i is None or i >= len(self.store.identities):
             return
         ident = self.store.identities[i]
-        self.pub_text.setText(ident.public)
-        self.pub_fp.setText(f"Fingerprint  {fingerprint(ident.public_raw)}")
+        self._pub_key = ident.key_text
+        self.pub_text.setText(self._pub_key if len(self._pub_key) <= 80 else
+                              f"{self._pub_key[:48]}…{self._pub_key[-16:]}")
+        self.pub_fp.setText(f"Fingerprint  {fingerprint(ident.key_raw)}")
+        note = ("Unlock this identity once on the Keys page to add its signing keys." if ident.can_sign
+                and ident.verify_raw is None else "" if ident.can_sign else
+                "A classical key: it can't sign. Upgrade it on the Keys page for post-quantum protection and signing.")
+        self.pub_note.setText(note)
+        self.pub_note.setVisible(bool(note))
+
+    def _pub_qr(self):
+        i = self.pub_ident.value()
+        if i is not None and i < len(self.store.identities):
+            ident = self.store.identities[i]
+            show_key_qr("Your public key", ident.key_raw)

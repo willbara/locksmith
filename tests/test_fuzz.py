@@ -18,11 +18,11 @@ import random
 import struct
 import tarfile
 
+import fileformat
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from locksmith.core import engine, keys, metadata, minisign, tools
+from locksmith.core import engine, keys, metadata, minisign, signing, sshsig, tools
 from locksmith.core.engine import DecryptKeys, EncryptOptions
 from locksmith.core.errors import LocksmithError
 
@@ -90,19 +90,7 @@ def recipient_file(ident):
 def _forge(ident: bytes, frames: list[bytes], meta_raw: bytes, chunk=1024) -> bytes:
     """A correctly encrypted message whose frame plaintexts and metadata we choose."""
     opts = EncryptOptions(recipients=[keys.public_from_private(ident)], chunk_size=chunk, **FAST)
-    header, k = engine._build_header(opts, {"kind": "file"}, engine._Checker(None, None))
-    h = json.loads(header)
-    n = os.urandom(12)
-    c = AESGCM(k.meta_key).encrypt(n, meta_raw, k.fmt.label + b"meta")
-    h["meta"] = {"n": base64.b64encode(n).decode(), "c": base64.b64encode(c).decode()}
-    header = json.dumps(h, separators=(",", ":")).encode()
-    prefix, aad = base64.b64decode(h["np"]), hashlib.sha256(header).digest()
-    out = io.BytesIO(engine.MAGIC + struct.pack(">I", len(header)) + header)
-    out.seek(0, 2)
-    for i, fr in enumerate(frames):
-        ct = k.cipher.seal(engine._nonce(prefix, i, i == len(frames) - 1), fr, aad)
-        out.write(struct.pack(">I", len(ct)) + ct)
-    return out.getvalue()
+    return fileformat.forge(opts, {"kind": "file"}, frames, meta_raw)
 
 
 def _tar(members: dict[str, bytes]) -> bytes:
@@ -123,8 +111,8 @@ def test_fuzz_header_parser(recipient_file):
 
 def test_fuzz_header_json_structure(recipient_file):
     """Swap header values for values of other types and shapes, keeping valid JSON."""
-    (hlen,) = struct.unpack(">I", recipient_file[8:12])
-    header = json.loads(recipient_file[12:12 + hlen])
+    header, _ = fileformat.split(recipient_file)
+    header.pop("_fixed_raw")
     odd = [None, True, 0, -1, 2**63, 1.5, "", "x" * 100, "AAAA", [], {}, [1, 2], {"t": "pw"}]
 
     def sample(rng):
@@ -138,14 +126,40 @@ def test_fuzz_header_json_structure(recipient_file):
                 if isinstance(slot, dict) and slot:
                     target, key = slot, rng.choice(list(slot))
             target[key] = json.loads(json.dumps(rng.choice(odd)))  # a fresh copy each time
-        raw = json.dumps(h).encode()
-        return engine.MAGIC + struct.pack(">I", len(raw)) + raw
+        return fileformat.join(h, b"")
 
     fuzz("header-json", sample, engine.inspect_bytes)
 
 
 def test_fuzz_whole_file_decrypt(recipient_file, ident):
     fuzz("decrypt", recipient_file, lambda b: engine.decrypt_bytes(b, DecryptKeys(identities=[ident])))
+
+
+def test_fuzz_signed_file(ident):
+    signer = os.urandom(96)
+    blob = engine.encrypt_bytes(b"signed fuzz " * 300, EncryptOptions(
+        recipients=[keys.public_from_private(ident)], chunk_size=1024, signer=signer, **FAST))
+    dk = DecryptKeys(identities=[ident], verifiers=[signing.public_key(signer)])
+    assert engine.decrypt_bytes(blob, dk).signature.verified
+    fuzz("signed-file", blob, lambda b: engine.decrypt_bytes(b, dk))
+
+
+def test_fuzz_signature_frames(ident):
+    """A sender holding the file key controls the signature frames' contents completely."""
+    signer = os.urandom(96)
+    public = signing.public_key(signer)
+    seed = signing.sign_locked(signer, b"{}", bytes(64))
+    meta = b'{"name":"a.txt","kind":"file","comp":"none"}'
+
+    def sample(rng):
+        sig = mutate(rng, seed)
+        size = rng.choice([1024, 4096])
+        parts = [sig[i:i + size] for i in range(0, len(sig), size)] or [b""]
+        return _forge(ident, [engine.FRAME_HDR.pack(0, 2) + b"hi",
+                              *(engine.FRAME_HDR.pack(engine.KIND_SIG, len(p)) + p for p in parts)], meta, size)
+
+    fuzz("signature-frames", sample,
+         lambda b: engine.decrypt_bytes(b, DecryptKeys(identities=[ident], verifiers=[public])))
 
 
 def test_fuzz_authenticated_plaintext(ident):
@@ -182,9 +196,10 @@ def test_fuzz_armor(recipient_file):
 # ── keys, shares and backups ─────────────────────────────────────────────────
 
 def test_fuzz_public_keys():
-    for raw in (os.urandom(32), keys.public_from_private(os.urandom(96))):
-        fuzz("public-key", keys.encode_public(keys.public_from_private(raw) if len(raw) == 96 else raw),
-             keys.decode_public, mutate_text)
+    private = os.urandom(96)
+    for raw in (os.urandom(32), keys.public_from_private(private),
+                keys.public_from_private(private) + keys.verify_key(private)):
+        fuzz(f"public-key-{len(raw)}", keys.encode_public(raw), keys.decode_public, mutate_text)
 
 
 def test_fuzz_shares_and_words():
@@ -215,7 +230,10 @@ def test_fuzz_identity_backup(tmp_path):
 def test_fuzz_key_store(tmp_path):
     src = keys.KeyStore(tmp_path / "seed")
     src.generate("me", post_quantum=False)
+    src.generate("signer")   # hybrid, with its cached verify keys
     src.add_contact("friend", keys.encode_public(keys.public_from_private(os.urandom(32))))
+    private = os.urandom(96)
+    src.add_contact("signing friend", keys.encode_public(keys.public_from_private(private) + keys.verify_key(private)))
     seed = (tmp_path / "seed" / "keys.json").read_text(encoding="utf-8")
     counter = iter(range(10**9))
 
@@ -244,6 +262,36 @@ def test_fuzz_minisign(tmp_path):
     assert minisign.verify_file(f, sig_text, pub).trusted_comment == comment
     fuzz("minisign-sig", sig_text, lambda t: minisign.verify_file(f, t, pub), mutate_text)
     fuzz("minisign-key", pub, lambda t: minisign.verify_file(f, sig_text, t), mutate_text)
+
+
+def test_fuzz_signing(tmp_path):
+    private = os.urandom(96)
+    public = keys.public_from_private(private) + keys.verify_key(private)
+    f = tmp_path / "f"
+    f.write_bytes(b"signed data")
+    text = signing.sign_file(f, private, "a comment ✓")
+    assert signing.verify_file(f, text, [public]).comment == "a comment ✓"
+    blob = base64.b64decode("".join(text.split()[3:-3]))
+    fuzz("signing-blob", blob, lambda b: signing.verify_file(f, signing.armor(b), [public]))
+    fuzz("signing-text", text, lambda t: signing.verify_file(f, t, [public]), mutate_text)
+
+
+def test_fuzz_sshsig():
+    folder = os.path.join(os.path.dirname(__file__), "interop", "sshsig")
+    f = os.path.join(folder, "message.bin")
+    for name in ("ed25519", "rsa3072", "ecdsa256"):
+        sig_text = sshsig.read_small(os.path.join(folder, f"{name}.sig"))
+        pub = sshsig.read_small(os.path.join(folder, f"{name}.pub"))
+        assert sshsig.verify_file(f, sig_text, pub).namespace == "file"
+        blob = base64.b64decode("".join(sig_text.split()[3:-3]))
+
+        def armored(b: bytes, pub=pub):
+            return sshsig.verify_file(f, f"{sshsig.ARMOR_BEGIN}\n{base64.b64encode(b).decode()}\n"
+                                         f"{sshsig.ARMOR_END}", pub)
+
+        fuzz(f"sshsig-blob-{name}", blob, armored)
+        fuzz(f"sshsig-text-{name}", sig_text, lambda t, pub=pub: sshsig.verify_file(f, t, pub), mutate_text)
+        fuzz(f"sshsig-key-{name}", pub, lambda t, s=sig_text: sshsig.verify_file(f, s, t), mutate_text)
 
 
 def test_fuzz_manifest(tmp_path):

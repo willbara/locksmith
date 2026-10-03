@@ -65,6 +65,9 @@ def fsync_tree(root: Path) -> bool:
     return ok
 
 
+INTERNET_ZONE_MARK = b"[ZoneTransfer]\r\nZoneId=3\r\n"
+
+
 def copy_zone_identifier(source: Path, target: Path):
     """Windows: give decrypted output the source file's Mark of the Web (the
     Zone.Identifier stream that downloads carry). Without it, a program or macro
@@ -78,6 +81,17 @@ def copy_zone_identifier(source: Path, target: Path):
             mark = f.read(4096)
     except OSError:
         return  # the source has no mark: nothing to carry over
+    _write_zone_mark(target, mark)
+
+
+def mark_untrusted(target: Path):
+    """Windows: mark output that came from someone else, with no file to inherit a mark
+    from (a pasted message), as downloaded from the internet. Same rules as above."""
+    if IS_WINDOWS:
+        _write_zone_mark(target, INTERNET_ZONE_MARK)
+
+
+def _write_zone_mark(target: Path, mark: bytes):
     files = [Path(root) / name for root, _, names in os.walk(target) for name in names] \
         if Path(target).is_dir() else [Path(target)]
     for path in files:

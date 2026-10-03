@@ -19,9 +19,9 @@ import tarfile
 import time
 from pathlib import Path
 
+import fileformat
 import pytest
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from locksmith.core import compress, engine, kdf, keys, osutil, tools
 from locksmith.core.engine import DecryptKeys, EncryptOptions
@@ -38,14 +38,7 @@ def _encrypt(tmp_path, data=b"secret data " * 1000, **kw) -> Path:
     return engine.encrypt_paths([src], tmp_path / "enc", opts)
 
 
-def _split(blob: bytes) -> tuple[dict, bytes]:
-    (hlen,) = struct.unpack(">I", blob[8:12])
-    return json.loads(blob[12:12 + hlen]), blob[12 + hlen:]
-
-
-def _join(header: dict, body: bytes) -> bytes:
-    raw = json.dumps(header).encode()
-    return engine.MAGIC + struct.pack(">I", len(raw)) + raw + body
+_split, _join = fileformat.split, fileformat.join
 
 
 def _assert_rejected(tmp_path, blob: bytes, keys=PW):
@@ -60,7 +53,9 @@ def _assert_rejected(tmp_path, blob: bytes, keys=PW):
 # ── crafted & fuzzed files ───────────────────────────────────────────────────
 
 MUTATIONS = [
-    lambda h: h.update(v=2),
+    lambda h: h.update(v=1),   # contradicts the version in the signature
+    lambda h: h.update(v=3),
+    lambda h: h.update(extra=1),   # a version 2 fixed header has exactly its fields
     lambda h: h.update(chunk=True),
     lambda h: h.update(chunk=-1),
     lambda h: h.update(chunk=10**12),
@@ -162,22 +157,8 @@ def _forge(tmp_path, frames: list[bytes], meta: dict, chunk=4096, meta_raw: byte
     """Build a correctly encrypted file whose frames and metadata we choose.
     ``meta_raw`` replaces the encrypted metadata with arbitrary bytes."""
     opts = EncryptOptions(password="pw", chunk_size=chunk, **FAST)
-    header, k = engine._build_header(opts, meta, engine._Checker(None, None))
-    h = json.loads(header)
-    if meta_raw is not None:
-        n = os.urandom(12)
-        c = AESGCM(k.meta_key).encrypt(n, meta_raw, k.fmt.label + b"meta")
-        h["meta"] = {"n": base64.b64encode(n).decode(), "c": base64.b64encode(c).decode()}
-        header = json.dumps(h, separators=(",", ":")).encode()
-    prefix = base64.b64decode(h["np"])
-    aad = hashlib.sha256(header).digest()
-    out = io.BytesIO()
-    out.write(engine.MAGIC + struct.pack(">I", len(header)) + header)
-    for i, fr in enumerate(frames):
-        ct = k.cipher.seal(engine._nonce(prefix, i, i == len(frames) - 1), fr, aad)
-        out.write(struct.pack(">I", len(ct)) + ct)
     path = tmp_path / "forged.locked"
-    path.write_bytes(out.getvalue())
+    path.write_bytes(fileformat.forge(opts, meta, frames, meta_raw))
     return path
 
 
@@ -236,7 +217,7 @@ def test_every_padding_mode_decrypts_with_many_pad_frames(tmp_path, pad):
 def test_deeply_nested_header_is_reported_as_damage():
     raw = b"[" * 200_000
     with pytest.raises(CorruptedError):
-        engine.inspect_bytes(engine.MAGIC + struct.pack(">I", len(raw)) + raw)
+        engine.inspect_bytes(engine.MAGIC + bytes(32) + struct.pack(">I", len(raw)) + raw)
 
 
 def test_deeply_nested_metadata_is_reported_as_damage(tmp_path):
@@ -1246,6 +1227,94 @@ def test_mark_of_the_web_carries_over(tmp_path):
         assert f.read() == mark
 
 
+def _pasted(tmp_path, armor_from: Path) -> bytes:
+    out = engine.encrypt_paths([armor_from], tmp_path / "enc", EncryptOptions(password="pw", armor=True, **FAST))
+    return engine.dearmor(out.read_text(encoding="utf-8"))
+
+
+def test_pasted_files_and_folders_are_written_like_decrypted_files(tmp_path, monkeypatch):
+    """N7: a pasted message goes through the same core path as a file: a missing output
+    folder is created (not swapped for the home folder), a folder is unwrapped one level as
+    decrypt_path does, and everything written gets the internet zone mark."""
+    marked = []
+    monkeypatch.setattr(engine, "mark_untrusted", lambda target: marked.append(Path(target)))
+    src = tmp_path / "proj"
+    (src / "sub").mkdir(parents=True)
+    (src / "sub" / "run.exe").write_bytes(b"MZ")
+    (src / "a.txt").write_text("a", encoding="utf-8")
+    out = tmp_path / "not" / "there yet"
+    res = engine.decrypt_pasted(_pasted(tmp_path, src), out, PW)
+    assert res.path == out / "proj" and (out / "proj" / "sub" / "run.exe").read_bytes() == b"MZ"
+    assert res.complete and marked == [res.path]
+    from_file = engine.decrypt_path(next((tmp_path / "enc").iterdir()), tmp_path / "from-file", PW)
+    assert sorted(p.relative_to(from_file.path) for p in from_file.path.rglob("*")) == \
+        sorted(p.relative_to(res.path) for p in res.path.rglob("*"))
+
+    single = tmp_path / "run.exe"
+    single.write_bytes(b"MZ program")
+    res = engine.decrypt_pasted(_pasted(tmp_path, single), out, PW)
+    assert res.path == out / "run.exe" and res.path.read_bytes() == b"MZ program" and marked[-1] == res.path
+
+
+def test_pasted_text_stays_in_memory(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "mark_untrusted", lambda target: pytest.fail("nothing was written"))
+    blob = engine.encrypt_bytes(b"hello", EncryptOptions(password="pw", **FAST), kind="text")
+    res = engine.decrypt_pasted(blob, tmp_path / "out", PW)
+    assert res.path is None and res.data == b"hello" and not (tmp_path / "out").exists()
+
+
+def test_pasted_content_keeps_the_in_memory_cap(tmp_path, monkeypatch):
+    big = tmp_path / "big.bin"
+    big.write_bytes(os.urandom(5000))
+    blob = _pasted(tmp_path, big)
+    monkeypatch.setattr(engine, "MAX_ARMOR_INPUT", 4096)
+    with pytest.raises(LocksmithError):
+        engine.decrypt_pasted(blob, tmp_path / "out", PW)
+    assert not list((tmp_path / "out").iterdir())   # no .part left behind
+
+
+def test_mark_untrusted_writes_the_internet_zone_to_every_file(tmp_path, monkeypatch):
+    if sys.platform != "win32":
+        monkeypatch.setattr(osutil, "IS_WINDOWS", True)   # "name:Zone.Identifier" is an ordinary file here
+    folder = tmp_path / "proj"
+    (folder / "sub").mkdir(parents=True)
+    files = [folder / "a.txt", folder / "sub" / "run.exe"]
+    for f in files:
+        f.write_bytes(b"x")
+    try:
+        osutil.mark_untrusted(folder)
+        marks = [Path(f"{f}:Zone.Identifier").read_bytes() for f in files]
+    except OSError:
+        pytest.skip("this file system has no alternate data streams")
+    assert marks == [b"[ZoneTransfer]\r\nZoneId=3\r\n"] * 2
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Mark of the Web is a Windows feature")
+def test_pasted_messages_get_the_mark_of_the_web(tmp_path):
+    """N7 on Windows: every file decrypted from pasted text has ZoneId=3."""
+    probe = tmp_path / "probe"
+    probe.write_bytes(b"")
+    try:
+        with open(f"{probe}:Zone.Identifier", "wb"):
+            pass
+    except OSError:
+        pytest.skip("this file system has no alternate data streams")
+    src = tmp_path / "proj"
+    (src / "sub").mkdir(parents=True)
+    (src / "sub" / "run.exe").write_bytes(b"MZ")
+    single = tmp_path / "macro.docm"
+    single.write_bytes(b"PK")
+    for item in (src, single):
+        res = engine.decrypt_pasted(_pasted(tmp_path, item), tmp_path / "dec", PW)
+        # Wine keeps a stream as a file named "name:Zone.Identifier"; real Windows never lists it.
+        written = ([p for p in res.path.rglob("*") if p.is_file() and ":" not in p.name] if res.path.is_dir()
+                   else [res.path])
+        assert written
+        for f in written:
+            with open(f"{f}:Zone.Identifier", "rb") as m:
+                assert b"ZoneId=3" in m.read()
+
+
 # ── damaged config, decrypted permissions, crash leftovers ───────────────────
 
 def test_deeply_nested_key_file_is_backed_up(tmp_path):
@@ -1403,10 +1472,9 @@ def test_commitment_mismatch_moves_on_to_the_next_slot():
     b = engine.encrypt_bytes(b"b", EncryptOptions(password="same", **FAST))
     ha, body = _split(a)
     ha["slots"] = _split(b)[0]["slots"] + ha["slots"]
-    # b's slot opens first but fails the commitment; a's own slot then opens. The header was
-    # changed, so the frames (which authenticate it) are what finally fail.
-    with pytest.raises(CorruptedError, match="Authentication failed at chunk 1"):
-        engine.decrypt_bytes(_join(ha, body), DecryptKeys(password="same"))
+    # b's slot opens first but fails the commitment; a's own slot then opens. In version 2 the
+    # frames don't authenticate the slots (so they can be edited), and the file opens.
+    assert engine.decrypt_bytes(_join(ha, body), DecryptKeys(password="same")).data == b"a"
 
 
 @pytest.mark.parametrize("hybrid", [False, True])

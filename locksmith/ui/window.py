@@ -55,7 +55,7 @@ class MainWindow(QMainWindow):
         self.decrypt = DecryptPage(self.store)
         self.share = SharePage(self.store)
         self.keys = KeysPage(self.store)
-        self.tools = ToolsPage()
+        self.tools = ToolsPage(self.store)
         self.settings_page = SettingsPage(self._defaults_changed)
         for page in (self.encrypt, self.decrypt, self.share, self.keys, self.tools, self.settings_page):
             self.stack.addWidget(page)
@@ -86,6 +86,8 @@ class MainWindow(QMainWindow):
         self.encrypt.recipients.reload()
         self.decrypt.reload_identities()
         self.share.reload()
+        self.tools.reload()
+        self.encrypt.reload_signers()
 
     def _share_file(self, path):
         self.share.set_file(path)

@@ -1,7 +1,7 @@
 """`locksmith --self-test`: prove a build works on this machine.
 
 Round-trips every cipher suite, codec and key-derivation function, checks
-public-key encryption and memory hardening, then builds the full window
+public-key encryption, signatures and memory hardening, then builds the full window
 offscreen. Uses a throwaway config directory, so real keys and settings are
 never touched. Exit code 0 means everything passed.
 """
@@ -97,6 +97,37 @@ def run() -> int:
         assert res.path.read_bytes() == data
 
     check("public-key encryption", pubkey)
+
+    def signatures():
+        from cryptography.exceptions import UnsupportedAlgorithm
+        from cryptography.hazmat.backends.openssl.backend import backend
+        from cryptography.hazmat.primitives.asymmetric.mldsa import MLDSA65PrivateKey
+
+        from .core import signing
+        from .core.errors import LocksmithError
+
+        # ML-DSA needs cryptography built with OpenSSL 3.5+, AWS-LC or BoringSSL; a distro
+        # package linked to an older system OpenSSL lacks it.
+        try:
+            MLDSA65PrivateKey.generate()
+        except UnsupportedAlgorithm:
+            raise RuntimeError(f"ML-DSA is not available with {backend.openssl_version_text()}") from None
+        ident = KeyStore(tmp / "signing").generate("self-test")
+        text = signing.sign_file(src, ident.private_raw(), "self-test")
+        assert signing.verify_file(src, text, [ident.key_raw]).comment == "self-test"
+        blob = engine.encrypt_bytes(data, EncryptOptions(password="pw", kdf="pbkdf2-sha512", preset="fast",
+                                                         signer=ident.private_raw()))
+        res = engine.decrypt_bytes(blob, DecryptKeys(password="pw", verifiers=[ident.key_raw]))
+        assert res.data == data and res.signature.verified, "a signed file did not verify"
+        changed = tmp / "changed.bin"
+        changed.write_bytes(data + b"!")
+        try:
+            signing.verify_file(changed, text, [ident.key_raw])
+        except LocksmithError:
+            return
+        raise RuntimeError("a signature verified for a different file")
+
+    check("signatures (Ed25519, ML-DSA-65)", signatures)
 
     def window():
         from PySide6.QtWidgets import QApplication

@@ -51,14 +51,27 @@ def saved_signers(store) -> dict[bytes, str]:
     return {k: v for k, v in names.items() if keys.can_verify(k)}
 
 
-def signature_text(sig, names: dict[bytes, str]) -> str:
+def signature_text(sig, names: dict[bytes, str], intent: str | None = None) -> str:
     """How a decrypted file's signature is described. Never "from X": a signature shows
-    which key signed the content, not who sent the file."""
+    which key signed the content, not who sent the file. ``intent`` is what the signed
+    recipient list says about this reader (DecryptResult.intent); it is always neutral, and
+    without a list nothing is said about whom the file was meant for."""
     if sig is None:
         return "Not signed"
     if sig.verified:
-        return f"✓  Signed with the key you saved as {names.get(sig.key, 'a saved key')}"
+        text = f"✓  Signed with the key you saved as {names.get(sig.key, 'a saved key')}"
+        if intent == "not_listed":
+            text += ", but you weren't on its original recipient list"
+        elif intent == "password":
+            text += ". Addressed to specific people; opened with its password"
+        return text
     return f"Signed by a key you haven't saved (fingerprint {sig.fingerprint}), so it can't be checked"
+
+
+def own_encryption_keys(store) -> list[bytes]:
+    """The encryption keys of all the user's identities, locked ones too: checked against a
+    signed file's recipient list."""
+    return [i.public_raw for i in store.identities]
 
 
 def reveal(path: str | Path):
@@ -110,9 +123,10 @@ class RecipientPicker(QWidget):
     changed = Signal()
     manage = Signal()
 
-    def __init__(self, store):
+    def __init__(self, store, manage_link: bool = True):
         super().__init__()
         self.store = store
+        self.manage_link = manage_link
         self.lay = QVBoxLayout(self)
         self.lay.setContentsMargins(0, 0, 0, 0)
         self.lay.setSpacing(2)
@@ -127,21 +141,23 @@ class RecipientPicker(QWidget):
                 item.widget().deleteLater()
         self.rows = []
         # Files are encrypted to public_raw; the fingerprint shown is the full key's.
-        entries = [(f"{i.name}  (you)", i.public_raw, i.key_raw) for i in self.store.identities] + \
-                  [(c.name, c.public_raw, c.key_raw) for c in self.store.contacts]
+        entries = [(f"{i.name}  (you)", i.public_raw, fingerprint(i.key_raw),
+                    "post-quantum" if i.is_post_quantum else "classical") for i in self.store.identities] + \
+                  [(c.name, c.public_raw, c.fingerprint, c.kind if c.ssh else
+                    "post-quantum" if len(c.public_raw) > 32 else "classical") for c in self.store.contacts]
         if not entries:
             self.lay.addWidget(label("No keys yet. Create your own identity or add a contact’s "
                                      "public key on the Keys page.", "caption"))
-        for name, raw, full in entries:
-            kind = "post-quantum" if len(raw) > 32 else "classical"
-            row = ToggleRow(name, f"{fingerprint(full)}  ·  {kind}", raw in chosen)
+        for name, raw, fp, kind in entries:
+            row = ToggleRow(name, f"{fp}  ·  {kind}", raw in chosen)
             row.toggled.connect(self.changed)
             self.rows.append((row, raw))
             self.lay.addWidget(row)
-        link = LinkButton("Manage keys and contacts")
-        link.clicked.connect(self.manage)
-        self.lay.addSpacing(6)
-        self.lay.addWidget(link)
+        if self.manage_link:
+            link = LinkButton("Manage keys and contacts")
+            link.clicked.connect(self.manage)
+            self.lay.addSpacing(6)
+            self.lay.addWidget(link)
         self.changed.emit()
 
     def selected(self) -> list[bytes]:

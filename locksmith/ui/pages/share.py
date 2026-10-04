@@ -29,7 +29,15 @@ from ..widgets import (
     toast,
 )
 from ..workers import run_task
-from .common import reveal, saved_signers, show_key_qr, signature_text, signer_choices, unlock_signer
+from .common import (
+    own_encryption_keys,
+    reveal,
+    saved_signers,
+    show_key_qr,
+    signature_text,
+    signer_choices,
+    unlock_signer,
+)
 
 PART_SIZES = {
     8 * 1000 * 1000: "8 MB (chat apps)",
@@ -259,12 +267,13 @@ class SharePage(Page):
             if password is None:
                 return
         names = saved_signers(self.store)
-        keys = DecryptKeys(password=password, identities=identities, verifiers=list(names))
+        keys = DecryptKeys(password=password, identities=identities, verifiers=list(names),
+                           own_keys=own_encryption_keys(self.store))
 
         def done(res):
             if res.meta.get("kind") == "text":
                 dialogs.text_view("Decrypted message", res.data.decode("utf-8", errors="replace"),
-                                  signature_text(res.signature, names), mono=False, secret=True)
+                                  signature_text(res.signature, names, res.intent), mono=False, secret=True)
             else:
                 dialogs.info("This is a file", "Use the Decrypt page to save files and folders.")
 

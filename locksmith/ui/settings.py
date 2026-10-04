@@ -28,6 +28,7 @@ DEFAULTS = {
     "confirm_shred": True,
     "auto_lock": 10,        # minutes of inactivity; 0 = never
     "strip_metadata": False,
+    "recovery_data": False,
 }
 
 

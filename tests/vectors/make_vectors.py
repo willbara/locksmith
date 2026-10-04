@@ -5,7 +5,7 @@
 Only do this deliberately: the committed files are the evidence that every later
 version still reads files made by this one. Encryption is randomised, so each run
 produces different files; vectors.json records the inputs and expected results,
-including each file's data key (DEK), which the independent reader recovers.
+including each file's data key (DEK), which the second reader recovers.
 """
 
 from __future__ import annotations

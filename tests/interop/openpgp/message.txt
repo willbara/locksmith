@@ -1,0 +1,3 @@
+Text mode:
+line two
+line three without a newline

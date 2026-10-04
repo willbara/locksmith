@@ -6,8 +6,13 @@
 # libraries are bundled, and the build fails if anything inside would need a glibc
 # newer than GLIBC_TARGET. Every downloaded tool is pinned and checksum-verified.
 #
+# Reproducible: the same source and pinned inputs make a byte-identical AppImage
+# (packaging/check_reproducible.sh builds twice and compares). File times come from
+# SOURCE_DATE_EPOCH (by default the last commit's time) and Python's hash seed is fixed.
+#
 # Host requirements: curl, tar, xz, sha256sum, ar and objdump (binutils).
-# Environment: SKIP_TESTS=1 skips the test suite and the final self-test.
+# Environment: SKIP_TESTS=1 skips the test suite and the final self-test;
+#              SOURCE_DATE_EPOCH overrides the timestamp stored in the build.
 set -euo pipefail
 
 PYTHON_VERSION="3.14.7"
@@ -63,6 +68,8 @@ fetch() {
 
 cd "$ROOT"
 mkdir -p "$TOOLS"
+SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "$ROOT" log -1 --format=%ct 2>/dev/null || echo 1767225600)}"
+export SOURCE_DATE_EPOCH PYTHONHASHSEED=0 TZ=UTC LC_ALL=C.UTF-8
 export UV_PYTHON_INSTALL_DIR="$BUILD/python" UV_CACHE_DIR="$BUILD/uv-cache" UV_PYTHON_PREFERENCE=only-managed
 
 fetch "https://github.com/astral-sh/uv/releases/download/$UV_VERSION/uv-$ARCH-unknown-linux-musl.tar.gz" \
@@ -96,6 +103,7 @@ LOCKSMITH_XCB_CURSOR="$(find "$XCB_DIR" -name 'libxcb-cursor.so.0.*' -type f | h
 export LOCKSMITH_XCB_CURSOR
 
 echo "==> Freezing with PyInstaller"
+rm -rf "$BUILD/pyinstaller" "$BUILD/work"   # nothing left over from an earlier build
 "$PY" -m PyInstaller --noconfirm --clean --log-level WARN \
     --distpath "$BUILD/pyinstaller" --workpath "$BUILD/work" packaging/locksmith.spec
 
@@ -161,6 +169,9 @@ exec "$HERE/usr/lib/locksmith/locksmith" "$@"
 EOF
 sed -i "s/@GLIBC_TARGET@/$GLIBC_TARGET/" "$APPDIR/AppRun"
 chmod +x "$APPDIR/AppRun"
+
+# Every file in the AppDir gets the same time, so the squashfs image doesn't record when it was built.
+find "$APPDIR" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
 
 fetch "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-$ARCH.AppImage" \
       "appimagetool-$APPIMAGETOOL_VERSION-$ARCH.AppImage" "$APPIMAGETOOL_SHA"

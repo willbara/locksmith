@@ -19,6 +19,9 @@ TOOLS="$BUILD/tools"
 WINPY_DIR="$BUILD/win/python"
 export WINEPREFIX="$BUILD/wine" WINEDEBUG=-all WINEARCH=win64
 cd "$ROOT"
+# Same inputs, same .exe: fixed file times and hash seed (as in build_appimage.sh).
+SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "$ROOT" log -1 --format=%ct 2>/dev/null || echo 1767225600)}"
+export SOURCE_DATE_EPOCH PYTHONHASHSEED=0
 
 for tool in wine curl python3 sha256sum; do
     command -v "$tool" >/dev/null || { echo "Missing required tool: $tool" >&2; exit 1; }

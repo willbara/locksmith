@@ -11,11 +11,16 @@ PySide6 desktop app for file encryption, packaged as an AppImage. It is built lo
 - `tests/vectors` are committed files checked by the engine and by `tests/spec_reader.py` (written from
   `docs/FORMAT.md`). Never regenerate them to make a test pass: a failure means old files no longer open. A format
   change adds new vectors and updates `docs/FORMAT.md`. Version 2 vectors come from
-  `tests/vectors/make_v2_vectors.py` and signature vectors from `make_signature_vectors.py`; each leaves the
-  others alone. Never rerun `make_vectors.py` (the version 1 files).
-- `tests/interop` holds signatures made by the real `ssh-keygen` and `minisign` (each folder's `make_vectors.sh`
-  records how). Same rule: never regenerate them to make a test pass.
-- Build: `./packaging/build_appimage.sh` → `dist/Locksmith-<arch>.AppImage` (pinned uv + Python 3.14, hash-locked deps)
+  `tests/vectors/make_v2_vectors.py`, signature vectors from `make_signature_vectors.py`, and the recipient
+  list, SSH recipient and recovery data vectors from `make_addressed_vectors.py`, `make_ssh_vectors.py` and
+  `make_recovery_vectors.py`; each leaves the others alone. Never rerun `make_vectors.py` (the version 1 files).
+- `tests/interop` holds files made by real tools: signatures from `ssh-keygen`, `minisign` and GnuPG
+  (`openpgp/`), SSH test key pairs (`sshkeys/`, private halves committed on purpose) and the age authors'
+  CCTV test kit (`age-cctv/`, fetched by its `fetch.sh`). Each folder's script records how. Same rule: never
+  regenerate them to make a test pass.
+- Build: `./packaging/build_appimage.sh` → `dist/Locksmith-<arch>.AppImage` (pinned uv + Python 3.14, hash-locked deps).
+  Builds are reproducible (`SOURCE_DATE_EPOCH`, fixed hash seed); `./packaging/check_reproducible.sh` builds twice
+  and compares
 - Check a build: `dist/Locksmith-x86_64.AppImage --self-test`; other distros: `./packaging/test_distros.sh` (podman)
 - Windows build (from Linux, via Wine): `./packaging/build_windows.sh` → `dist/Locksmith-windows-x64.exe`.
   Run the suite with Windows Python: `WINEPREFIX=$PWD/build/wine wine build/win/python/tools/python.exe -X utf8 -m pytest`
@@ -59,6 +64,11 @@ PySide6 desktop app for file encryption, packaged as an AppImage. It is built lo
   only thing the engine takes; `key_raw` is the full key, for fingerprints and verifying. Identities keep a
   `locksmith2` `public` (older versions read it) and cache the verify keys in `verify`.
 - `core/metadata.py` strips images with allowlists. Keep it that way: unknown data is dropped, not kept.
+- Other formats, all in core: `age.py` (age files; keys map onto Locksmith's, FORMAT.md §18), `sshkeys.py`
+  (SSH keys as recipients: Ed25519 via an `x25519` slot, RSA via the `ssh-rsa` slot, which 3.0 can't read),
+  `openpgp.py` (v4 detached signature verification against one key), `parity.py` (`.lpar` recovery data,
+  §17), `qrdecode.py` (pure-Python QR reader for paper backups; the UI only loads and scales images) and
+  `desktop.py` (file manager integration). `engine.change_access` rewrites only a v2 file's key slots.
 
 ## Format and versioning
 

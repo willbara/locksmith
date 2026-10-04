@@ -12,6 +12,20 @@ def _attach_windows_console():
         sys.stdout = sys.stderr = open("CONOUT$", "w", encoding="utf-8")  # noqa: SIM115
 
 
+def command_line(args: list[str]) -> tuple[list[str], bool]:
+    """The paths to open, and whether --encrypt asked for them all to go to Encrypt (as the file
+    manager's "Encrypt with Locksmith" does). Everything after "--" is a path."""
+    paths, encrypt, options = [], False, True
+    for a in args:
+        if options and a == "--":
+            options = False
+        elif options and a.startswith("-"):
+            encrypt = encrypt or a == "--encrypt"
+        else:
+            paths.append(a)
+    return paths, encrypt
+
+
 def main() -> int:
     if "--self-test" in sys.argv[1:]:
         if sys.platform == "win32" and getattr(sys, "frozen", False):
@@ -74,8 +88,8 @@ def main() -> int:
         lambda state: state == Qt.ApplicationState.ApplicationActive and theme.mode == "system"
         and theme.refresh_system())
 
-    paths = [a for a in sys.argv[1:] if not a.startswith("-")]
-    win = MainWindow(paths)
+    paths, encrypt = command_line(sys.argv[1:])
+    win = MainWindow(paths, encrypt)
     win.show()
     return app.exec()
 

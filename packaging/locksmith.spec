@@ -32,7 +32,7 @@ QT_LIBS_DROP = {"libQt6EglFSDeviceIntegration.so.6", "libQt6EglFsKmsSupport.so.6
 QT_PLUGINS_KEEP = {
     "platforms": {"libqwayland.so", "libqwayland-generic.so", "libqwayland-egl.so", "libqxcb.so",
                   "libqoffscreen.so"},
-    "imageformats": {"libqsvg.so"},
+    "imageformats": {"libqsvg.so", "libqjpeg.so", "libqwebp.so"},   # photos of a paper backup
     "iconengines": {"libqsvgicon.so"},
 }
 # platformthemes: the GTK theme pulls in all of GTK, and the portal theme cannot

@@ -24,6 +24,12 @@ def open_new(path: Path | str, mode: int = 0o600) -> int:
     return os.open(path, NEW_FILE_FLAGS, mode)
 
 
+def is_link(path: Path | str) -> bool:
+    """A symlink, or on Windows a junction: anything that points somewhere else."""
+    path = Path(path)
+    return path.is_symlink() or path.is_junction()
+
+
 def fsync_dir(path: Path) -> bool:
     """Make a rename in ``path`` durable, and say whether that was confirmed. Windows
     has no directory fsync; there the rename itself is journaled by NTFS."""

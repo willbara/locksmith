@@ -129,6 +129,50 @@ def run() -> int:
 
     check("signatures (Ed25519, ML-DSA-65)", signatures)
 
+    def age_files():
+        import io
+
+        from .core import age
+        from .core.keys import public_from_private
+        hybrid, classical = os.urandom(96), os.urandom(32)
+        for raw in (hybrid, classical):
+            out, back = io.BytesIO(), io.BytesIO()
+            age.encrypt_stream(io.BytesIO(data), out, [age.recipient_for(public_from_private(raw))])
+            age.decrypt_stream(io.BytesIO(out.getvalue()), back, age.Keys(identities=[raw]))
+            assert back.getvalue() == data, "an age file did not round-trip"
+
+    check("age files (X25519, ML-KEM-768 + X25519)", age_files)
+
+    def ssh_keys():
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+        from .core import sshkeys
+        key = Ed25519PrivateKey.generate()
+        # A passphrase-protected OpenSSH key needs the bcrypt module.
+        pem = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.OpenSSH,
+                                serialization.BestAvailableEncryption(b"self-test"))
+        ident = sshkeys.load_identity(pem, "self-test")
+        line = key.public_key().public_bytes(serialization.Encoding.OpenSSH, serialization.PublicFormat.OpenSSH)
+        blob = engine.encrypt_bytes(b"ssh", EncryptOptions(recipients=[sshkeys.parse_recipient(line.decode()).raw]))
+        assert engine.decrypt_bytes(blob, DecryptKeys(ssh=[ident])).data == b"ssh"
+
+    check("SSH keys (bcrypt)", ssh_keys)
+
+    def recovery():
+        from .core import parity
+        lpar = parity.create(src, "10")
+        damaged = bytearray(data)
+        damaged[100:5000] = bytes(4900)
+        src.write_bytes(bytes(damaged))
+        parity.repair(src)
+        assert src.read_bytes() == data, "recovery data did not repair the file"
+        lpar.unlink()
+        for leftover in tmp.glob("sample.bin.damaged*"):
+            leftover.unlink()
+
+    check("recovery data", recovery)
+
     def window():
         from PySide6.QtWidgets import QApplication
 
@@ -145,6 +189,25 @@ def run() -> int:
         w.close()
 
     check("user interface", window)
+
+    def paper_backup():
+        from PySide6.QtCore import QBuffer, QIODevice
+        from PySide6.QtWidgets import QApplication
+
+        from .core import keys, qrdecode
+        from .ui import paper
+        QApplication.instance() or QApplication([])
+        raw = os.urandom(96)
+        page = paper.render_image("self-test", "-", 0, raw, 0.4)
+        buf = QBuffer()
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
+        assert page.save(buf, "JPG", 85), "JPEG images can't be written (image plugin missing)"
+        photo = paper.load_image(bytes(buf.data()))
+        assert not photo.isNull(), "JPEG images can't be read (image plugin missing)"
+        assert keys.private_from_paper(qrdecode.decode(*paper.gray_pixels(photo))) == raw
+        assert paper.render_pdf("self-test", "-", 0, raw).startswith(b"%PDF")
+
+    check("paper backup (PDF, JPEG photo, QR reader)", paper_backup)
 
     import shutil
     shutil.rmtree(tmp, ignore_errors=True)

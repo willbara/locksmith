@@ -2,7 +2,7 @@
 
     .venv/bin/python tests/vectors/make_signature_vectors.py
 
-Written from docs/FORMAT.md sections 9, 13 and 14 with the independent reader, never
+Written from docs/FORMAT.md sections 9, 13 and 14 with the second reader, never
 Locksmith's code. It signs with the "hybrid" identity already in vectors.json and leaves
 every other vector untouched. Only do this deliberately: ML-DSA signing is randomised, so
 each run makes different signatures, and the committed ones are the evidence that later

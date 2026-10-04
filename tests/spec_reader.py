@@ -1,4 +1,4 @@
-"""An independent reader for the Locksmith file format, written from docs/FORMAT.md.
+"""A second reader for the Locksmith file format, written from docs/FORMAT.md.
 
 It uses only the standard library and `cryptography`, never the engine, so the test
 vectors check the specification and the engine against each other.
@@ -18,6 +18,7 @@ from dataclasses import dataclass
 
 from cryptography.exceptions import InvalidSignature, InvalidTag
 from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from cryptography.hazmat.primitives.asymmetric.mldsa import MLDSA65PrivateKey, MLDSA65PublicKey
 from cryptography.hazmat.primitives.asymmetric.mlkem import MLKEM768PrivateKey
@@ -68,8 +69,44 @@ def kdf(name: str, p: dict, secret: bytes, salt: bytes) -> bytes:
     return PBKDF2HMAC(hashes.SHA512(), 32, salt, p["i"]).derive(secret)
 
 
-def _slot_keys(slot: dict, label: bytes, password, keyfile, identity):
+def ssh_mpint(n: int) -> bytes:
+    """RFC 4251 §5: a positive mpint, with a leading zero byte when the top bit is set."""
+    raw = n.to_bytes((n.bit_length() + 8) // 8, "big")
+    return struct.pack(">I", len(raw)) + raw
+
+
+def ssh_rsa_blob(public_key) -> bytes:
+    """RFC 4253 §6.6: the SSH wire encoding of an RSA public key."""
+    numbers = public_key.public_numbers()
+    return struct.pack(">I", 7) + b"ssh-rsa" + ssh_mpint(numbers.e) + ssh_mpint(numbers.n)
+
+
+def ssh_ed25519_to_x25519(public: bytes) -> bytes:
+    """Section 3: u = (1 + y) / (1 - y) mod p."""
+    p = 2 ** 255 - 19
+    y = int.from_bytes(public, "little") & ((1 << 255) - 1)
+    return ((1 + y) * pow(1 - y, -1, p) % p).to_bytes(32, "little")
+
+
+def ssh_ed25519_identity(seed: bytes) -> bytes:
+    """Section 3: the X25519 private key that opens an SSH Ed25519 recipient's slot."""
+    return hashlib.sha512(seed).digest()[:32]
+
+
+def _slot_keys(slot: dict, label: bytes, password, keyfile, identity, rsa_key=None):
     """Yield (KEK, slot kind) candidates this slot could be opened with."""
+    if slot["t"] == "ssh-rsa":
+        if rsa_key is None:
+            return
+        c = b64(slot["c"])
+        oaep = padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=label + b"ssh-rsa")
+        try:
+            secret = rsa_key.decrypt(c, oaep)
+        except ValueError:
+            return
+        rpk = ssh_rsa_blob(rsa_key.public_key())
+        yield hkdf(secret, 32, hashlib.sha256(c + rpk).digest(), label + b"ssh-rsa"), b"ssh-rsa"
+        return
     if slot["t"] == "pw" and (password is not None or keyfile is not None) and slot["kf"] == (keyfile is not None):
         secret = unicodedata.normalize("NFC", password or "").encode()
         base = kdf(slot["kdf"], slot["p"], secret, b64(slot["salt"]))
@@ -95,7 +132,7 @@ def _u32(blob: bytes, pos: int) -> int:
 
 
 def read(blob: bytes, password: str | None = None, keyfile: bytes | None = None,
-         identity: bytes | None = None, verifiers: tuple[bytes, ...] = ()) -> dict:
+         identity: bytes | None = None, verifiers: tuple[bytes, ...] = (), rsa_key=None) -> dict:
     """Decrypt a version 1 or 2 file. Returns the DEK, metadata, content, the parsed fixed header,
     the slots and, for a signed file, its signature ("valid" with the key, or "unknown")."""
     version = MAGICS[blob[:8]]
@@ -118,15 +155,15 @@ def read(blob: bytes, password: str | None = None, keyfile: bytes | None = None,
         pos = 48 + flen + slen
         commit_info = label + b"commit" + hashlib.sha256(raw).digest()
     salt = b64(h["salt"])
-    dek = None
+    dek = opened_with = None
     for slot in slots:
-        for kek, kind in _slot_keys(slot, label, password, keyfile, identity):
+        for kek, kind in _slot_keys(slot, label, password, keyfile, identity, rsa_key):
             try:
                 candidate = AESGCM(kek).decrypt(b64(slot["n"]), b64(slot["w"]), label + b"slot/" + kind)
             except InvalidTag:
                 continue
             if hkdf(candidate, 32, salt, commit_info) == kc:
-                dek = candidate
+                dek, opened_with = candidate, kind
         if dek:
             break
     assert dek is not None, "no slot opened"
@@ -162,8 +199,39 @@ def read(blob: bytes, password: str | None = None, keyfile: bytes | None = None,
             content += block
         elif kind == 3:
             signature += block
-    return {"dek": dek, "meta": meta, "content": content, "header": h, "slots": slots,
+    return {"dek": dek, "meta": meta, "content": content, "header": h, "slots": slots, "opened_with": opened_with,
             "signature": _check_locked_signature(signature, raw, content, verifiers) if signature else None}
+
+
+def encryption_key(identity: bytes) -> bytes:
+    """Section 9: the raw encryption key of a raw private key (32 or 96 bytes)."""
+    key = X25519PrivateKey.from_private_bytes(identity[:32]).public_key().public_bytes_raw()
+    if len(identity) == 96:
+        key += MLKEM768PrivateKey.from_seed_bytes(identity[32:]).public_key().public_bytes_raw()
+    return key
+
+
+def recipient_entry(key: bytes) -> bytes:
+    """Section 7: a "to" entry for a recipient's raw encryption key (32 or 1216 bytes)."""
+    return hashlib.sha256(b"locksmith/v2/recipient" + b"\x00" + key).digest()
+
+
+def addressed(r: dict, own_keys: list[bytes]) -> str | None:
+    """Section 7: what a file's "to" list says about a reader whose identities have the encryption
+    keys ``own_keys``, given the result of ``read``. None: nothing is said."""
+    to = r["meta"].get("to")
+    if r["signature"] is None or r["signature"]["status"] != "valid" or not isinstance(to, list) \
+            or not 1 <= len(to) <= 64:
+        return None
+    try:
+        entries = [b64(e) for e in to]
+    except (TypeError, ValueError):
+        return None
+    if any(len(e) != 32 for e in entries):
+        return None
+    if any(recipient_entry(k) in entries for k in own_keys):
+        return "listed"
+    return "password" if r["opened_with"] == b"pw" else "not_listed"
 
 
 def _check_locked_signature(blob: bytes, fixed: bytes, content: bytes, verifiers) -> dict:
@@ -269,3 +337,59 @@ def verify_signature(text: str, data: bytes, keys: list[bytes]) -> tuple[bytes, 
     except InvalidSignature:
         raise AssertionError("signature does not verify") from None
     return key, sig
+
+
+# ── recovery data (section 17) ───────────────────────────────────────────────
+
+def _gf_mul(a: int, b: int) -> int:
+    product = 0
+    while b:
+        if b & 1:
+            product ^= a
+        a <<= 1
+        if a & 0x100:
+            a ^= 0x11D
+        b >>= 1
+    return product
+
+
+def _gf_inv(a: int) -> int:
+    return next(x for x in range(1, 256) if _gf_mul(a, x) == 1)
+
+
+def read_recovery(data: bytes, lpar: bytes) -> dict:
+    """Check recovery data against the file it protects, recomputing every parity byte."""
+    assert lpar[:8] == b"LOCKPAR\x01" and lpar[-8:] == b"LOCKPAR\x02"
+    mlen = _u32(lpar, 8)
+    meta, check = lpar[12:12 + mlen], lpar[12 + mlen:44 + mlen]
+    assert hashlib.sha256(meta).digest() == check
+    assert lpar[-12 - 32 - mlen:-12] == meta + check and _u32(lpar, len(lpar) - 12) == mlen
+    hlen = _u32(meta, 0)
+    h = json.loads(meta[4:4 + hlen])
+    size, block, k, m = h["size"], h["block"], h["k"], h["m"]
+    assert size == len(data) and hashlib.sha256(data).hexdigest() == h["sha256"]
+    n = -(-size // block)
+    stripes = max(1, -(-n // k))
+    table = meta[4 + hlen:]
+    hashes = [table[i * 16:(i + 1) * 16] for i in range(len(table) // 16)]
+    assert len(hashes) == n + stripes * m
+
+    def block_at(b: int) -> bytes:
+        return data[b * block:(b + 1) * block].ljust(block, b"\0")
+
+    for b in range(n):
+        assert hashes[b] == hashlib.sha256(data[b * block:(b + 1) * block]).digest()[:16]
+    start = 44 + mlen
+    for j in range(stripes):
+        for i in range(m):
+            expected = bytearray(block)
+            for t in range(k):
+                if t * stripes + j < n:
+                    c = _gf_inv(i ^ (m + t))
+                    for pos, byte in enumerate(block_at(t * stripes + j)):
+                        if byte:
+                            expected[pos] ^= _gf_mul(c, byte)
+            p = lpar[start + (j * m + i) * block:start + (j * m + i + 1) * block]
+            assert p == bytes(expected), f"parity block {i} of stripe {j}"
+            assert hashes[n + j * m + i] == hashlib.sha256(p).digest()[:16]
+    return {"block": block, "k": k, "m": m, "stripes": stripes, "blocks": n}

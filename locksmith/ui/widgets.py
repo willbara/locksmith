@@ -1141,16 +1141,19 @@ class PasswordField(QWidget):
 class KeyfilePicker(QWidget):
     changed = Signal()
 
-    def __init__(self, allow_generate=True, parent=None):
+    def __init__(self, allow_generate=True, parent=None, *, button="Keyfile…", empty="No keyfile",
+                 tip="Any file can be a keyfile. Its exact bytes become part of the key.", title="Choose keyfile",
+                 start=""):
         super().__init__(parent)
         self.path: str | None = None
+        self._empty, self._title, self._start = empty, title, start
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(8)
-        self.label = Label("No keyfile")
+        self.label = Label(empty)
         self.label.setProperty("role", "caption")
-        self.choose = Button("Keyfile…", "key")
-        self.choose.setToolTip("Any file can be a keyfile. Its exact bytes become part of the key.")
+        self.choose = Button(button, "key")
+        self.choose.setToolTip(tip)
         self.choose.clicked.connect(self._choose)
         lay.addWidget(self.choose)
         if allow_generate:
@@ -1170,7 +1173,7 @@ class KeyfilePicker(QWidget):
             self.label.setText(Path(path).name)
             self.label.setProperty("role", "mono")
         else:
-            self.label.setText("No keyfile")
+            self.label.setText(self._empty)
             self.label.setProperty("role", "caption")
         self.label.style().unpolish(self.label)
         self.label.style().polish(self.label)
@@ -1178,7 +1181,7 @@ class KeyfilePicker(QWidget):
         self.changed.emit()
 
     def _choose(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Choose keyfile")
+        path, _ = QFileDialog.getOpenFileName(self, self._title, self._start)
         if path:
             self.set_path(path)
 

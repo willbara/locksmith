@@ -5,9 +5,10 @@ from pathlib import Path
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QGridLayout, QVBoxLayout, QWidget
 
-from ...core import compress, engine, kdf, tools
+from ...core import age, compress, engine, kdf, parity, sshkeys, tools
 from ...core.ciphers import SUITES
 from ...core.engine import EncryptOptions
+from ...core.osutil import is_link
 from .. import dialogs
 from ..settings import settings
 from ..widgets import (
@@ -90,6 +91,10 @@ class EncryptPage(Page):
             "Adds decoy recipient slots, so the file shows 8, 16, 32 or 64 instead of how many people "
             "can really open it.", settings["hide_recipients"])
         rl.addWidget(self.hide_recipients)
+        self.rsa_note = label("An SSH RSA recipient is selected. Locksmith 3.0 and earlier can't open such a file at "
+                              "all, even with its password.", "caption")
+        self.rsa_note.setVisible(False)
+        rl.addWidget(self.rsa_note)
         self.rcpt_box.setVisible(False)
         prot.add(self.rcpt_box)
         self.add(prot)
@@ -149,6 +154,10 @@ class EncryptPage(Page):
         g.setColumnStretch(0, 1)
         g.setColumnStretch(1, 1)
         adv.add(g)
+        self.format = Dropdown({"locked": "Locksmith (.locked)", "age": "age (.age), for age, rage and other age tools"})
+        self.format_field = Field("File format", self.format)
+        self.format.currentIndexChanged.connect(self._update_state)
+        adv.add(self.format_field)
         adv.add(divider())
         self.hide_name = ToggleRow("Hide file names",
                                    "Give encrypted files random names. The real name is stored inside.",
@@ -166,7 +175,11 @@ class EncryptPage(Page):
                                "Overwrite and delete the originals after encrypting. Best effort only: "
                                "SSDs and copy-on-write filesystems (btrfs) may keep old copies.",
                                settings["shred_after"])
-        for t in (self.hide_name, self.bundle, self.armor, self.strip, self.shred):
+        self.recovery = ToggleRow("Add recovery data",
+                                  "Also saves a .lpar file (5% of the size) that can repair the encrypted file if "
+                                  "its storage is damaged later. Useful for long-term archives.",
+                                  settings["recovery_data"])
+        for t in (self.hide_name, self.bundle, self.armor, self.strip, self.recovery, self.shred):
             adv.add(t)
         self.bundle.toggled.connect(self._update_state)
         self.keyfile.changed.connect(self._update_state)
@@ -179,6 +192,14 @@ class EncryptPage(Page):
         self.sign_field = Field("Sign as", self.sign_as, "Whoever opens the file can check it was signed with "
                                 "your key and hasn't changed since.")
         self.add(self.sign_field)
+        self.address = ToggleRow("Address it to the selected people",
+                                 "Lists the recipients inside the signed file, so whoever opens it can tell whether "
+                                 "they were one of them. Everyone who can open it can read the list.")
+        self.address_note = label("", "caption")
+        self.add(self.address)
+        self.add(self.address_note)
+        self.sign_as.currentIndexChanged.connect(self._update_state)
+        self.address.toggled.connect(self._update_state)
         self.reload_signers()
         self.output = OutputPicker("Save next to the originals")
         self.add(Field("Output", self.output))
@@ -236,6 +257,24 @@ class EncryptPage(Page):
         if mode in (1, 2):
             ok = ok and bool(self.recipients.selected())
         self.go.setEnabled(bool(ok) and self.task is None)
+        is_age = self.format.value() == "age"
+        self.rsa_note.setVisible(not is_age and mode in (1, 2)
+                                 and any(map(sshkeys.is_rsa_raw, self.recipients.selected())))
+        self.format_field.set_caption(
+            "age files use ChaCha20-Poly1305, and scrypt for a password. They have no signature, keyfile, size "
+            "padding, note, decoy recipients or stored file name, and a folder becomes a .tar archive. A password "
+            "and recipients can't be combined. Post-quantum keys stay post-quantum (age 1.3 or later)."
+            if is_age else "")
+        signing = not self.sign_field.isHidden() and isinstance(self.sign_as.value(), int)
+        has_keys = mode in (1, 2) and bool(self.recipients.selected())
+        self.address.setVisible(signing)
+        self.address.setEnabled(has_keys)
+        if not has_keys:
+            self.address.setChecked(False)
+        self.address_note.setText("" if has_keys else
+                                  "Only files with public-key recipients can be addressed: a password or keyfile "
+                                  "has no key to list.")
+        self.address_note.setVisible(signing and not has_keys)
         n = len(self.files.paths())
         self.go.setText("Encrypt" if n <= 1 else
                         (f"Encrypt {n} items" if not self.bundle.isChecked() else f"Encrypt {n} items as one"))
@@ -248,6 +287,8 @@ class EncryptPage(Page):
         choices = signer_choices(self.store)
         self.sign_as.set_items(choices)
         self.sign_field.setVisible(len(choices) > 1)
+        if hasattr(self, "go"):
+            self._update_state()
 
     def options(self) -> EncryptOptions:
         mode = self.mode.index()
@@ -261,6 +302,7 @@ class EncryptPage(Page):
             hide_name=self.hide_name.isChecked(), note=self.note.text().strip(),
             hide_recipients=mode in (1, 2) and self.hide_recipients.isChecked(),
             armor=self.armor.isChecked(), strip_metadata=self.strip.isChecked(),
+            address_to=not self.address.isHidden() and self.address.isEnabled() and self.address.isChecked(),
         )
 
     # ── run ──
@@ -269,12 +311,28 @@ class EncryptPage(Page):
         paths = [Path(p) for p in self.files.paths()]
         if not paths:
             return
+        links = [p.name for p in paths if is_link(p)]
+        if links:
+            # Checked before anything runs: each item is encrypted (and shredded) in turn.
+            dialogs.error(f"{links[0]} is a link. Add the file or folder it points to instead.", "Can't encrypt a link")
+            return
         opts = self.options()
+        is_age = self.format.value() == "age"
+        if is_age and (problem := self._age_problem(opts)):
+            dialogs.error(problem, "Not possible in an age file")
+            return
         if opts.password and tools.strength_label(tools.estimate_entropy(opts.password))[0] <= 1:
             if not dialogs.confirm("Weak password",
                                    "This password could be guessed quickly. Use it anyway?",
                                    ok="Use anyway"):
                 return
+        if opts.address_to and opts.hide_recipients and not dialogs.confirm(
+                "Recipients will see the list",
+                "Addressing the file lists its recipients inside it, and everyone who can open it can read that "
+                "list: they'll see who else it was sent to and how many people that is. Toward them, that undoes "
+                "“Hide the number of recipients”, which still hides the number from everyone else. Continue?",
+                ok="Sign and address it", icon="user"):
+            return
         shred = self.shred.isChecked()
         if shred and opts.keyfile and tools.covered_by(Path(opts.keyfile), paths):
             dialogs.error("The keyfile is one of the items being shredded, or inside one of them. "
@@ -303,10 +361,36 @@ class EncryptPage(Page):
         if signer is None:
             return
         out_dir = self.output.directory()
+        recovery = self.recovery.isChecked()
         bundle = self.bundle.isChecked() and len(paths) > 1
         groups = [paths] if bundle else [[p] for p in paths]
+        if is_age:
+            ssh_blobs = {c.public_raw: c.ssh.blob for c in self.store.contacts
+                         if c.ssh is not None and c.ssh.key_type == "ssh-ed25519"}
+            age_recipients = [age.recipient_for(r, ssh_blobs.get(r)) for r in opts.recipients]
+            work_factor = {"fast": 16, "balanced": 18, "strong": 19, "paranoid": 20}[opts.preset]
+
+        def work_age(report, cancel):
+            outputs, stats = [], {}
+            n = len(groups)
+            for i, group in enumerate(groups):
+                def sub(frac, stage, i=i):
+                    report(None if frac is None else (i + frac) / n,
+                           stage + (f"  ·  {i + 1} of {n}" if n > 1 else ""))
+                outputs.append(age.encrypt_paths(group, out_dir, age_recipients, opts.password, opts.armor,
+                                                 progress=sub, cancel=cancel, verify=shred, work_factor=work_factor,
+                                                 strip=opts.strip_metadata, hide_name=opts.hide_name, stats=stats))
+                if recovery:
+                    parity.create(outputs[-1], "5", progress=sub, cancel=cancel)
+                if shred:
+                    for p in group:
+                        report(None, f"Shredding {p.name}")
+                        tools.shred(p, cancel=cancel)
+            return outputs, stats
 
         def work(report, cancel):
+            if is_age:
+                return work_age(report, cancel)
             ident, passphrase = signer
             # Unlocking may run Argon2id, so it happens here, off the UI thread.
             opts.signer = ident.private_raw(passphrase) if ident else None
@@ -319,6 +403,8 @@ class EncryptPage(Page):
                 # Shredding requires proof the encrypted copy on disk is intact.
                 outputs.append(engine.encrypt_paths(group, out_dir, opts, progress=sub, cancel=cancel,
                                                     verify=shred, stats=stats))
+                if recovery:
+                    parity.create(outputs[-1], "5", progress=sub, cancel=cancel)
                 if shred:
                     for p in group:
                         report(None, f"Shredding {p.name}")
@@ -330,6 +416,28 @@ class EncryptPage(Page):
         self.task = run_task(work, self._done, self._failed, self.progress.update_progress,
                              self._cancelled, self)
         self._update_state()
+
+    def _age_problem(self, opts: EncryptOptions) -> str | None:
+        """Why these settings can't make an age file, if they can't. Options that protect
+        privacy or authenticity are refused rather than silently left out."""
+        if opts.keyfile:
+            return "age files can't use a keyfile. Remove it, or choose the Locksmith format."
+        if opts.password and opts.recipients:
+            return ("An age file opens either with a password or with public keys, not both. Choose one, or the "
+                    "Locksmith format.")
+        if isinstance(self.sign_as.value(), int) and not self.sign_field.isHidden():
+            return "age files can't be signed. Choose “Don't sign”, or the Locksmith format."
+        if opts.padding != "none":
+            return "age files have no size padding. Set Size padding to None, or choose the Locksmith format."
+        if opts.note:
+            return "age files can't hold a note. Clear it, or choose the Locksmith format."
+        if opts.hide_recipients:
+            return ("age files can't hide the number of recipients. Turn that off, or choose the Locksmith "
+                    "format.")
+        if len({len(r) == 1216 for r in opts.recipients}) > 1:
+            return ("age doesn't mix post-quantum and classical recipients in one file: it would be only as strong "
+                    "as the classical ones. Choose one kind, or the Locksmith format.")
+        return None
 
     def _finish(self):
         self.task = None

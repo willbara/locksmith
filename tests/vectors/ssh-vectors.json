@@ -1,0 +1,15 @@
+{
+  "name": "v2-ssh-recipients",
+  "file": "v2-ssh-recipients.locked",
+  "signer": "hybrid",
+  "dek": "c68372e775c0dc514bec5c19b412d6bd7c64d63e0d38c4bfa751355abd0741a3",
+  "slot_types": [
+    "pw",
+    "ssh-rsa",
+    "x25519"
+  ],
+  "ed25519_x25519_public": "0c54ede14b551db8685edbdb601202d8160260b2dd8dd0a854334d2d9e226271",
+  "rsa_blob_sha256": "aec4f0944a154461419b852da473452cd3e81464b45da4f9d903501482a919ac",
+  "rsa_blob": "AAAAB3NzaC1yc2EAAAADAQABAAABgQC4w/gDjlUAtx4jd0rMZGFk1v/mDPgepbLi4rRoelW63892iYMKelG29MtpUr5lQubRrGlcmpG6YIGe6Bqb7fGsxl2e3f44/r0Lrzfj1yWnt6iW4SjVPa3GZIfdM8bHuRVhL6GThSRLnoj/MaoIbUxpWsjBND6a/CjI8o+P4I0CGtFzSEbjJfc3FLEUrPOLOMTm7X7x0+D9NI1diaBbeCNhGIv+1NWtuCRJVqs5lLRv2T7Htuz3qi8JlKCUNiGo5zy/xPiXfpbOCDwK9gYDjASzhcnVUvW8EUqG6kHwJ4E7WeKaHF0zoy4CAMNdcMmE0J1igwOwpNPIpv1PpDZsRrxpviJZvSv24jDPEwxkFsO/2FIxwqobEelwv24G9amyIiuQH4mvVLKfgnztEnc0sjcnwFMMXpQnErrlbAZt+nyPd8vSk9SFvIrK+FrejSy2MPOnEzC/IFgjFfeJR6iCGkZ4n3+tkbswx3PRexNG5/k2ho8M2HOPI3cHv8eDjWXA1tk=",
+  "content_sha256": "666d39bbf69201d5da01150fb82b581a171d1e9222ffca562e5102fc9d2962e3"
+}

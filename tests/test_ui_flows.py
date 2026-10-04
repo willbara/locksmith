@@ -660,3 +660,313 @@ def test_signed_message_through_the_share_page(window, monkeypatch):
     s._open_message()
     wait(lambda: shown)
     assert shown[0] == ("meet at noon", "✓  Signed with the key you saved as Alice (you)")
+
+
+@pytest.mark.parametrize("target", ["file", "folder"])
+def test_shred_refuses_symlinked_inputs(tmp_path, window, needs_symlinks, target):
+    """N2: with shredding on, a link given as input is refused on Encrypt and on Tools → Shred;
+    the data it points to and the link itself are untouched, and nothing is encrypted."""
+    real = tmp_path / "real"
+    if target == "file":
+        real.write_text("plaintext\n", encoding="utf-8")
+    else:
+        real.mkdir()
+        (real / "inside.txt").write_text("plaintext\n", encoding="utf-8")
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    e = window.encrypt
+    e.add_paths([str(tmp_path / "plain.txt"), str(link)])
+    (tmp_path / "plain.txt").write_text("other\n", encoding="utf-8")
+    _set_password(e)
+    e.shred.setChecked(True)
+    e.output._dir = str(tmp_path / "out")
+    e.output._rebuild()
+    e.go.click()
+    wait(lambda: e.task is None)
+    assert any("is a link" in a for a in window.asked)
+    assert link.is_symlink() and (tmp_path / "plain.txt").exists()
+    assert (real.read_text(encoding="utf-8") if target == "file" else
+            (real / "inside.txt").read_text(encoding="utf-8")) == "plaintext\n"
+    assert not list(tmp_path.glob("out/*.locked"))
+
+    t = window.tools
+    window.asked.clear()
+    t.shred_list.add([str(link)])
+    t._shred()
+    assert any("is a link" in a for a in window.asked)
+    assert link.is_symlink() and real.exists()
+
+
+def test_change_who_can_open_a_file(tmp_path, window, monkeypatch):
+    """Decrypt → Change who can open it: unlock with the page's inputs, rewrite the slots, and ask
+    before leaving the user unable to open it."""
+    from locksmith.core import engine
+    from locksmith.core.engine import AccessChange, DecryptKeys, EncryptOptions
+    src = tmp_path / "doc.txt"
+    src.write_bytes(b"contents\n")
+    enc = engine.encrypt_paths([src], tmp_path / "enc", EncryptOptions(password="old-pw", kdf="pbkdf2-sha512",
+                                                                       preset="fast"))
+    before = engine.inspect(enc)
+    d = window.decrypt
+    d.add_paths([str(enc)])
+    assert d.access.isEnabled()
+    d.password.setText("old-pw")
+    friend = window.store.generate("Friend")
+    monkeypatch.setattr(d, "_access_sheet", lambda path, info: AccessChange(
+        set_password=True, password="new-pw", kdf="pbkdf2-sha512", preset="fast", add_recipients=[friend.public_raw]))
+    d.access.click()
+    wait(lambda: d.task is None)
+    assert not [a for a in window.asked if a.startswith("ERROR")]
+    after = engine.inspect(enc)
+    assert after.recipient_slots == before.recipient_slots + 1
+    assert engine.decrypt_bytes(enc.read_bytes(), DecryptKeys(password="new-pw")).data == b"contents\n"
+    assert engine.decrypt_bytes(enc.read_bytes(), DecryptKeys(identities=[friend.private_raw()])).data == b"contents\n"
+    assert d.password.text() == ""
+
+    # Removing the password the user opened it with, leaving only the friend: asked first.
+    window.asked.clear()
+    d.password.setText("new-pw")
+    monkeypatch.setattr(d, "_access_sheet", lambda path, info: AccessChange(set_password=True))
+    monkeypatch.setattr(window.store, "identities", [])   # the friend's identity isn't one of the user's
+    d.access.click()
+    wait(lambda: d.task is None and window.asked)
+    wait(lambda: d.task is None)
+    assert window.asked[0] == "You won’t be able to open it"
+    assert engine.inspect(enc).password_slots == []
+
+
+def test_addressed_file_through_encrypt_and_decrypt(tmp_path, window, monkeypatch):
+    """The "addressed to" toggle: only with recipients, a warning when decoys are on too, and
+    neutral wording on Decrypt for a reader who isn't on the list."""
+    from locksmith.core.keys import KeyStore
+    from locksmith.ui import dialogs
+    from locksmith.ui.widgets import Label
+    store, e, d = window.store, window.encrypt, window.decrypt
+    me = store.generate("Alice")
+    bob_store = KeyStore(tmp_path / "bob")
+    bob = bob_store.generate("Bob")
+    store.add_contact("Bob", bob.key_text)
+    window._keys_changed()
+    src = tmp_path / "plan.txt"
+    src.write_text("the plan", encoding="utf-8")
+    e.files.add([str(src)])
+    e.sign_as.set_value(store.identities.index(me))
+    assert not e.address.isHidden() and not e.address.isEnabled()   # password only: nothing to list
+    assert "no key to list" in e.address_note.text()
+    e.mode.setIndex(1)
+    for row, raw in e.recipients.rows:
+        row.setChecked(raw == bob.public_raw)
+    assert e.address.isEnabled()
+    e.address.setChecked(True)
+    e.hide_recipients.setChecked(True)
+    e.output._dir = str(tmp_path / "enc")
+    e.output._rebuild()
+    asked = []
+    monkeypatch.setattr(dialogs, "confirm", lambda title, *a, **k: (asked.append(title), True)[1])
+    e.start()
+    wait(lambda: e.task is None)
+    assert asked == ["Recipients will see the list"]
+    (enc,) = (tmp_path / "enc").glob("*.locked")
+
+    # Bob forwards it to Carol by adding her slot; Carol has saved Alice's key.
+    from locksmith.core import engine
+    carol = KeyStore(tmp_path / "carol").generate("Carol")
+    engine.change_access(enc, engine.DecryptKeys(identities=[bob.private_raw()]),
+                         engine.AccessChange(add_recipients=[carol.public_raw]))
+    store.remove_identity(me)
+    store.contacts.clear()
+    store.add_contact("Alice", me.key_text)
+    store.identities.append(carol)
+    window._keys_changed()
+    d.files.add([str(enc)])
+    d.output._dir = str(tmp_path / "dec")
+    d.output._rebuild()
+    d.start()
+    wait(lambda: d.task is None)
+    texts = [lab.text() for lab in d.findChildren(Label)]
+    assert ("✓  Signed with the key you saved as Alice, but you weren't on its original recipient list"
+            in texts)
+
+
+def test_ssh_key_recipient_through_encrypt_and_decrypt(tmp_path, window, monkeypatch):
+    """Encrypt to an SSH contact, then open the file on Decrypt with the protected SSH private key."""
+    from pathlib import Path
+
+    from locksmith.ui import dialogs
+    keys_dir = Path(__file__).parent / "interop" / "sshkeys"
+    store, e, d = window.store, window.encrypt, window.decrypt
+    store.add_contact("Server", (keys_dir / "id_rsa3072.pub").read_text(encoding="utf-8"))
+    window._keys_changed()
+    src = tmp_path / "notes.txt"
+    src.write_text("for the server", encoding="utf-8")
+    e.files.add([str(src)])
+    e.mode.setIndex(1)
+    for row, _ in e.recipients.rows:
+        row.setChecked(True)
+    assert not e.rsa_note.isHidden()   # older versions can't open it: said before encrypting
+    e.output._dir = str(tmp_path / "enc")
+    e.output._rebuild()
+    e.start()
+    wait(lambda: e.task is None)
+    (enc,) = (tmp_path / "enc").glob("*.locked")
+
+    passphrase = (keys_dir / "passphrase.txt").read_text(encoding="utf-8").strip()
+    asked = []
+    monkeypatch.setattr(dialogs, "prompt", lambda title, *a, **k: (asked.append(title), passphrase)[1])
+    d.files.add([str(enc)])
+    d.ssh_key.set_path(str(keys_dir / "id_rsa3072_protected"))
+    d.output._dir = str(tmp_path / "dec")
+    d.output._rebuild()
+    d.start()
+    wait(lambda: d.task is None)
+    assert asked == ["SSH key passphrase"]
+    assert (tmp_path / "dec" / "notes.txt").read_text(encoding="utf-8") == "for the server"
+
+
+def test_age_files_through_encrypt_and_decrypt(tmp_path, window, monkeypatch):
+    """Encrypt → File format → age: to a post-quantum identity (an mlkem768x25519 stanza), then
+    opened on Decrypt; options age can't honour are refused, and a pasted age message opens."""
+    from locksmith.core import age
+    from locksmith.ui import dialogs
+    from locksmith.ui.widgets import Label
+    store, e, d = window.store, window.encrypt, window.decrypt
+    store.generate("Me")
+    window._keys_changed()
+    src = tmp_path / "photo.txt"
+    src.write_text("age content", encoding="utf-8")
+    e.files.add([str(src)])
+    e.format.set_value("age")
+    assert "ChaCha20-Poly1305" in e.format_field.caption.text()
+    e.mode.setIndex(2)
+    _set_password(e)
+    for row, _ in e.recipients.rows:
+        row.setChecked(True)
+    e.output._dir = str(tmp_path / "enc")
+    e.output._rebuild()
+    e.start()
+    assert any("not both" in a for a in window.asked)   # password and recipients: refused before anything runs
+    e.mode.setIndex(1)
+    e.start()
+    wait(lambda: e.task is None)
+    (enc,) = (tmp_path / "enc").glob("*.age")
+    assert [s.type for s in age.read_header(open(enc, "rb")).stanzas] == [b"mlkem768x25519"]
+
+    d.files.add([str(enc)])
+    assert "post-quantum age key" in d.info_lines.text()
+    d.output._dir = str(tmp_path / "dec")
+    d.output._rebuild()
+    d.start()
+    wait(lambda: d.task is None)
+    assert (tmp_path / "dec" / "photo.txt").read_text(encoding="utf-8") == "age content"
+
+    # A pasted armored age message with a password, shown as text.
+    out = __import__("io").BytesIO()
+    age.encrypt_stream(__import__("io").BytesIO(b"pasted secret"), out, [], "pw-for-age", work_factor=10)
+    monkeypatch.setattr(dialogs, "text_input", lambda *a, **k: age.armor(out.getvalue()))
+    shown = []
+    monkeypatch.setattr(dialogs, "text_view", lambda title, text, *a, **k: shown.append(text))
+    d.paste_text()
+    d.password.setText("pw-for-age")
+    d.start()
+    wait(lambda: d.task is None)
+    assert shown == ["pasted secret"]
+    assert any(lab.text() == "Decrypted message" for lab in d.findChildren(Label))
+
+
+def test_openpgp_signature_tool(window):
+    from pathlib import Path
+
+    from locksmith.ui.widgets import Label
+    here = Path(__file__).parent / "interop" / "openpgp"
+    t = window.tools
+    t.pg_file, t.pg_sig, t.pg_key = here / "message.bin", here / "rsa-subkey.sig", here / "rsa.asc"
+    t._pg_verify()
+    wait(lambda: t.pg_go.isEnabled())
+    assert t.pg_result.text().startswith("✓  Valid signature from key ")
+    assert "RSA 3072 subkey" in t.pg_detail.text() and "not checked by anyone" in t.pg_detail.text()
+    t.pg_sig = here / "revoked.sig"
+    t.pg_key = here / "revoked.asc"
+    t._pg_verify()
+    wait(lambda: t.pg_go.isEnabled())
+    assert t.pg_result.text() == "✕  Not verified" and "revoked" in t.pg_detail.text()
+    assert isinstance(t.pg_detail, Label)
+
+
+def test_paper_backup_restores_by_scanning_its_qr_code(tmp_path, window, monkeypatch):
+    """Keys → paper backup: a PDF saved owner-only; the page's QR code, photographed (here: the
+    page rendered, rotated and scaled), restores the identity through Restore → Scan QR code."""
+    import stat
+    import sys
+
+    from PySide6.QtGui import QTransform
+    from PySide6.QtWidgets import QFileDialog
+
+    from locksmith.core import keys
+    from locksmith.ui import dialogs, paper
+    store, k = window.store, window.keys
+    ident = store.generate("Paper", passphrase="pass phrase")
+    raw = ident.private_raw("pass phrase")
+    k.reload()
+    pdf = tmp_path / "backup.pdf"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **kw: (str(pdf), ""))
+    monkeypatch.setattr(dialogs, "prompt", lambda *a, **kw: "pass phrase")
+    k._paper_backup(ident)
+    wait(lambda: pdf.exists())
+    assert pdf.read_bytes().startswith(b"%PDF")
+    if sys.platform != "win32":
+        assert stat.S_IMODE(pdf.stat().st_mode) == 0o600
+
+    photo = paper.render_image("Paper", keys.fingerprint(ident.key_raw), ident.created, raw, 0.4)
+    photo = photo.transformed(QTransform().rotate(8))
+    image = tmp_path / "photo.png"
+    assert photo.save(str(image))
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **kw: (str(image), ""))
+    from PySide6.QtWidgets import QPlainTextEdit
+    box = QPlainTextEdit()
+    k._scan_qr(box)
+    wait(lambda: box.toPlainText())
+    assert keys.private_from_paper(box.toPlainText()) == raw
+
+
+@pytest.mark.skipif(__import__("sys").platform == "win32", reason="Linux desktop files")
+def test_desktop_integration_and_encrypt_routing(tmp_path, window, monkeypatch):
+    from locksmith.ui import host
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    launched = []
+    monkeypatch.setattr(host, "launch", lambda args: launched.append(args) or True)
+    s = window.settings_page
+    s._integrate()
+    assert (tmp_path / "data" / "applications" / "locksmith.desktop").exists()
+    assert ["xdg-mime", "default", "locksmith.desktop", "application/x-locksmith"] in launched
+    assert s.unintegrate.isEnabled() and s.integration_state.text().startswith("Added")
+    s._unintegrate()
+    assert not (tmp_path / "data" / "applications" / "locksmith.desktop").exists()
+
+    locked = tmp_path / "already.locked"
+    locked.write_bytes(b"LOCKED\x00\x02")
+    window.open_paths([str(locked)], encrypt=True)   # "Encrypt with Locksmith" on a .locked file
+    assert window.encrypt.files.paths() == [str(locked)] and window.decrypt.files.paths() == []
+
+
+def test_recovery_data_through_encrypt_and_tools(tmp_path, window, monkeypatch):
+    from PySide6.QtWidgets import QFileDialog
+    e, t = window.encrypt, window.tools
+    src = tmp_path / "archive.txt"
+    src.write_bytes(b"keep me for decades\n" * 20_000)
+    e.files.add([str(src)])
+    _set_password(e)
+    e.recovery.setChecked(True)
+    e.output._dir = str(tmp_path / "enc")
+    e.output._rebuild()
+    e.start()
+    wait(lambda: e.task is None)
+    (enc,) = (tmp_path / "enc").glob("*.locked")
+    assert enc.with_name(enc.name + ".lpar").exists()
+    original = enc.read_bytes()
+    damaged = bytearray(original)
+    damaged[1000:3000] = bytes(2000)
+    enc.write_bytes(bytes(damaged))
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: (str(enc), ""))
+    t._rc_repair()
+    wait(lambda: t._rc_task is None)
+    assert t.rc_result.text() == f"✓  Repaired {enc.name}" and enc.read_bytes() == original

@@ -115,7 +115,7 @@ def _photo(text: str, scale=5, angle=0.0, skew=0.0, noise=0, seed=1, invert=Fals
 @pytest.mark.parametrize("seed", range(12))
 def test_photographed_codes(seed):
     rng = random.Random(seed)
-    text = keys.paper_qr_text(os.urandom(rng.choice([32, 96])))
+    text = keys.paper_qr_text(rng.randbytes(rng.choice([32, 96])))   # seeded: each case is the same every run
     w, h, px = _photo(text, scale=rng.choice([3, 4, 6]), angle=rng.uniform(-3.1, 3.1), skew=rng.uniform(0, 0.08),
                       noise=rng.choice([0, 25]), seed=seed)
     assert qrdecode.decode(w, h, px) == text

@@ -710,14 +710,31 @@ def _attempt(rows, width, height) -> str | None:
     return None
 
 
+def _upscaled(width: int, height: int, gray: bytes) -> bytes:
+    """The image at twice the size (each pixel repeated), for codes whose modules are only a few
+    pixels wide: the binarizer's 8-pixel blocks are coarse next to them."""
+    out = []
+    for y in range(height):
+        row = gray[y * width:(y + 1) * width]
+        doubled = bytes(b for v in row for b in (v, v))
+        out += [doubled, doubled]
+    return b"".join(out)
+
+
 def decode(width: int, height: int, gray: bytes) -> str:
     """The text of the QR code in a grayscale image (one byte per pixel, rows top to bottom)."""
     if width <= 0 or height <= 0 or len(gray) != width * height or width * height > MAX_PIXELS:
         raise LocksmithError("That image can't be read.")
-    for global_threshold in (False, True):
-        rows = binarize(width, height, gray, global_threshold)
-        for candidate in (rows, [r.translate(bytes((1, 0)) + bytes(254)) for r in rows]):   # also light-on-dark
-            text = _attempt(candidate, width, height)
-            if text is not None:
-                return text
+    sizes = [(width, height, gray)]
+    if 4 * width * height <= MAX_PIXELS:
+        sizes.append((2 * width, 2 * height, None))   # made only if needed
+    for w, h, pixels in sizes:
+        if pixels is None:
+            pixels = _upscaled(width, height, gray)
+        for global_threshold in (False, True):
+            rows = binarize(w, h, pixels, global_threshold)
+            for candidate in (rows, [r.translate(bytes((1, 0)) + bytes(254)) for r in rows]):   # also light-on-dark
+                text = _attempt(candidate, w, h)
+                if text is not None:
+                    return text
     raise LocksmithError(NOT_FOUND)

@@ -9,7 +9,7 @@ WIN = Path(SPECPATH)
 # Qt plugins the app needs; everything else in these folders is dropped.
 QT_PLUGINS_KEEP = {
     "platforms": {"qwindows.dll", "qoffscreen.dll"},     # offscreen: for --self-test
-    "imageformats": {"qsvg.dll"},
+    "imageformats": {"qsvg.dll", "qjpeg.dll", "qwebp.dll"},   # photos of a paper backup
     "iconengines": {"qsvgicon.dll"},
 }
 QT_PLUGIN_DIRS_DROP = {"styles", "tls", "networkinformation", "generic", "platforminputcontexts",

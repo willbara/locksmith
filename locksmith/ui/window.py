@@ -6,7 +6,7 @@ from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QHBoxLayout, QMainWindow, QWidget
 
 from .. import __version__
-from ..core import scratch
+from ..core import age, scratch
 from ..core.engine import is_encrypted_name, looks_encrypted
 from ..core.keys import KeyStore
 from . import dialogs
@@ -27,7 +27,7 @@ NAV = [("Encrypt", "lock"), ("Decrypt", "unlock"), ("Share", "share"), ("Keys", 
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, open_paths: list[str] | None = None):
+    def __init__(self, open_paths: list[str] | None = None, encrypt: bool = False):
         super().__init__()
         self.setWindowTitle("Locksmith")
         self.setWindowIcon(app_icon())
@@ -73,7 +73,7 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)
         QTimer.singleShot(0, lambda: self.sidebar.select(0, animate=False))
         if open_paths:
-            QTimer.singleShot(50, lambda: self.open_paths(open_paths))
+            QTimer.singleShot(50, lambda: self.open_paths(open_paths, encrypt))
         if self.store.problem:
             QTimer.singleShot(400, lambda: dialogs.error(self.store.problem, "Problem loading your keys"))
 
@@ -99,14 +99,14 @@ class MainWindow(QMainWindow):
                         ("padding", e.padding), ("threads", e.threads)):
             dd.set_value(settings[key])
         for key, t in (("hide_name", e.hide_name), ("hide_recipients", e.hide_recipients), ("bundle", e.bundle),
-                       ("armor", e.armor), ("strip_metadata", e.strip)):
+                       ("armor", e.armor), ("strip_metadata", e.strip), ("recovery_data", e.recovery)):
             t.setChecked(settings[key])
         self.decrypt.delete_after.setChecked(settings["delete_after_decrypt"])
 
-    def open_paths(self, paths: list[str]):
-        """Route dropped or command-line paths to Encrypt or Decrypt."""
-        enc = [p for p in paths if not self._is_encrypted(p)]
-        dec = [p for p in paths if self._is_encrypted(p)]
+    def open_paths(self, paths: list[str], encrypt: bool = False):
+        """Route dropped or command-line paths to Encrypt or Decrypt (all to Encrypt with ``encrypt``)."""
+        enc = [p for p in paths if encrypt or not self._is_encrypted(p)]
+        dec = [p for p in paths if not encrypt and self._is_encrypted(p)]
         if dec:
             self.decrypt.add_paths(dec)
         if enc:
@@ -118,13 +118,14 @@ class MainWindow(QMainWindow):
         path = Path(p)
         if not path.is_file():
             return False
-        if is_encrypted_name(path.name):
+        if is_encrypted_name(path.name) or path.name.lower().endswith(age.EXTENSION):
             return True
         try:
             with open(path, "rb") as f:
-                return looks_encrypted(f.read(8))
+                head = f.read(64)
         except OSError:
             return False
+        return looks_encrypted(head) or age.is_age(head)
 
     def closeEvent(self, e):
         clear_clipboard_secret()

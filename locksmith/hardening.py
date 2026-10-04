@@ -1,7 +1,7 @@
-"""Process hardening so secrets in memory cannot be read out of the process.
+"""Process hardening, so secrets in memory are kept out of reach of other programs.
 
-Python cannot reliably wipe passwords or keys from memory, so instead we make
-sure that memory never leaves the process:
+Python cannot reliably wipe passwords or keys from memory, so instead the process
+is configured to keep that memory to itself:
 
 * Core dumps are disabled (RLIMIT_CORE = 0). A crash can no longer write a copy
   of memory, including keys, to disk via systemd-coredump or a core file.

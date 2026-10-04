@@ -6,6 +6,7 @@ never a crash, a write outside the chosen folder, or partial plaintext on disk.
 
 import base64
 import dataclasses
+import errno
 import hashlib
 import io
 import json
@@ -729,10 +730,13 @@ def test_shred_does_not_follow_symlinks(tmp_path, needs_symlinks):
     (d / "link-dir").symlink_to(tmp_path)
     tools.shred(d)
     assert not d.exists() and outside.read_text() == "precious"
+    # A link given directly is refused (N2): removing it would report a shred while the
+    # data it points to stays. Both are left as they were.
     link = tmp_path / "top-link"
     link.symlink_to(outside)
-    tools.shred(link)
-    assert not link.is_symlink() and outside.read_text() == "precious"
+    with pytest.raises(LocksmithError, match="is a link"):
+        tools.shred(link)
+    assert link.is_symlink() and outside.read_text() == "precious"
 
 
 @pytest.mark.parametrize("shares", [
@@ -1386,7 +1390,7 @@ def test_decrypt_journals_its_temporary_files(tmp_path, monkeypatch):
     seen = []
     real = engine.extract_archive
     monkeypatch.setattr(engine, "extract_archive",
-                        lambda a, d: (seen.append(json.loads(journal.read_text(encoding="utf-8"))), real(a, d))[1])
+                        lambda a, d, **kw: (seen.append(json.loads(journal.read_text(encoding="utf-8"))), real(a, d, **kw))[1])
     engine.decrypt_path(locked, tmp_path / "dec", PW)
     assert [Path(p).name for p in seen[0]][0].endswith(".part") and len(seen[0]) == 2
     assert not journal.exists()  # everything was cleaned up, so nothing is listed
@@ -1693,3 +1697,187 @@ def test_minisign_comment_is_checked_byte_for_byte(tmp_path):
     pub = base64.b64encode(b"Ed" + bytes(8) + sk.public_key().public_bytes_raw()).decode()
     v = minisign.verify_file(f, minisign.read_small(tmp_path / "f.minisig"), pub)
     assert v.trusted_comment.encode("utf-8", "surrogateescape") == comment
+
+
+# ── 2026-10-01 re-audit: N2, N5, N6, N8 ──────────────────────────────────────
+
+@pytest.mark.parametrize("target", ["file", "folder"])
+def test_encrypting_a_link_is_refused(tmp_path, needs_symlinks, target):
+    """N2: a link given directly would encrypt (or only store) the link, and shredding would
+    remove just the link while the plaintext stayed."""
+    real = tmp_path / "real"
+    if target == "file":
+        real.write_text("plaintext", encoding="utf-8")
+    else:
+        real.mkdir()
+        (real / "inside.txt").write_text("plaintext", encoding="utf-8")
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    out = tmp_path / "out"
+    with pytest.raises(LocksmithError, match="is a link"):
+        engine.encrypt_paths([link], out, EncryptOptions(password="pw", **FAST), verify=True)
+    assert not out.exists() or not any(out.iterdir())
+    assert link.is_symlink() and real.exists()
+
+
+def test_links_inside_a_folder_are_still_stored(tmp_path, needs_symlinks):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.txt").write_text("a", encoding="utf-8")
+    (src / "rel").symlink_to("a.txt")
+    enc = engine.encrypt_paths([src], tmp_path / "enc", EncryptOptions(password="pw", **FAST))
+    res = engine.decrypt_path(enc, tmp_path / "dec", PW)
+    assert (res.path / "rel").is_symlink() and os.readlink(res.path / "rel") == "a.txt"
+
+
+def test_disk_guard_stops_before_filling_the_disk(tmp_path, monkeypatch):
+    """N5: decryption stops while free space remains, and leaves nothing behind."""
+    from collections import namedtuple
+    usage = namedtuple("usage", "total used free")
+    enc = _encrypt(tmp_path, os.urandom(3 << 20))
+    monkeypatch.setattr(engine.shutil, "disk_usage", lambda p: usage(100 << 30, 99 << 30, 4 << 20))
+    out = tmp_path / "dec"
+    with pytest.raises(LocksmithError, match="before the disk filled up"):
+        engine.decrypt_path(enc, out, PW)
+    assert list(out.iterdir()) == []   # no .part file and no output
+
+
+def test_disk_guard_reserve(tmp_path, monkeypatch):
+    from collections import namedtuple
+    usage = namedtuple("usage", "total used free")
+    for total, free, reserve in ((100 << 30, 50 << 30, 2 << 30),     # 2% of the disk
+                                 (10 << 30, 9 << 30, 1 << 30),       # at least 1 GiB
+                                 (10 << 30, 600 << 20, 300 << 20)):  # never more than half of what is free
+        monkeypatch.setattr(engine.shutil, "disk_usage", lambda p, t=total, f=free: usage(t, t - f, f))
+        guard = engine._DiskGuard(tmp_path)
+        assert guard.reserve == reserve
+        guard.need(free - reserve)
+        with pytest.raises(LocksmithError):
+            guard.need(free - reserve + 1)
+
+
+def test_disk_guard_checks_each_extracted_member(tmp_path, monkeypatch):
+    """N5: a folder's members are checked before each is written (the archive is on disk too)."""
+    from collections import namedtuple
+    usage = namedtuple("usage", "total used free")
+    archive = _tar(tmp_path, [("d", None), ("d/small.txt", b"x"), ("d/big.bin", bytes(5 << 20))])
+    monkeypatch.setattr(engine.shutil, "disk_usage", lambda p: usage(100 << 30, 0, 8 << 20))
+    guard = engine._DiskGuard(tmp_path)
+    out = tmp_path / "out"
+    with pytest.raises(LocksmithError, match="before the disk filled up"):
+        engine.extract_archive(archive, out, space=guard)
+    assert not out.exists()
+
+
+def test_one_unwritable_member_does_not_lose_the_folder(tmp_path):
+    """N6: a name valid on Windows (90 CJK characters, 270 UTF-8 bytes) is over Linux's limit.
+    It is skipped and reported; everything else is extracted and the result isn't complete."""
+    long_name = "漢" * 90
+    archive = _tar(tmp_path, [("d", None), ("d/good.txt", b"good"), (f"d/{long_name}.txt", b"long")])
+    ext = engine.extract_archive(archive, tmp_path / "out")
+    assert (tmp_path / "out" / "d" / "good.txt").read_bytes() == b"good"
+    if osutil.IS_WINDOWS:   # 94 UTF-16 units: fine there
+        assert ext.skipped == []
+    else:
+        assert ext.skipped == [f"d/{long_name}.txt"]
+
+
+def test_long_member_name_makes_decrypt_incomplete(tmp_path, monkeypatch):
+    """N6 through decrypt_path: the folder opens, the long name is reported, the source is kept."""
+    long_name = "漢" * 90 + ".txt"
+    src = tmp_path / "proj"
+    src.mkdir()
+    (src / "good.txt").write_text("good", encoding="utf-8")
+    real_add = tarfile.TarFile.add
+
+    def add(self, name, arcname=None, *a, **kw):   # the long name can't exist on this disk: add it to the archive
+        real_add(self, name, arcname, *a, **kw)
+        if arcname != "proj":
+            return
+        info = tarfile.TarInfo(f"proj/{long_name}")
+        info.size = 4
+        self.addfile(info, io.BytesIO(b"long"))
+    monkeypatch.setattr(tarfile.TarFile, "add", add)
+    enc = engine.encrypt_paths([src], tmp_path / "enc", EncryptOptions(password="pw", **FAST))
+    monkeypatch.setattr(tarfile.TarFile, "add", real_add)
+    monkeypatch.setattr(engine, "_name_too_long", lambda part: part == long_name)   # as on Linux, everywhere
+    res = engine.decrypt_path(enc, tmp_path / "dec", PW)
+    assert (res.path / "good.txt").read_text(encoding="utf-8") == "good"
+    assert res.skipped == [f"proj/{long_name}"] and not res.complete
+
+
+def test_member_that_fails_to_be_created_is_skipped(tmp_path, monkeypatch):
+    """N6: an OSError on one member skips it (removing anything partly written) instead of
+    deleting what was already extracted."""
+    archive = _tar(tmp_path, [("d", None), ("d/a.txt", b"a"), ("d/bad.txt", b"partial"), ("d/z.txt", b"z")])
+    real = tarfile.TarFile.makefile
+
+    def makefile(self, tarinfo, targetpath):
+        if tarinfo.name.endswith("bad.txt"):
+            with open(targetpath, "wb") as f:
+                f.write(b"par")
+            raise OSError(errno.EIO, "I/O error")
+        return real(self, tarinfo, targetpath)
+    monkeypatch.setattr(tarfile.TarFile, "makefile", makefile)
+    ext = engine.extract_archive(archive, tmp_path / "out")
+    assert ext.skipped == ["d/bad.txt"]
+    assert sorted(p.name for p in (tmp_path / "out" / "d").iterdir()) == ["a.txt", "z.txt"]
+
+
+def test_full_disk_while_extracting_aborts(tmp_path, monkeypatch):
+    archive = _tar(tmp_path, [("d", None), ("d/a.txt", b"a"), ("d/b.txt", b"b")])
+
+    def makefile(self, tarinfo, targetpath):
+        raise OSError(errno.ENOSPC, "No space left on device")
+    monkeypatch.setattr(tarfile.TarFile, "makefile", makefile)
+    with pytest.raises(LocksmithError, match="unpack"):
+        engine.extract_archive(archive, tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
+def test_case_insensitive_destination_on_linux(tmp_path, monkeypatch):
+    """N8: FAT and exFAT drives (and casefolded folders) ignore case on Linux too, so a second
+    name differing only in case is skipped there, never written over the first."""
+    monkeypatch.setattr(engine, "_ignores_case", lambda folder: True)
+    archive = _tar(tmp_path, [("folder/Notes.txt", b"first"), ("folder/notes.txt", b"second")])
+    ext = engine.extract_archive(archive, tmp_path / "out")
+    assert ext.skipped == ["folder/notes.txt"]
+    assert (tmp_path / "out" / "folder" / "Notes.txt").read_bytes() == b"first"
+
+
+def test_case_collision_makes_decrypt_incomplete(tmp_path, monkeypatch):
+    src = tmp_path / "proj"
+    src.mkdir()
+    (src / "Notes.txt").write_text("first", encoding="utf-8")
+    try:
+        (src / "notes.txt").write_text("second", encoding="utf-8")
+    except OSError:
+        pytest.skip("this file system ignores case")
+    if len(list(src.iterdir())) != 2:
+        pytest.skip("this file system ignores case")
+    enc = engine.encrypt_paths([src], tmp_path / "enc", EncryptOptions(password="pw", **FAST))
+    monkeypatch.setattr(engine, "_ignores_case", lambda folder: True)
+    res = engine.decrypt_path(enc, tmp_path / "dec", PW)
+    assert len(res.skipped) == 1 and not res.complete
+
+
+def test_case_probe(tmp_path, monkeypatch):
+    """The probe answers for the real file system and leaves nothing behind."""
+    if not osutil.IS_WINDOWS:
+        (tmp_path / "probe").touch()
+        expected = (tmp_path / "PROBE").exists()
+        (tmp_path / "probe").unlink()
+        assert engine._ignores_case(tmp_path) is expected
+    assert list(tmp_path.iterdir()) == []
+    monkeypatch.setattr(engine, "IS_WINDOWS", False)
+    monkeypatch.setattr(engine, "open_new", lambda p: (_ for _ in ()).throw(OSError(errno.EACCES, "denied")))
+    assert engine._ignores_case(tmp_path)   # can't tell: assume it does, which only reports collisions
+
+
+def test_disk_guard_without_free_space_information(tmp_path, monkeypatch):
+    """Some network and FUSE file systems can't report free space: decryption goes on unguarded."""
+    def fail(path):
+        raise OSError(errno.ENOSYS, "not supported")
+    enc = _encrypt(tmp_path)
+    monkeypatch.setattr(engine.shutil, "disk_usage", fail)
+    assert engine.decrypt_path(enc, tmp_path / "dec", PW).path.exists()

@@ -1,5 +1,5 @@
 """Committed test vectors (tests/vectors) must keep opening, with the engine and with an
-independent reader written from docs/FORMAT.md. A failure here means this build can no
+second reader written from docs/FORMAT.md. A failure here means this build can no
 longer read files an earlier one wrote, or the specification no longer matches."""
 
 import hashlib
@@ -169,3 +169,27 @@ def test_locksmith_signatures_verify_with_the_specification(tmp_path):
     text = signing.sign_file(f, SIGNER, "cross-check ✓", created=1234)
     key, sig = spec_reader.verify_signature(text, f.read_bytes(), [spec_reader.public3(SIGNER)])
     assert (sig.comment, sig.created) == ("cross-check ✓", 1234)
+
+
+# ── the recipient list (FORMAT.md §7) ────────────────────────────────────────
+
+ADDRESSED = json.loads((HERE / "addressed-vectors.json").read_text(encoding="utf-8"))
+
+
+def test_addressed_vector_lists_the_classical_identity():
+    classical = bytes.fromhex(VECTORS["identities"]["classical"])
+    assert ADDRESSED["to"] == [spec_reader.recipient_entry(spec_reader.encryption_key(classical)).hex()]
+
+
+@pytest.mark.parametrize("reader", ADDRESSED["readers"], ids=[r["reader"] for r in ADDRESSED["readers"]])
+def test_addressed_vector_tells_each_reader_the_same(reader, tmp_path):
+    blob = (HERE / ADDRESSED["file"]).read_bytes()
+    spec, keys = _unlock(reader, tmp_path)
+    signer = spec_reader.public3(bytes.fromhex(VECTORS["identities"][ADDRESSED["signer"]]))
+    r = spec_reader.read(blob, **spec, verifiers=(signer,))
+    own = [spec_reader.encryption_key(spec["identity"])] if spec.get("identity") else []
+    assert hashlib.sha256(r["content"]).hexdigest() == ADDRESSED["content_sha256"]
+    assert spec_reader.addressed(r, own) == reader["intent"]
+    keys.verifiers = [signer]
+    res = engine.decrypt_bytes(blob, keys)
+    assert res.signature.verified and res.intent == reader["intent"]

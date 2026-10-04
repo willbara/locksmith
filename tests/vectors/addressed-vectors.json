@@ -1,0 +1,33 @@
+{
+  "name": "v2-signed-addressed-forwarded",
+  "file": "v2-signed-addressed-forwarded.locked",
+  "signer": "hybrid",
+  "slots": 3,
+  "to": [
+    "6bed3034b9ddd7fe4f053715d11f17bd4d99915bc43cebe711affaedb6d7e0e8"
+  ],
+  "content_sha256": "6ef79d3ce3db50ec21787bf9addf7d36666a8ee2cd9d4cd802416ad31937eb85",
+  "readers": [
+    {
+      "reader": "classical",
+      "unlock": {
+        "identity": "classical"
+      },
+      "intent": "listed"
+    },
+    {
+      "reader": "hybrid",
+      "unlock": {
+        "identity": "hybrid"
+      },
+      "intent": "not_listed"
+    },
+    {
+      "reader": "password",
+      "unlock": {
+        "password": "correct horse battery staple \u2713"
+      },
+      "intent": "password"
+    }
+  ]
+}

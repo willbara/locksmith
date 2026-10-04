@@ -224,3 +224,69 @@ def test_plan_reader_streams_in_small_reads(tmp_path):
         pieces = b"".join(iter(lambda: r.read(7), b""))
     with metadata.PlanReader(src, plan.plan) as r:
         assert pieces == r.read() and len(pieces) == plan.size and plan.removed > 0
+
+
+# ── N4: JFIF and Adobe segments, sPLT, animation frames ──────────────────────
+
+def _segments(jpg: bytes) -> list[tuple[int, bytes]]:
+    """(marker, payload) of each segment before the first scan."""
+    out, pos = [], 2
+    while jpg[pos + 1] != 0xDA:
+        marker, (length,) = jpg[pos + 1], struct.unpack(">H", jpg[pos + 2:pos + 4])
+        out.append((marker, jpg[pos + 4:pos + 2 + length]))
+        pos += 2 + length
+    return out
+
+
+def test_jpeg_app0_and_app14_keep_only_their_fixed_fields(tmp_path):
+    jpg, _ = _image("JPG")
+    assert jpg[2:4] == b"\xff\xe0", "Qt writes a JFIF segment first"
+    jfif = b"JFIF\x00\x01\x02\x01\x00\x48\x00\x48" + bytes([2, 1]) + b"THUMB1"   # a 2x1 RGB thumbnail
+    jfxx = b"JFXX\x00\x10" + b"\xff\xd8JFXX-SECRET uncropped\xff\xd9"
+    unknown = b"serial=SERIAL-SECRET owner=OWNER-SECRET"
+    adobe = b"Adobe\x00\x64\x00\x00\x00\x00\x01" + b"ADOBE-SECRET"
+    evil = jpg[:2] + _seg(0xE0, jfif) + _seg(0xE0, jfxx) + _seg(0xE0, unknown) + _seg(0xEE, adobe) + jpg[2:]
+    out, _ = _roundtrip(tmp_path, "photo.jpg", evil)
+    for s in (b"THUMB1", b"JFXX", b"SERIAL-SECRET", b"OWNER-SECRET", b"ADOBE-SECRET"):
+        assert s not in out, s
+    segs = _segments(out)
+    app0 = [p for m, p in segs if m == 0xE0]
+    app14 = [p for m, p in segs if m == 0xEE]
+    # The first JFIF segment, as its 14 bytes with no thumbnail; Qt's own one is a duplicate, dropped.
+    assert app0 == [jfif[:12] + b"\x00\x00"]
+    assert app14 == [adobe[:12]]
+    assert _decode(out).size() == _decode(jpg).size()
+
+
+def test_jpeg_short_jfif_and_adobe_are_dropped(tmp_path):
+    jpg, _ = _image("JPG")
+    body = jpg[2:]
+    body = body[2 + struct.unpack(">H", body[2:4])[0]:]    # without Qt's JFIF segment
+    evil = jpg[:2] + _seg(0xE0, b"JFIF\x00\x01") + _seg(0xEE, b"Adobe\x00") + body
+    out, _ = _roundtrip(tmp_path, "photo.jpg", evil)
+    assert [m for m, _ in _segments(out) if m in (0xE0, 0xEE)] == []
+    _decode(out)
+
+
+def test_png_splt_dropped(tmp_path):
+    png, img = _image("PNG")
+    iend = png.rindex(b"IEND") - 4
+    splt = _png_chunk(b"sPLT", b"PALETTE-NAME-SECRET\x00\x08" + bytes(6))
+    out, _ = _roundtrip(tmp_path, "shot.png", png[:iend] + splt + png[iend:])
+    assert b"sPLT" not in out and b"PALETTE-NAME-SECRET" not in out
+    assert _decode(out).convertToFormat(QImage.Format.Format_RGB32) == img
+
+
+def test_webp_animation_frames_keep_only_image_chunks(tmp_path):
+    simple, _ = _image("WEBP")
+    image_chunk = simple[12:]
+    frame_header = bytes(6) + (63).to_bytes(3, "little") + (47).to_bytes(3, "little") + bytes(4)
+    anmf = _webp_chunk(b"ANMF", frame_header + image_chunk + _webp_chunk(b"XTRA", b"FRAME-SECRET"))
+    vp8x = bytes([0x02, 0, 0, 0]) + (63).to_bytes(3, "little") + (47).to_bytes(3, "little")
+    body = b"WEBP" + _webp_chunk(b"VP8X", vp8x) + _webp_chunk(b"ANIM", bytes(6)) + anmf
+    out, _ = _roundtrip(tmp_path, "anim.webp", b"RIFF" + struct.pack("<I", len(body)) + body)
+    assert b"FRAME-SECRET" not in out and b"XTRA" not in out
+    pos = out.index(b"ANMF")
+    (size,) = struct.unpack("<I", out[pos + 4:pos + 8])
+    assert out[pos + 8:pos + 8 + size] == frame_header + image_chunk
+    assert struct.unpack("<I", out[4:8])[0] == len(out) - 8

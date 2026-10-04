@@ -6,11 +6,11 @@ from pathlib import Path
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import QApplication, QFileDialog, QPlainTextEdit, QVBoxLayout
 
-from ...core import keys
+from ...core import age, keys, qrdecode
 from ...core.errors import LocksmithError
-from ...core.keys import fingerprint, tpm_available
+from ...core.keys import fingerprint, tpm_available, write_secret_file
 from ...core.osutil import IS_WINDOWS
-from ...core.tools import same_secret
+from ...core.tools import open_regular, same_secret
 from .. import dialogs
 from ..dialogs import Sheet
 from ..widgets import (
@@ -29,6 +29,8 @@ from ..widgets import (
 )
 from ..workers import run_task
 from .common import show_key_qr
+
+MAX_IMAGE = 50 << 20
 
 
 class _KeyRow(Card):
@@ -69,7 +71,7 @@ class KeysPage(Page):
             "     so files sent to you also resist future quantum computers).\n"
             "2.  Send your public key to friends. It only lets people encrypt files for you.\n"
             "3.  Add their public keys as contacts, then pick them under Encrypt → Public keys.\n"
-            "Only the matching private key can open the file. It never leaves this device.\n"
+            "Only the matching private key can open the file. It stays on this device unless you back it up.\n"
             "Post-quantum identities also sign files (Tools), and their public key verifies the signatures.",
             "caption"))
         self.add(how)
@@ -131,20 +133,22 @@ class KeysPage(Page):
                 row.action("fingerprint", "Unlock once to add its signing keys to the public key",
                            lambda _=0, i=ident: self._remember_verify(i))
             row.action("copy", "Copy public key", lambda _=0, i=ident: self._copy(i.key_text))
+            row.action("share", "Copy as an age recipient (for age and rage)",
+                       lambda _=0, i=ident: self._copy_age(i))
             row.action("qr", "Show public key as QR", lambda _=0, i=ident: show_key_qr(i.name, i.key_raw))
             row.action("download", "Export backup", lambda _=0, i=ident: self._export(i))
             row.action("message", "Show backup words", lambda _=0, i=ident: self._backup_words(i))
+            row.action("file", "Save a printable paper backup (QR code and words)",
+                       lambda _=0, i=ident: self._paper_backup(i))
             row.action("scissors", "Split into Shamir shares", lambda _=0, i=ident: self._split_identity(i))
             row.action("trash", "Delete", lambda _=0, i=ident: self._delete_identity(i))
             self.ident_box.addWidget(row)
         if not self.store.contacts:
-            self.contact_box.addWidget(label("No contacts yet. Ask a friend for their “locksmith1…” key.",
-                                             "caption"))
+            self.contact_box.addWidget(label("No contacts yet. Ask a friend for their public key: a “locksmith…” "
+                                             "key, an age key (age1…) or an SSH key.", "caption"))
         for c in self.store.contacts:
             added = time.strftime("%d %b %Y", time.localtime(c.added))
-            kind = ("Post-quantum, verifies signatures" if c.can_verify else
-                    "Post-quantum" if len(c.public_raw) > 32 else "Classical")
-            row = _KeyRow(c.name, fingerprint(c.key_raw), f"{kind}  ·  added {added}")
+            row = _KeyRow(c.name, c.fingerprint, f"{c.kind}  ·  added {added}")
             row.action("copy", "Copy public key", lambda _=0, c=c: self._copy(c.public))
             row.action("trash", "Remove", lambda _=0, c=c: self._delete_contact(c))
             self.contact_box.addWidget(row)
@@ -157,6 +161,11 @@ class KeysPage(Page):
     def _copy(self, text):
         QApplication.clipboard().setText(text)
         toast("Public key copied", "copy")
+
+    def _copy_age(self, ident):
+        QApplication.clipboard().setText(age.recipient_text(ident.public_raw))
+        toast("age recipient copied. Post-quantum ones (age1pq1…) need age 1.3 or later." if ident.is_post_quantum
+              else "age recipient copied", "copy", 4000)
 
     def _new_identity(self):
         s = Sheet("New identity", "A key pair for receiving encrypted files.", icon="user")
@@ -181,9 +190,10 @@ class KeysPage(Page):
                  lambda m, k: dialogs.error(m), parent=self)
 
     def _add_contact(self):
-        s = Sheet("Add contact", "Paste the public key someone shared with you.", icon="user")
+        s = Sheet("Add contact", "Paste the public key someone shared with you: a Locksmith key, or an SSH "
+                  "Ed25519 or RSA key (one line of their .pub file).", icon="user")
         name = LineEdit("Name")
-        key = LineEdit("locksmith…", mono=True)
+        key = LineEdit("locksmith…  or  ssh-ed25519 AAAA…", mono=True)
         key.add_action("paste", "Paste", lambda: key.setText(QApplication.clipboard().text().strip()))
         s.add(name)
         s.add(key)
@@ -192,7 +202,7 @@ class KeysPage(Page):
         if not s.exec():
             return
         try:
-            raw = keys.decode_public(key.text())
+            raw = keys.decode_recipient(key.text())
             same = self.store.contact_with_encryption_key(raw)
             if same is not None and not same.can_verify and keys.can_verify(raw):
                 if not dialogs.confirm(
@@ -211,6 +221,13 @@ class KeysPage(Page):
             return
         self.reload(True)
         toast(done, "user")
+        if c.ssh is not None:
+            dialogs.info(f"Added {c.name}'s SSH key",
+                         f"Files you encrypt to this key open with {c.name}'s SSH private key. Check its fingerprint "
+                         f"with them: {c.fingerprint}. SSH keys are classical, so these files are not protected "
+                         "against future quantum computers."
+                         + (" Files with an SSH RSA recipient can't be opened by Locksmith 3.0 or earlier, even "
+                            "with a password." if c.ssh.key_type == "ssh-rsa" else ""), icon="user")
 
     def _export(self, ident):
         path, _ = QFileDialog.getSaveFileName(self, "Export identity backup",
@@ -265,6 +282,48 @@ class KeysPage(Page):
                               f"{len(words)} words. Restore them under Keys → Restore.", secret=True)
         self._with_private_key(ident, show)
 
+    def _paper_backup(self, ident):
+        if not dialogs.confirm("Save a paper backup?", "Saves a one-page PDF with this identity's QR code and backup "
+                               "words, to print and keep offline. " + self._RAW_WARNING + " Delete the PDF once it is "
+                               "printed.", ok="Choose where", icon="key"):
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Save paper backup", f"{ident.name} paper backup.pdf",
+                                              "PDF documents (*.pdf)")
+        if not path:
+            return
+
+        def save(raw):
+            from .. import paper
+            write_secret_file(Path(path), paper.render_pdf(ident.name, fingerprint(ident.key_raw), ident.created, raw))
+            toast("Paper backup saved. Print it, then delete the PDF.", "download", 5000)
+        self._with_private_key(ident, save)
+
+    def _scan_qr(self, box):
+        """Read a paper backup's QR code from a photo or scan into the restore box."""
+        path, _ = QFileDialog.getOpenFileName(self, "Choose a photo or scan of the paper backup", "",
+                                              "Images (*.png *.jpg *.jpeg *.bmp *.webp *.gif);;All files (*)")
+        if not path:
+            return
+        from .. import paper
+        try:
+            with open_regular(Path(path)) as f:
+                data = f.read(MAX_IMAGE + 1)
+            if len(data) > MAX_IMAGE:
+                raise LocksmithError("That image is too large.")
+            w, h, gray = paper.gray_pixels(paper.load_image(data))
+        except (LocksmithError, OSError, ValueError) as e:
+            dialogs.error(str(e) if isinstance(e, LocksmithError) else "That image can't be read.")
+            return
+
+        def done(text):
+            if not keys.is_paper_text(text):
+                dialogs.error("That QR code isn't a Locksmith paper backup.", "Not a paper backup")
+                return
+            box.setPlainText(text)
+            toast("Paper backup read. Check the name and choose Restore.", "check")
+        run_task(lambda r, c: qrdecode.decode(w, h, gray), done, lambda m, k: dialogs.error(m, "No QR code found"),
+                 parent=self)
+
     def _split_identity(self, ident):
         s = Sheet("Split into Shamir shares", "Give each share to a different person or place. Any chosen "
                   "number of them restores this identity; fewer reveal nothing.", icon="scissors")
@@ -288,7 +347,8 @@ class KeysPage(Page):
             "Restore them under Keys → Restore.", secret=True))
 
     def _restore(self):
-        s = Sheet("Restore an identity", "Type its backup words, or paste enough of its Shamir shares.",
+        s = Sheet("Restore an identity", "Type its backup words, scan its paper backup, paste enough of its Shamir "
+                  "shares, or paste an age identity (AGE-SECRET-KEY-…).",
                   width=620, icon="refresh")
         name = LineEdit("Name, e.g. “Work laptop”")
         s.add(name)
@@ -297,6 +357,10 @@ class KeysPage(Page):
         box.setProperty("mono", "true")
         box.setMinimumHeight(160)
         s.add(box)
+        scan = Button("Scan QR code…", "qr", "ghost")
+        scan.setToolTip("Read the QR code of a paper backup from a photo or scan")
+        scan.clicked.connect(lambda: self._scan_qr(box))
+        s.add(hrow(scan, None))
         s.add(label("PASSPHRASE (OPTIONAL)", "label"))
         pw = PasswordField("Protects the private key on this device", strength=True, generate=False)
         s.add(pw)
@@ -312,8 +376,14 @@ class KeysPage(Page):
             return
 
         def work(r, c):
-            raw = (keys.private_from_shares(text.split()) if "locksmithshare" in text
-                   else keys.private_from_words(text))
+            if keys.is_paper_text(text):
+                raw = keys.private_from_paper(text)
+            elif age.is_identity_text(text):
+                raw = age.parse_identity(text)
+            elif "locksmithshare" in text:
+                raw = keys.private_from_shares(text.split())
+            else:
+                raw = keys.private_from_words(text)
             return self.store.restore(n, raw, p)
 
         run_task(work, lambda ident: (self.reload(True), toast(f"Restored “{ident.name}”", "key")),

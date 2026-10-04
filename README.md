@@ -5,6 +5,11 @@
 A minimalist black-and-white desktop app to encrypt, decrypt and share files on Linux and Windows.
 Build it yourself as a single AppImage or a single Windows .exe.
 
+> **Status:** Locksmith has not been independently audited. It was built with AI-assisted review, and is
+> checked by its tests, fuzzing and published test vectors, which reduce the risk of mistakes but can't rule
+> them out. Don't let a Locksmith file be the only copy of data you can't afford to lose: keep another
+> backup.
+
 ## Build
 
 Needs `curl`, `tar`, `xz` and binutils (`ar`, `objdump`), plus internet access on the first build. No system
@@ -23,6 +28,9 @@ the AppImage's self-test. Set `SKIP_TESTS=1` to skip the tests and the self-test
 **Compatibility:** the AppImage runs on any Linux with glibc 2.34+ and a standard desktop: Ubuntu 22.04+,
 Debian 12+, Linux Mint 21+, Fedora 35+, RHEL/Rocky/Alma 9+, Arch. On older systems it exits with a clear
 message. `./packaging/test_distros.sh` checks this in podman containers of several distros.
+
+**Reproducible:** the same source and pinned inputs give a byte-identical AppImage;
+`./packaging/check_reproducible.sh` builds twice and compares.
 
 **Check a build:** `./dist/Locksmith-x86_64.AppImage --self-test` round-trips every cipher, compression method and
 key-derivation function, checks public-key encryption and memory protection, and builds the window offscreen.
@@ -81,13 +89,23 @@ docs/        file-format specification
   (AES + ChaCha20, AES + ChaCha20 + OCB3) with an independent key per layer.
 - **Key derivation:** Argon2id, scrypt or PBKDF2-SHA512, with four strength presets (Fast → Paranoid).
 - **Protection:** a password, a keyfile (second factor), public keys for any number of recipients, or any
-  combination. Each one wraps the same random file key.
+  combination. Each one wraps the same random file key, so the password, keyfile and recipients can be
+  changed later without encrypting the data again (Decrypt → Change who can open it). That doesn't take
+  access away from anyone who could already open the file; encrypting it again does.
 - **Keys:** identities (your key pairs) and contacts (other people's public keys). New identities are hybrid
   post-quantum (X25519 + ML-KEM-768) and can sign files (Ed25519 + ML-DSA-65); older classical ones can be
   upgraded. An identity can be protected
   with a passphrase, sealed to the machine's TPM, exported as a backup, written down as backup words, split
-  into Shamir shares, and shared as text or a QR code. Recipients stay anonymous: a file doesn't say who it
-  was encrypted for, and decoy slots can hide how many recipients there are.
+  into Shamir shares, saved as a printable paper backup (QR code and words, restored by photographing
+  or scanning the page), and shared as text or a QR code. Recipients aren't named in the file: it
+  doesn't list whose keys can open it, and decoy slots can hide how many recipients there are. A signed
+  file can optionally be addressed to its recipients, so a reader can tell whether they were one of them.
+- **SSH and age keys:** SSH Ed25519 and RSA public keys can be recipients, and the SSH private key opens
+  the file (passphrase-protected keys too). age keys (`age1…`, `age1pq1…`, `AGE-SECRET-KEY-…`) can be
+  added as contacts or restored as identities.
+- **age files:** encrypt to and decrypt `.age` files (age-encryption.org/v1), including age's
+  post-quantum recipients, so files can be exchanged with age and rage. Checked against the age
+  authors' test kit.
 - **Privacy:** optional lossless removal of photo metadata (JPEG, PNG, WebP: location, camera, dates), file
   times and archive owner names.
 - **Extras:** streaming chunked encryption with parallel per-chunk compression (Zstandard, zlib, LZMA,
@@ -97,8 +115,12 @@ docs/        file-format specification
   parts and join them, send encrypted text messages, show a password as a QR code, split a password among
   people with Shamir secret sharing, publish your public key.
 - **Tools:** password and passphrase generator, strength tester, checksums, file comparison, folder
-  manifests (`sha256sum --tag` compatible), detached signatures (sign and verify, `.lsig`), minisign and SSH
-  (`ssh-keygen -Y sign`) signature verification, keyfile generator, shredder.
+  manifests (`sha256sum --tag` compatible), detached signatures (sign and verify, `.lsig`), minisign, SSH
+  (`ssh-keygen -Y sign`) and OpenPGP (GnuPG `.sig`/`.asc`, against one public key, no keyring) signature
+  verification, recovery data (`.lpar`) that repairs files damaged by failing storage, keyfile generator,
+  shredder.
+- **Desktop integration:** Settings → Desktop integration opens `.locked` files with Locksmith and adds
+  "Encrypt with Locksmith" to the right-click menu of GNOME Files, Dolphin, Nemo and Windows Explorer.
 - **Interface:** dark, light or system theme, monochrome throughout.
 
 ## File format
@@ -108,8 +130,7 @@ docs/        file-format specification
 ```
 
 The full specification is [docs/FORMAT.md](docs/FORMAT.md), with test vectors in
-[tests/vectors](tests/vectors). What Locksmith does and doesn't protect against is in
-[docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
+[tests/vectors](tests/vectors).
 
 This is format version 2. Files in version 1 (Locksmith 2.x) are still read. Locksmith 2.0 replaced the
 format of Cryptor 1.x (the app's former name); Cryptor files and keys are not read.
@@ -134,15 +155,21 @@ format of Cryptor 1.x (the app's former name); Cryptor files and keys are not re
 
 ## Runtime protection
 
-- **Memory:** core dumps are disabled and the process is non-dumpable. A crash cannot write keys to disk,
-  and other programs running as you cannot read its memory.
-- **No network:** a seccomp filter on every thread stops Locksmith from creating any internet or other
+These are settings the process applies to itself at start-up. Settings → About shows which ones this
+system accepted. They narrow what other programs can reach; they don't defend against root, the kernel
+or malware that already controls your account.
+
+- **Memory:** the process is configured to disable core dumps and to be non-dumpable, so a crash shouldn't
+  write keys to disk and other programs running as you are refused access to its memory. Python can't
+  reliably erase secrets from memory once they are used, so this keeps that memory inside the process
+  rather than wiping it.
+- **No network:** a seccomp filter on every thread is configured to refuse creating any internet or other
   non-local socket. Programs it opens (file manager, mail) are started by systemd, outside the sandbox.
-- **Auto-lock and panic:** after inactivity (default 10 minutes), or with Ctrl+L, secrets are cleared from
+- **Auto-lock and panic:** after inactivity (default 10 minutes), or with Ctrl+L, secrets are removed from
   the window and it is covered. Ctrl+Shift+L also minimizes it. A task that finishes while locked doesn't
   show its secret result; after unlocking, you're told to open it again.
-- **Clipboard:** copied passwords and decrypted text are hidden from clipboard managers and cleared after
-  30 seconds, on lock and on quit.
+- **Clipboard:** copied passwords and decrypted text are marked so clipboard managers skip them, and cleared
+  after 30 seconds, on lock and on quit.
 
 The desktop portal refuses requests from a non-dumpable process, so Locksmith uses its own file dialogs and
 reads the system dark/light setting through a short-lived helper process. Settings → About shows the status.
@@ -156,6 +183,10 @@ protected with a passphrase (Argon2id + AES-GCM).
 
 - Shredding is best effort. SSDs and copy-on-write filesystems such as btrfs can keep old copies.
 - Losing the password, keyfile or private key means losing the data. There is no recovery.
+- Changing a file's password or recipients doesn't revoke access: anyone who opened it before may have
+  kept its file key. To take access away, decrypt it and encrypt it again.
+- SSH keys and classical age keys are not post-quantum. A file with an SSH RSA recipient can't be opened
+  by Locksmith 3.0 or earlier at all.
 - Unsigned files are not authenticated. Decrypting proves a file was not changed after it was made, not
   who made it: anyone with your public key can send you a file, and its name and note can claim anything.
   To show who made a file, sign it (Encrypt → Sign as, or a detached `.lsig` from Tools). A valid signature

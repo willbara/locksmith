@@ -1,9 +1,10 @@
 # Locksmith file format, version 2
 
 This document specifies everything needed to read and write Locksmith files and the related text
-formats (armor, public keys, Shamir shares, identity backups, checksum manifests, signing keys and
-detached signatures) without Locksmith's code. The test vectors in [`tests/vectors`](../tests/vectors) are files made to this specification;
-[`tests/spec_reader.py`](../tests/spec_reader.py) is an independent reader written from it, and
+formats (armor, public keys, Shamir shares, identity backups and paper backups, checksum manifests,
+signing keys, detached signatures and recovery data) without Locksmith's code, and how Locksmith's
+keys map onto age files (section 18). The test vectors in [`tests/vectors`](../tests/vectors) are files made to this specification;
+[`tests/spec_reader.py`](../tests/spec_reader.py) is a second reader written from it, and
 `tests/test_vectors.py` checks the two against each other.
 
 Locksmith writes version 2 and still reads version 1 (section 16).
@@ -53,7 +54,8 @@ bytes they read, never a re-serialisation, because their hash is authenticated (
 
 A random 32-byte data key (DEK) encrypts the file. Each slot wraps it under a key-encryption key (KEK):
 `w = AES-256-GCM(KEK, nonce = n, plaintext = DEK, aad = LABEL || "slot/" || t)`, so `w` is 48 bytes.
-Every slot has `t` (its type), `n` (base64, 12 bytes) and `w` (base64, 48 bytes). The writer shuffles
+Every slot has `t` (its type), `n` (base64, 12 bytes) and `w` (base64, 48 bytes). A reader rejects a
+slot type it doesn't know. The writer shuffles
 the slots, so their order says nothing.
 
 ### Password slot, `t = "pw"`
@@ -101,6 +103,38 @@ KEK        = HKDF(ss_m || ss_x, 32, salt = transcript, LABEL || "x25519-mlkem768
 
 The KEK stays secret unless both X25519 and ML-KEM-768 are broken.
 
+### SSH Ed25519 recipients
+
+An SSH Ed25519 public key (`ssh-ed25519`, RFC 8709) is converted to the X25519 key of the same secret
+and gets an ordinary `x25519` slot, so the file doesn't show that an SSH key is involved. With `y` the
+Ed25519 key read as a little-endian integer with its top bit cleared, and `p = 2^255 - 19`:
+
+```
+rpk = u = (1 + y) / (1 - y) mod p        (32 bytes, little-endian)
+```
+
+Writers reject keys with `y ≥ p`, `y = 1`, no valid `x` coordinate, or a low-order result. The SSH
+private key opens the slot with the X25519 private key `SHA-512(seed)[0..32]`, where `seed` is the
+32-byte Ed25519 private key; X25519 clamps it exactly as Ed25519 does. Such a slot is classical.
+
+### SSH RSA recipient slot, `t = "ssh-rsa"`
+
+An SSH RSA public key of 2048 to 16384 bits. `rpk` is its SSH wire encoding (RFC 4253 §6.6: the string
+`ssh-rsa`, then `e` and `n` as mpints). `c` is base64 of the RSA-OAEP ciphertext, exactly as long as
+the modulus:
+
+```
+secret = 32 random bytes
+c      = RSA-OAEP(rpk, secret, hash = SHA-256, MGF1 with SHA-256, label = LABEL || "ssh-rsa")
+KEK    = HKDF(secret, 32, salt = SHA-256(c || rpk), LABEL || "ssh-rsa")
+```
+
+The slot holds `t`, `c`, `n` and `w`, with `w` wrapped as for every slot (aad `LABEL || "slot/ssh-rsa"`).
+A slot names no key: a reader tries its RSA keys of the matching size on it. RSA is classical, and the
+length of `c` shows the key's size. RSA keys whose wire encoding is exactly 32 or 1216 bytes are not
+used, so a raw recipient key's length alone tells the kinds apart. Locksmith 3.0 and earlier don't know
+this slot type and refuse the whole file, whatever else could open it.
+
 ### Decoy slots
 
 A writer may add recipient slots for keys that are generated and immediately discarded, wrapping a
@@ -108,6 +142,20 @@ random value, to hide how many recipients there are (Locksmith rounds up to 8, 1
 within the 64-slot limit). Decoys are hybrid if any real recipient is, otherwise classical, so a file
 with both kinds still shows that it has at least one classical recipient. They are ordinary slots that
 no key opens, so readers need nothing special.
+
+### Changing the slots
+
+A writer that changes who can open a file (a new password or keyfile, recipients added or replaced)
+unlocks it, keeps `magic`, `kc`, the fixed header bytes and every frame exactly as they are, and writes
+a new slots array of 1 to 64 slots wrapping the same DEK, shuffled again. Nothing else is re-encrypted.
+Without a recipient's private key, its slot can't be told apart from other recipients' slots or from
+decoys, so a writer either keeps every recipient slot or replaces them all with a new list; it can't
+take out one. When it hides the number of recipients, it rounds the recipient slots up as above,
+counting the kept ones.
+
+A change revokes nothing. Anyone who could open the file before may have kept its DEK, which opens
+every copy, old or new, whatever its slots say. Taking access away means encrypting the content again
+under a new DEK.
 
 ## 4. Unlocking and key schedule
 
@@ -193,16 +241,35 @@ hold:
 | `created` | when the file was encrypted (Unix seconds) |
 | `items`   | number of items in a bundle |
 | `note`    | the sender's free text. Only a valid signature (section 15) vouches for it |
-| `to`      | reserved: the signer's intended recipients (see below) |
+| `to`      | the signer's intended recipients, in signed files only (see below) |
 
 Readers ignore unknown fields and fields of the wrong type.
 
-`to`, reserved for a later version of Locksmith, lists the recipients the signer addressed a signed
-file to: an array of base64 32-byte entries, each `SHA-256("locksmith/v2/recipient" || 0x00 || key)`
-where `key` is a recipient's raw encryption key exactly as in section 9 (the 32-byte X25519 key, or the
-1216-byte X25519 || ML-KEM-768 key, with no prefix or checksum). A reader tests every one of its own
-identities' encryption keys against it. It means something only in a signed file, because anyone who
-can open a file can rewrite its metadata; readers ignore it in unsigned files. For `dir` and `bundle`, the content is a
+`to` lists the recipients the signer addressed a signed file to: an array of 1 to 64 base64 32-byte
+entries, each `SHA-256("locksmith/v2/recipient" || 0x00 || key)` where `key` is a recipient's raw
+encryption key exactly as in section 9 (the 32-byte X25519 key, or the 1216-byte X25519 || ML-KEM-768
+key, with no prefix or checksum), the bytes its slot was made for: for an SSH Ed25519 recipient, its
+converted X25519 key, and for an SSH RSA recipient, its wire encoding (section 3). A writer lists only real recipients
+(never decoys), writes `to` only in a signed file, and refuses it for a file with no recipient slots: a
+password or keyfile has no key to list. The list keeps the signer's original intent: changing the slots
+later (section 3) leaves it as it was.
+
+`to` means something only when the file's signature verifies with a key the reader trusts (section 15),
+because anyone who can open a file can rewrite its metadata; readers ignore it in unsigned files, in
+files signed by an unknown key, and when it isn't an array of 1 to 64 such entries. A reader tests the
+encryption keys of every one of its own identities against it, not only the one that opened the file:
+
+- one of them is listed: the reader was addressed, and says nothing more;
+- none is listed and an identity's slot opened the file: the reader says it wasn't on the original
+  recipient list;
+- none is listed and a password or keyfile opened it: the reader says the file was addressed to
+  specific people and opened with its password, never that the reader was left off.
+
+Without `to`, a reader says nothing about whom a file was meant for. Everyone who can open a file can
+read its list, and so learn how many recipients were addressed, even when decoy slots hide that number
+from everyone else.
+
+For `dir` and `bundle`, the content is a
 POSIX (PAX) tar stream. A `dir` archive holds one top-level folder. Readers must extract only regular
 files, folders and links that stay inside the destination, and must refuse metadata headers over
 1 MiB and sparse members, which Locksmith never writes.
@@ -251,6 +318,11 @@ ML-KEM-768 seed). `locked` is `{"kdf": "argon2id", "p", "salt", "n", "c"}` with
 written as proquints: each 16 bits, big-endian, becomes consonant-vowel-consonant-vowel-consonant from
 `bdfghjklmnprstvz` (4 bits) and `aiou` (2 bits). That is 18 words for a classical key and 50 for a
 hybrid one. The words are the private key, with no passphrase.
+
+**Paper backup**: a printed page with the backup words and a QR code holding
+`LOCKSMITH-ID1:` followed by the base32 (RFC 4648, upper case, no padding) of the same bytes the
+words encode: the raw private key and its 4-byte checksum. QR codes store this text in their compact
+alphanumeric mode. Readers accept it in either case and check the checksum.
 
 **Identity shares**: Shamir shares (section 11) of `"LSI1" || raw private key`.
 
@@ -392,5 +464,72 @@ Version 1 files are still read, never written. They differ from version 2 as fol
 - `LABEL` is `locksmith/v1/` in every derivation and AEAD label of sections 3–7, including the hybrid
   slot's (`locksmith/v1/x25519-mlkem768`).
 - `kc == HKDF(DEK, 32, salt, LABEL || "commit")`: the commitment covers only the DEK.
-- Frames use `aad = SHA-256(header bytes exactly as stored)`, so they are bound to the slots too.
+- Frames use `aad = SHA-256(header bytes exactly as stored)`, so they are bound to the slots too:
+  changing who can open a version 1 file means encrypting it again.
 - Frame kinds are 0–2 only: version 1 files are never signed.
+
+## 17. Recovery data
+
+Recovery data is a separate file, by convention the protected file's name plus `.lpar`, that can
+repair storage damage to any file (Locksmith writes it for its own files on request). It doesn't
+change the protected file, and it protects against decay, not against tampering: someone who can
+change both files can change both consistently. Locksmith files are authenticated anyway.
+
+**Layout.** The protected file of `size` bytes is cut into `n = ceil(size / B)` data blocks of `B`
+bytes, the last one padded with zeros (blocks past the end are all zeros). With `k` data and `m`
+parity blocks per stripe, there are `S = max(1, ceil(n / k))` stripes, and data block `b` is at
+position `t = b div S` of stripe `j = b mod S`, so each stripe's blocks are spread evenly over the
+file. Writers choose `B` as a multiple of 4096 from 4096 to 1 MiB, and `(k, m)` as (200, 2), (80, 4),
+(40, 4) or (20, 4) (1, 5, 10 or 20% of the file).
+
+**Parity.** Over GF(2^8) with the polynomial `x^8 + x^4 + x^3 + x^2 + 1` (0x11D), parity block `i`
+of stripe `j` is, byte by byte,
+
+```
+P[j][i] = XOR over t of  C(i, t) · D[t·S + j]        C(i, t) = 1 / (i XOR (m + t))
+```
+
+for `i` from 0 to `m - 1` and `t` from 0 to `k - 1`. `C` is a Cauchy matrix, so any `m` lost blocks
+of a stripe (data or parity) can be rebuilt from the others by solving a small linear system.
+
+**File.**
+
+```
+"LOCKPAR" 0x01 || u32 len(meta) || meta || SHA-256(meta)
+parity blocks P[0][0], P[0][1], …, P[0][m-1], P[1][0], …   (S·m blocks of B bytes)
+meta || SHA-256(meta) || u32 len(meta) || "LOCKPAR" 0x02
+
+meta  = u32 len(header) || header || data hashes (n × 16 bytes) || parity hashes (S·m × 16 bytes)
+```
+
+`header` is UTF-8 JSON: `{"v": 1, "size", "block": B, "k", "m", "sha256": hex SHA-256 of the whole
+protected file, "name": its name when made}`. A block's hash is the first 16 bytes of SHA-256 of
+its bytes (a data block without its padding). The description is stored twice; a reader uses
+whichever copy matches its checksum and whose sizes add up to the file's length.
+
+**Repair.** A reader marks the data blocks whose hash differs (or that are missing) and the parity
+blocks whose hash differs, rebuilds each stripe with at most as many damaged data blocks as it
+has intact parity blocks, and accepts the result only if its SHA-256 equals `sha256`. A
+contiguous run of damage up to `m·S - 1` blocks long touches no stripe more than `m` times.
+
+## 18. age files
+
+Locksmith also reads and writes files in the age format (age-encryption.org/v1, specified at
+c2sp.org/age), for exchanging files with age and rage. Those files follow that specification, not
+this one; this section only says how Locksmith's keys take part.
+
+- A classical identity's 32-byte raw private key is an age X25519 identity (`AGE-SECRET-KEY-1…`),
+  and its public key is the `age1…` recipient.
+- An age post-quantum identity (`AGE-SECRET-KEY-PQ-1…`) is a 32-byte seed that X-Wing expands as
+  `SHAKE256(seed, 96) = d || z || sk_X`. Locksmith keeps it as the hybrid raw private key
+  `sk_X || d || z` (section 10): the X25519 key, then the ML-KEM-768 seed. The `age1pq1…` recipient
+  holds `pk_M || pk_X`; Locksmith's `locksmith2` key holds the same keys as `pk_X || pk_M`. So every
+  Locksmith hybrid identity opens `mlkem768x25519` stanzas and can be written as an `age1pq1…`
+  recipient, but not as a seed.
+- `ssh-ed25519` and `ssh-rsa` stanzas follow age's own rules for SSH keys, which differ from the
+  slots of section 3 (age tweaks the Ed25519 shared secret and names the key with a 4-byte tag).
+- Locksmith writes ChaCha20-Poly1305 payloads as age requires, with a passphrase (scrypt, work
+  factor 16 to 20) or with recipients, never both, and never post-quantum and classical recipients
+  in one file. It reads scrypt work factors up to 21. age files have no name, signature, padding or
+  note: Locksmith names the output after the file without `.age`, and stores a folder as a tar
+  archive (`name.tar.age`), which comes back as that archive.

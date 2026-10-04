@@ -2,7 +2,7 @@
 
     .venv/bin/python tests/vectors/make_v2_vectors.py
 
-The engine writes them; the independent reader (spec_reader.py) records what they must
+The engine writes them; the second reader (spec_reader.py) records what they must
 decrypt to, including each file's data key and, for signed files, the signature. The
 password, keyfile and identities come from vectors.json, whose version 1 files this
 leaves untouched. Only do this deliberately: encryption and ML-DSA signing are

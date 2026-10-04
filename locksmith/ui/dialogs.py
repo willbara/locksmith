@@ -110,6 +110,10 @@ class Sheet(QWidget):
             self._center()
         return False
 
+    def relayout(self):
+        """Resize the card after showing or hiding something in it."""
+        self._center()
+
     def _center(self):
         self.card.adjustSize()
         self.card.move((self.width() - self.card.width()) // 2,

@@ -3,13 +3,15 @@ from __future__ import annotations
 from PySide6.QtWidgets import QGridLayout
 
 from ... import __version__
-from ...core import compress, engine, kdf
+from ...core import compress, desktop, engine, kdf
 from ...core.ciphers import SUITES
+from ...core.errors import LocksmithError
 from ...core.keys import config_dir
 from ...core.osutil import IS_WINDOWS
+from .. import dialogs, host
 from ..settings import settings
 from ..theme import theme
-from ..widgets import Button, Card, Dropdown, Field, Page, ToggleRow, hrow, label
+from ..widgets import Button, Card, Dropdown, Field, Page, ToggleRow, hrow, label, toast
 from .common import open_url
 from .encrypt import THREADS
 
@@ -25,9 +27,9 @@ def protection_summary(h) -> list[str]:
             "TPM sealing: not available currently.",
         ]
     return [
-        "Memory protection: active (no core dumps, other programs cannot read this process's memory)"
-        if h.ok else "Memory protection: unavailable. " + " ".join(h.problems),
-        "Network: blocked. Locksmith cannot connect to the internet at all."
+        "Memory protection: on (core dumps disabled, other programs running as you refused access to this "
+        "process's memory)" if h.ok else "Memory protection: unavailable. " + " ".join(h.problems),
+        "Network block: on (a seccomp filter refuses internet sockets)"
         if h.network_blocked else "Network block: unavailable on this system.",
     ]
 
@@ -90,6 +92,7 @@ class SettingsPage(Page):
             ("bundle", "Bundle multiple items", "Encrypt several items into one file."),
             ("armor", "ASCII armor", "Produce text output instead of binary."),
             ("strip_metadata", "Remove photo metadata", "Strip location and camera details from images."),
+            ("recovery_data", "Add recovery data", "Save a .lpar file that can repair encrypted files later."),
             ("delete_after_decrypt", "Delete encrypted file after decrypting", ""),
             ("confirm_shred", "Confirm before shredding", ""),
         ):
@@ -97,6 +100,21 @@ class SettingsPage(Page):
             t.toggled.connect(lambda on, k=key: self._set(k, on))
             defaults.add(t)
         self.add(defaults)
+
+        integration = Card("Desktop integration", "Open .locked files with Locksmith, and add “Encrypt with "
+                           "Locksmith” to the file manager's right-click menu, for your account only.")
+        integration.add(label("Linux: GNOME Files (under Scripts), KDE Dolphin and Nemo, plus the application menu "
+                              "entry. Windows: Explorer (under “Show more options” on Windows 11). Each entry starts "
+                              "Locksmith from where it is now: add it again if you move it.", "caption"))
+        self.integration_state = label("", "caption")
+        integration.add(self.integration_state)
+        self.integrate = Button("Add to the desktop", "plus", "secondary")
+        self.integrate.clicked.connect(self._integrate)
+        self.unintegrate = Button("Remove", "trash", "ghost")
+        self.unintegrate.clicked.connect(self._unintegrate)
+        integration.add(hrow(self.integrate, self.unintegrate, None))
+        self.add(integration)
+        self._integration_status()
 
         about = Card("About")
         about.add(label(f"Locksmith {__version__}", "h2"))
@@ -114,6 +132,41 @@ class SettingsPage(Page):
         about.add(hrow(folder, None))
         self.add(about)
         self.finish()
+
+    def _integration_status(self):
+        on = desktop.installed()
+        self.integration_state.setText("Added: Locksmith opens .locked files and is in the right-click menu." if on else
+                                       "Not added.")
+        self.integrate.setText("Add again" if on else "Add to the desktop")
+        self.unintegrate.setEnabled(on)
+
+    def _integrate(self):
+        try:
+            if IS_WINDOWS:
+                desktop.install_windows()
+            else:
+                desktop.install_linux()
+                for args in desktop.refresh_commands():
+                    host.launch(args)   # refresh the desktop's caches; best effort
+        except (LocksmithError, OSError) as e:
+            dialogs.error(str(e), "Not added")
+            return
+        self._integration_status()
+        toast("Added to the desktop. Some file managers show it after they restart.", "check", 4500)
+
+    def _unintegrate(self):
+        try:
+            if IS_WINDOWS:
+                desktop.uninstall_windows()
+            else:
+                desktop.uninstall_linux()
+                for args in desktop.refresh_commands()[:2]:
+                    host.launch(args)
+        except OSError as e:
+            dialogs.error(str(e), "Not removed")
+            return
+        self._integration_status()
+        toast("Removed from the desktop", "trash")
 
     def _set(self, key, value):
         settings[key] = value

@@ -12,8 +12,8 @@ Complexity tags: **[Easy]** about a day or less · **[Medium]** a few days · **
 3. Format v2 (Part 1, "Format v2"). **Done:** the v2 container (fixed header and key slots kept apart, frames
    and the key commitment bound to the fixed header only), signed files, and the reserved `to` field
    (`intended_recipients`) in `docs/FORMAT.md` §7. Every file is now written as v2; v1 is still read. This is
-   version 3.0.0. **Still to build:** editing passwords,
-   keyfiles and recipients in place, the recipient-list UI, and the authenticated-encryption re-evaluation.
+   version 3.0.0. **Done since:** editing passwords, keyfiles and recipients in place (Decrypt → Change who can
+   open it), the recipient-list UI, and the authenticated-encryption re-evaluation (not built; see 1.2).
 
 ---
 
@@ -95,43 +95,72 @@ decide the bundle before building any of them.
     warning when the list and decoy slots are both enabled.
 - [x] **[Hard]** Extend the key commitment to cover the fixed header fields, so tampering fails at unlock.
   It must also exclude the key slots, so recipient, password and keyfile edits don't break it
-- [ ] **[Hard]** Change the password or keyfile without re-encrypting the data
-- [ ] **[Hard]** Add or remove recipients without re-encrypting the data. Removing a recipient does **not**
+- [x] **[Hard]** Change the password or keyfile without re-encrypting the data. `engine.change_access` rewrites
+  only the slots (FORMAT.md §3, "Changing the slots"); the UI is Decrypt → "Change who can open it…", which
+  unlocks with the page's inputs and asks before leaving the user unable to open the file
+- [x] **[Hard]** Add or remove recipients without re-encrypting the data. Removing a recipient does **not**
   revoke access for anyone who already has the file key and a copy of the data; the UI and docs must say so
   plainly. Real revocation means re-encrypting with a new file key
-- [ ] **[Hard]** Optional authenticated public-key encryption ("from Alice ✓"). Signed files in 1.1 plus the
+  - Recipient slots are anonymous, so a single recipient can't be picked out: the UI offers "keep them, add
+    more" or "replace them" with everyone who should keep access, and says why. The sheet, README and
+    FORMAT.md all state that a change revokes nothing.
+- [x] **[Hard]** Optional authenticated public-key encryption ("from Alice ✓"). Signed files in 1.1 plus the
   `intended_recipients` list may cover most of its use case, so re-evaluate it after signed files ship
+  - **Re-evaluated (2026-10-03): not built.** Signed files already give "signed with the key you saved as
+    Alice ✓", and the recipient list says whether the reader was addressed. What sender-authenticated
+    encryption would add is deniability (the reader can't prove to others who sent it). Against that:
+    a post-quantum version needs a post-quantum authenticated KEM, which isn't standardised (static X25519
+    authentication alone would be forgeable by a quantum computer, unlike the ML-DSA signatures we have);
+    it needs a new slot type that Locksmith 3.0 refuses, so a major version for a niche property; and two
+    ways to show a sender would confuse the "who made this" wording. Revisit if a standard PQ AKEM appears
+    and deniable messages become a concrete need.
 
 ## 1.3 Interop
 
-- [ ] **[Medium]** Accept SSH Ed25519 public keys as recipients (3–6 days). Convert to X25519 and reuse the
+- [x] **[Medium]** Accept SSH Ed25519 public keys as recipients (3–6 days). Convert to X25519 and reuse the
   `x25519` slot. Classical only. Decrypting with a passphrase-protected SSH key also needs the `bcrypt` module
   (3–5 days more, a new hash-locked dependency)
-- [ ] **[Hard]** Accept SSH RSA public keys as recipients
-- [ ] **[Hard]** Read and write age-compatible files
-- [ ] **[Hard]** OpenPGP signature verify-only (15–25 days hand-written, or 3–6 with `gpgv` on Linux only).
+  - Done: `core/sshkeys.py`; contacts store the SSH key line; Decrypt has an SSH key picker (the key is read
+    when needed, never stored). `bcrypt` 5.0.0 added to the lock. Vectors: `tests/interop/sshkeys` (made by
+    ssh-keygen) and `tests/vectors/v2-ssh-recipients.locked`.
+- [x] **[Hard]** Accept SSH RSA public keys as recipients
+  - New `ssh-rsa` slot (RSA-OAEP-SHA256, 2048–16384 bits, FORMAT.md §3). Locksmith 3.0 refuses files with
+    one, so under the SemVer rule the next release is 4.0.0; the Encrypt page warns when one is selected.
+- [x] **[Hard]** Read and write age-compatible files
+  - `core/age.py`: X25519, scrypt, ssh-ed25519, ssh-rsa and the post-quantum mlkem768x25519 (X-Wing in HPKE)
+    stanzas, armor, streaming. Passes all 147 vectors of the age authors' CCTV test kit
+    (`tests/interop/age-cctv`). Locksmith hybrid identities open age PQ files and export as `age1pq1…`.
+- [x] **[Hard]** OpenPGP signature verify-only (15–25 days hand-written, or 3–6 with `gpgv` on Linux only).
   Do this only if you have a concrete need to check OpenPGP-signed downloads. A narrow option is a v4 detached-signature
   verifier with a pinned key and no keyring
+  - Done as that narrow option: `core/openpgp.py` (v4, Ed25519/ECDSA/RSA, SHA-2/SHA-3, subkeys with
+    back-signatures, revocation and expiry), Tools card, vectors from GnuPG 2.4.9 in `tests/interop/openpgp`.
 - [ ] **[Deferred]** OpenPGP encrypt, decrypt and sign. Months of work, plus the RFC 9580 vs LibrePGP split
 
 ## 1.4 Identity backup
 
-- [ ] **[Medium]** Printable paper backup (QR + words)
-- [ ] **[Hard]** Restore an identity by scanning the paper backup's QR code
+- [x] **[Medium]** Printable paper backup (QR + words). Keys → identity → "Save a printable paper backup"
+  writes an owner-only one-page PDF (FORMAT.md §10).
+- [x] **[Hard]** Restore an identity by scanning the paper backup's QR code. Keys → Restore → "Scan QR code…"
+  reads a photo or scan with a pure-Python QR reader (`core/qrdecode.py`, no new dependency); the AppImage
+  and .exe now bundle Qt's JPEG and WebP image plugins for photos. A webcam isn't used.
 
 ## 1.5 Smaller features
 
-- [ ] **[Medium]** File manager integration: a right-click "Encrypt with Locksmith" and a `.locked` file association
-- [ ] **[Hard]** Recovery data (parity records) for long-term archives
+- [x] **[Medium]** File manager integration: a right-click "Encrypt with Locksmith" and a `.locked` file association.
+  Settings → Desktop integration (GNOME Files, Dolphin, Nemo, Windows Explorer; current user only)
+- [x] **[Hard]** Recovery data (parity records) for long-term archives. `.lpar` sidecar files (FORMAT.md §17,
+  Reed-Solomon/Cauchy over GF(256), spread stripes); Tools card and an Encrypt option
 
 ## 1.6 Trust and hardening
 
-- [ ] **[Easy]** Add a status note near the top of the README: not independently audited, built with AI-assisted
+- [x] **[Easy]** Add a status note near the top of the README: not independently audited, built with AI-assisted
   review, tests and fuzzing, not the only copy of irreplaceable data
-- [ ] **[Easy]** Soften absolute claims in the README and FORMAT.md: "independent reader" → "second reader",
+- [x] **[Easy]** Soften absolute claims in the README and FORMAT.md: "independent reader" → "second reader",
   runtime protections → "configured to", "Recipients stay anonymous" → "recipients aren't named in the file", and
   any implication that secrets are cleared from Python memory
-- [ ] **[Medium]** Reproducible builds
+- [x] **[Medium]** Reproducible builds. `SOURCE_DATE_EPOCH`, fixed hash seed and file times in the build scripts;
+  `packaging/check_reproducible.sh` built the AppImage twice with identical results (2026-10-03)
 - [ ] **[Hard]** Independent audit (long term)
 
 ---
@@ -180,7 +209,7 @@ passes after.
 
 ## 2.2 Shredding
 
-- [ ] **[Easy]** **N2: Encrypt-and-shred on a symlink leaves the original in place**
+- [x] **[Easy]** **N2: Encrypt-and-shred on a symlink leaves the original in place**
   - **Problem:** the file list keeps paths as given (`abspath`, not resolved). For a symlink to a file,
     `encrypt_paths` encrypts the target's contents, but `tools.shred` only unlinks the link: the plaintext target
     survives while the app reports it shredded. For a symlink to a folder, `tarfile.add` stores only the link, so
@@ -197,13 +226,15 @@ passes after.
 
 ## 2.3 Decrypt and extraction safety
 
-- [ ] **[Easy]** **N5: Decrypting a crafted file can fill the disk**
+- [x] **[Easy]** **N5: Decrypting a crafted file can fill the disk**
   - **Problem:** the earlier 4.4 fix capped only in-memory output. `decrypt_path` still writes everything a file
     expands to, so a few MB at ~22,000:1 becomes tens of GiB in the output folder (twice that for a folder: the
     `.part` archive plus the extracted copy). The `.part` file is deleted on ENOSPC, but until then the disk is
     full and other programs' writes fail, which can corrupt their data. (Sparse archive members are already
     refused by the N1 fix.)
   - **Where:** `locksmith/core/engine.py:770-840`, `engine.py:1129-1192`, `engine.py:1259-1310`
+  - **Done:** the reserve is also capped at half the space free when decryption starts, so a nearly full disk
+    still never fills up while small files still decrypt there.
   - **Fix:** in `decrypt_path`, check `shutil.disk_usage(out_dir).free` every batch. Stop with a clear
     `LocksmithError` when continuing would leave less than a reserve (for example, the larger of 1 GiB and 2% of
     the disk). A legitimate file that doesn't fit fails the same way, only earlier and without filling the disk.
@@ -211,7 +242,7 @@ passes after.
   - **Test:** monkeypatch `shutil.disk_usage` to report little free space and assert `decrypt_path` stops with
     `LocksmithError` and leaves no `.part` file.
 
-- [ ] **[Medium]** **N6: One member that can't be created makes the whole folder fail to extract**
+- [x] **[Medium]** **N6: One member that can't be created makes the whole folder fail to extract**
   - **Problem:** `extractall` treats an `OSError` on any member as fatal, and `extract_archive` then deletes
     everything already extracted. Confirmed: a folder holding `good.txt` and one file named with 90 CJK characters
     (270 bytes in UTF-8: valid on Windows, over Linux's 255-byte limit) fails with "File name too long", and
@@ -227,7 +258,7 @@ passes after.
   - **Test:** extract the two-member archive above. `good.txt` exists, the long name is in `skipped`, and
     `decrypt_path` reports `complete=False`.
 
-- [ ] **[Medium]** **N8: Case collisions still overwrite on case-insensitive drives under Linux (UNSURE)**
+- [x] **[Medium]** **N8: Case collisions still overwrite on case-insensitive drives under Linux (UNSURE)**
   - **Problem:** the earlier 5.2 fix compares names without case only when `IS_WINDOWS`. On Linux, FAT32 and exFAT
     USB drives (and casefolded ext4 folders) are case-insensitive too. Decrypting a folder holding `Notes.txt` and
     `notes.txt` onto one should let the second overwrite the first, report `complete=True`, and let delete-after
@@ -237,10 +268,14 @@ passes after.
     file in `dest` and check whether its case-swapped name exists. Casefold the key when it does.
   - **Test:** monkeypatch the probe to report a case-insensitive destination on Linux. The second name is skipped
     and `complete` is false. Then reproduce on a real exFAT image (loop mount) and record the result in this entry.
+  - **Reproduced (2026-10-03)** on a 64 MiB exFAT image loop-mounted with udisksctl, decrypting a folder with
+    `Notes.txt` ("first") and `notes.txt` ("second"): the code at `5026116` left one `Notes.txt` holding "second"
+    and reported `complete=True` (so delete-after would have removed the only copy of "first"). With the fix,
+    `Notes.txt` holds "first", `proj/notes.txt` is reported skipped, and `complete` is false.
 
 ## 2.4 Metadata privacy
 
-- [ ] **[Medium]** **N4: JPEG metadata stripping keeps any APP0 and APP14 segment verbatim**
+- [x] **[Medium]** **N4: JPEG metadata stripping keeps any APP0 and APP14 segment verbatim**
   - **Problem:** APP0 (`0xE0`) and Adobe APP14 (`0xEE`) are kept by marker alone, whatever they contain. Confirmed
     kept: a JFIF thumbnail, a JFXX thumbnail (a full embedded JPEG, which after a crop can still show the
     uncropped original), an unknown APP0 carrying `serial=… owner=…`, and extra bytes after the Adobe fields. This

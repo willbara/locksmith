@@ -112,8 +112,9 @@ def _read(f, off, n) -> bytes:
     return data
 
 
-# Segments a decoder needs, besides the APPn kept below: SOFn, DHT and DAC (C0-CF),
-# DQT, DNL, DRI, DHP and EXP (DB-DF). Anything else (APPn, COM, JPGn extensions) is dropped.
+# Segments a decoder needs, besides the APPn kept below (rewritten to their fixed fields,
+# except the colour profile): SOFn, DHT and DAC (C0-CF), DQT, DNL, DRI, DHP and EXP (DB-DF).
+# Anything else (other APPn, COM, JPGn extensions) is dropped.
 JPEG_KEEP = set(range(0xC0, 0xD0)) | set(range(0xDB, 0xE0))
 
 
@@ -121,6 +122,7 @@ def _plan_jpeg(f, size) -> Plan:
     plan: Plan = [(0, 2)]  # SOI
     pos = 2
     scanned = False
+    rewritten: set[str] = set()   # JFIF and Adobe segments are kept once
     while pos < size:
         if _read(f, pos, 1) != b"\xff":
             raise ValueError("expected a marker")
@@ -149,22 +151,31 @@ def _plan_jpeg(f, size) -> Plan:
             plan.append((pos, scan_end - pos))
             pos, scanned = scan_end, True
             continue
-        body = _read(f, pos + 4, min(length - 2, 64 << 10)) if marker in (0xE1, 0xE2) else b""
+        body = _read(f, pos + 4, min(length - 2, 64 << 10)) if marker in (0xE0, 0xE1, 0xE2, 0xEE) else b""
         if marker == 0xE1 and body.startswith(b"Exif\x00\x00") and not scanned:
             # Replace the whole EXIF block, in place, by one holding only the orientation.
             orientation = _read_orientation(_read(f, pos + 4, length - 2)[6:])
             if orientation and orientation != 1:
                 plan.append(_exif_orientation(orientation))
-        keep = (marker == 0xE0                                         # JFIF
-                or (marker == 0xE2 and body.startswith(b"ICC_PROFILE\x00"))  # colour profile
-                or marker == 0xEE                                      # Adobe (colour transform)
-                or marker in JPEG_KEEP)
-        if keep:
+        elif marker == 0xE0 and "jfif" not in rewritten and body.startswith(b"JFIF\x00") and len(body) >= 14:
+            # JFIF: only its version, density units and densities, never its thumbnail.
+            # JFXX (an extension holding a whole thumbnail JPEG) and other APP0 are dropped.
+            rewritten.add("jfif")
+            plan.append(_segment(0xE0, body[:12] + b"\x00\x00"))
+        elif marker == 0xEE and "adobe" not in rewritten and body.startswith(b"Adobe") and len(body) >= 12:
+            # Adobe: its fixed 12 bytes (version, flags, colour transform), nothing after them.
+            rewritten.add("adobe")
+            plan.append(_segment(0xEE, body[:12]))
+        elif (marker == 0xE2 and body.startswith(b"ICC_PROFILE\x00")) or marker in JPEG_KEEP:  # colour profile
             plan.append((pos, end - pos))
         pos = end
     if not scanned:
         raise ValueError("no image data")
     return plan  # truncated after its image data: keep what is there, as viewers do
+
+
+def _segment(marker: int, payload: bytes) -> bytes:
+    return bytes((0xFF, marker)) + struct.pack(">H", len(payload) + 2) + payload
 
 
 def _scan_end(f, pos: int, size: int) -> int:
@@ -213,8 +224,9 @@ def _exif_orientation(value: int) -> bytes:
 
 # ── PNG ──────────────────────────────────────────────────────────────────────
 
+# sPLT is left out: it carries a free-text palette name, and no decoder needs it.
 PNG_KEEP = {b"IHDR", b"PLTE", b"IDAT", b"IEND", b"tRNS", b"gAMA", b"cHRM", b"sRGB", b"iCCP", b"sBIT",
-            b"bKGD", b"hIST", b"sPLT", b"cICP", b"mDCv", b"cLLi", b"acTL", b"fcTL", b"fdAT"}
+            b"bKGD", b"hIST", b"cICP", b"mDCv", b"cLLi", b"acTL", b"fcTL", b"fdAT"}
 
 
 def _plan_png(f, size) -> Plan:
@@ -235,7 +247,8 @@ def _plan_png(f, size) -> Plan:
 
 # ── WebP ─────────────────────────────────────────────────────────────────────
 
-WEBP_KEEP = {b"VP8 ", b"VP8L", b"VP8X", b"ICCP", b"ANIM", b"ANMF", b"ALPH"}
+WEBP_KEEP = {b"VP8 ", b"VP8L", b"VP8X", b"ICCP", b"ANIM", b"ALPH"}
+ANMF_KEEP = {b"ALPH", b"VP8 ", b"VP8L"}   # an animation frame's image; it may also hold unknown chunks
 
 
 def _plan_webp(f, size) -> Plan:
@@ -252,8 +265,29 @@ def _plan_webp(f, size) -> Plan:
             data = bytearray(_read(f, pos + 8, length))
             data[0] &= ~0x0C & 0xFF      # clear the EXIF (0x08) and XMP (0x04) flags
             chunks.append(_read(f, pos, 8) + bytes(data) + (b"\x00" if length & 1 else b""))
+        elif fourcc == b"ANMF":
+            chunks.extend(_webp_frame(f, pos, length))
         elif fourcc in WEBP_KEEP:
             chunks.append((pos, 8 + padded))
         pos += 8 + padded
     body = sum(len(c) if isinstance(c, bytes) else c[1] for c in chunks)
     return [b"RIFF" + struct.pack("<I", 4 + body) + b"WEBP", *chunks]
+
+
+def _webp_frame(f, pos: int, length: int) -> Plan:
+    """An ANMF chunk rebuilt with only its 16-byte frame header and image sub-chunks."""
+    if length < 16:
+        raise ValueError("short animation frame")
+    end = pos + 8 + length
+    parts: Plan = [(pos + 8, 16)]
+    sub = pos + 24
+    while sub + 8 <= end:
+        fourcc, n = struct.unpack("<4sI", _read(f, sub, 8))
+        padded = n + (n & 1)
+        if sub + 8 + padded > end:
+            raise ValueError("truncated frame chunk")
+        if fourcc in ANMF_KEEP:
+            parts.append((sub, 8 + padded))
+        sub += 8 + padded
+    body = sum(len(c) if isinstance(c, bytes) else c[1] for c in parts)
+    return [b"ANMF" + struct.pack("<I", body), *parts]

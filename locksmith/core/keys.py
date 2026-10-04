@@ -40,7 +40,7 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-from . import kdf
+from . import age, kdf, sshkeys
 from .errors import LocksmithError, WrongKeyError
 from .osutil import config_base, fsync_dir, open_new
 from .sysenv import clean_env
@@ -205,6 +205,16 @@ def check_public(raw: bytes):
             raise LocksmithError("That public key's signing part is not valid.") from None
 
 
+def decode_recipient(text: str) -> bytes:
+    """The key files are encrypted to, from a key someone shared: a Locksmith public key, an age
+    recipient (age1… or age1pq1…), or an SSH Ed25519 or RSA public key (docs/FORMAT.md §3)."""
+    if sshkeys.is_ssh_text(text):
+        return sshkeys.parse_recipient(text).raw
+    if age.is_recipient_text(text):
+        return age.parse_recipient_key(text)   # the same keys as locksmith1 / locksmith2, written for age
+    return decode_public(text)
+
+
 def encode_public(raw: bytes) -> str:
     check = hashlib.sha256(raw).digest()[:4]
     return PREFIXES[len(raw)] + base64.urlsafe_b64encode(raw + check).decode().rstrip("=")
@@ -286,6 +296,36 @@ def private_from_words(text: str) -> bytes:
     raw, check = bytes(data[:-4]), bytes(data[-4:])
     if not secrets.compare_digest(_words_check(raw), check):
         raise LocksmithError("The words have a typo: their checksum doesn't match.")
+    return raw
+
+
+PAPER_PREFIX = "LOCKSMITH-ID1:"   # a paper backup's QR code (FORMAT.md §10)
+
+
+def paper_qr_text(raw: bytes) -> str:
+    """What a paper backup's QR code holds: the backup words' bytes (the raw private key and its
+    checksum) in base32, which QR codes store compactly as alphanumeric text."""
+    if len(raw) not in (X25519_LEN, HYBRID_PRIVATE_LEN):
+        raise LocksmithError("That private key can't be written on a paper backup.")
+    return PAPER_PREFIX + base64.b32encode(raw + _words_check(raw)).decode().rstrip("=")
+
+
+def is_paper_text(text: str) -> bool:
+    return text.strip().upper().startswith(PAPER_PREFIX)
+
+
+def private_from_paper(text: str) -> bytes:
+    """The raw private key in a paper backup's QR code, checked against its checksum."""
+    body = "".join(text.split())[len(PAPER_PREFIX):].upper()
+    if len(body) not in (-(-(X25519_LEN + 4) * 8 // 5), -(-(HYBRID_PRIVATE_LEN + 4) * 8 // 5)):
+        raise LocksmithError("That QR code is not a complete Locksmith paper backup.")
+    try:
+        data = base64.b32decode(body + "=" * (-len(body) % 8))
+    except (ValueError, binascii.Error):
+        raise LocksmithError("That QR code is not a Locksmith paper backup.") from None
+    raw, check = data[:-4], data[-4:]
+    if not secrets.compare_digest(_words_check(raw), check):
+        raise LocksmithError("The paper backup's checksum doesn't match: the code was misread or damaged.")
     return raw
 
 
@@ -432,12 +472,32 @@ class Identity:
 @dataclass
 class Contact:
     name: str
-    public: str               # encoded public key, including any verify keys (locksmith3)
+    public: str               # encoded public key, including any verify keys (locksmith3), or an SSH key line
     added: int
 
     @property
+    def ssh(self) -> sshkeys.SshRecipient | None:
+        return sshkeys.parse_recipient(self.public) if sshkeys.is_ssh_text(self.public) else None
+
+    @property
     def key_raw(self) -> bytes:
-        return decode_public(self.public)
+        ssh = self.ssh
+        return ssh.raw if ssh else decode_public(self.public)
+
+    @property
+    def fingerprint(self) -> str:
+        """The fingerprint its owner sees: SSH keys use SSH's own (as ``ssh-keygen -l`` prints it)."""
+        ssh = self.ssh
+        return ssh.fingerprint if ssh else fingerprint(self.key_raw)
+
+    @property
+    def kind(self) -> str:
+        ssh = self.ssh
+        if ssh:
+            return f"{ssh.label}, classical"
+        if self.can_verify:
+            return "Post-quantum, verifies signatures"
+        return "Post-quantum" if len(self.public_raw) > X25519_LEN else "Classical"
 
     @property
     def public_raw(self) -> bytes:
@@ -488,7 +548,7 @@ def _from_dict(cls, data):
     when = obj.created if cls is Identity else obj.added
     if isinstance(when, bool) or not isinstance(when, int):
         raise TypeError
-    decode_public(obj.public)
+    decode_public(obj.public) if cls is Identity else decode_recipient(obj.public)
     return obj
 
 
@@ -637,8 +697,8 @@ class KeyStore:
         return next((c for c in self.contacts if c.public_raw == part), None)
 
     def add_contact(self, name: str, public_text: str) -> Contact:
-        raw = decode_public(public_text)
-        encoded = encode_public(raw)
+        raw = decode_recipient(public_text)
+        encoded = sshkeys.parse_recipient(public_text).text if sshkeys.is_ssh_text(public_text) else encode_public(raw)
         same = self.contact_with_encryption_key(raw)
         if same is not None:
             if same.public == encoded or (same.can_verify and not can_verify(raw)):

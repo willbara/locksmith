@@ -28,6 +28,7 @@ nothing but the DEK, so they can change without re-encrypting the frames.
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import hmac
 import io
@@ -35,6 +36,7 @@ import json
 import os
 import secrets
 import shutil
+import stat
 import struct
 import tarfile
 import threading
@@ -58,7 +60,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from . import compress as comp
 from . import kdf as kdfmod
-from . import metadata, scratch, signing
+from . import metadata, scratch, signing, sshkeys
 from .ciphers import NONCE_SIZE, SUITES, SuiteCipher, layer_key_sizes
 from .errors import CancelledError, CorruptedError, LocksmithError, WrongKeyError
 from .osutil import (
@@ -66,6 +68,7 @@ from .osutil import (
     copy_zone_identifier,
     fsync_dir,
     fsync_tree,
+    is_link,
     mark_untrusted,
     open_new,
     portable_name,
@@ -97,6 +100,8 @@ def looks_encrypted(head: bytes) -> bool:
     """True if the first bytes are a Locksmith signature."""
     return head[:6] == b"LOCKED"
 HYBRID = "x25519-mlkem768"
+SSH_RSA = "ssh-rsa"
+RECIPIENT_SLOTS = ("x25519", HYBRID, SSH_RSA)
 X25519_LEN, MLKEM_PUBLIC_LEN, MLKEM_SEED_LEN, MLKEM_CT_LEN = 32, 1184, 64, 1088
 EXTENSION = ".locked"
 ARMOR_BEGIN = "-----BEGIN LOCKSMITH MESSAGE-----"
@@ -155,13 +160,16 @@ class EncryptOptions:
     threads: int = 0                        # 0 = automatic
     password: str | None = None
     keyfile: str | None = None
-    recipients: list[bytes] = field(default_factory=list)  # raw X25519 keys
+    # Raw keys files are encrypted to: X25519 (32 bytes), X25519 + ML-KEM-768 (1216), or an
+    # SSH RSA key blob (sshkeys; any other length, starting with the ssh-rsa type).
+    recipients: list[bytes] = field(default_factory=list)
     hide_name: bool = False
     note: str = ""
     armor: bool = False
     strip_metadata: bool = False   # JPEG/PNG/WebP metadata, file times and archive owner names
     hide_recipients: bool = False  # pad recipient slots with dummies so their number is hidden
     signer: bytes | None = None    # raw hybrid private key: sign the file (FORMAT.md §15)
+    address_to: bool = False       # list the recipients in the signed metadata ("to", FORMAT.md §7)
 
 
 @dataclass
@@ -170,6 +178,10 @@ class DecryptKeys:
     keyfile: str | None = None
     identities: list[bytes] = field(default_factory=list)  # raw X25519 private
     verifiers: list[bytes] = field(default_factory=list)   # raw locksmith3 keys whose signatures count
+    # The encryption keys of all the reader's identities, including locked ones, checked against
+    # a signed file's recipient list. The public keys of ``identities`` are always included.
+    own_keys: list[bytes] = field(default_factory=list)
+    ssh: list[sshkeys.SshIdentity] = field(default_factory=list)   # SSH private keys (Ed25519, RSA)
 
 
 @dataclass
@@ -182,6 +194,7 @@ class FileInfo:
     header_size: int
     format_name: str = "Locksmith"
     post_quantum_slots: int = 0
+    format_version: int = 2
 
     @property
     def suite_label(self) -> str:
@@ -199,6 +212,10 @@ class DecryptResult:
     # source can be deleted. Anything skipped, renamed or not flushed makes it False.
     complete: bool = False
     signature: signing.LockedSignature | None = None   # None: the file isn't signed
+    # For a validly signed file with a recipient list: "listed" (one of the reader's keys is on
+    # it), "not_listed" (opened with a key that isn't) or "password" (opened with a password or
+    # keyfile). None: no list, or no signature that vouches for it.
+    intent: str | None = None
 
 
 @dataclass
@@ -314,27 +331,86 @@ def validate_options(opts: EncryptOptions):
         raise LocksmithError("Thread count is out of range.")
     if not (opts.password or opts.keyfile or opts.recipients):
         raise LocksmithError("Add a password, a keyfile or at least one recipient.")
-    if opts.keyfile:
-        try:
-            size = os.path.getsize(opts.keyfile)
-        except OSError as e:
-            raise LocksmithError(f"Cannot read the keyfile: {e.strerror}") from e
-        if size == 0:
-            raise LocksmithError("The keyfile is empty, so it adds no secret.")
-        if not opts.password and size < MIN_KEYFILE_ONLY:
-            raise LocksmithError(f"A keyfile used without a password must be at least "
-                               f"{MIN_KEYFILE_ONLY} bytes of random data.")
-    for rpk in opts.recipients:
-        if not isinstance(rpk, bytes) or len(rpk) not in (X25519_LEN, X25519_LEN + MLKEM_PUBLIC_LEN):
-            raise LocksmithError("A recipient's public key is invalid.")
+    _check_keyfile(opts.password, opts.keyfile)
+    _check_recipients(opts.recipients)
     if opts.signer is not None:
         signing.check_signer(opts.signer)
+    if opts.address_to:
+        if not opts.recipients:
+            raise LocksmithError("Only files with public-key recipients can be addressed to specific people: a "
+                                 "password or keyfile has no key to list.")
+        if opts.signer is None:
+            raise LocksmithError("A recipient list only counts in a signed file. Choose who to sign as.")
     # The reader accepts at most MAX_SLOTS slots: never write a file it would refuse.
     opts.recipients = list(dict.fromkeys(opts.recipients))  # a repeated key adds nothing
     slots = len(opts.recipients) + bool(opts.password or opts.keyfile)
     if slots > MAX_SLOTS:
         raise LocksmithError(f"A file can have at most {MAX_SLOTS} ways to open it, counting the password "
                              f"as one. Choose fewer recipients (this needs {slots}).")
+
+
+def _check_keyfile(password: str | None, keyfile: str | None):
+    if keyfile:
+        try:
+            size = os.path.getsize(keyfile)
+        except OSError as e:
+            raise LocksmithError(f"Cannot read the keyfile: {e.strerror}") from e
+        if size == 0:
+            raise LocksmithError("The keyfile is empty, so it adds no secret.")
+        if not password and size < MIN_KEYFILE_ONLY:
+            raise LocksmithError(f"A keyfile used without a password must be at least "
+                                 f"{MIN_KEYFILE_ONLY} bytes of random data.")
+
+
+def _check_recipients(recipients: list[bytes]):
+    for rpk in recipients:
+        if not isinstance(rpk, bytes):
+            raise LocksmithError("A recipient's public key is invalid.")
+        if sshkeys.is_rsa_raw(rpk):
+            sshkeys.recipient_from_raw(rpk)   # raises unless a usable RSA key
+        elif len(rpk) not in (X25519_LEN, X25519_LEN + MLKEM_PUBLIC_LEN):
+            raise LocksmithError("A recipient's public key is invalid.")
+
+
+RECIPIENT_LABEL = b"locksmith/v2/recipient\x00"
+
+
+def recipient_tag(key: bytes) -> bytes:
+    """A recipient list entry (FORMAT.md §7): the hash of an encryption key as slots use it."""
+    return hashlib.sha256(RECIPIENT_LABEL + key).digest()
+
+
+def _option_meta(opts: EncryptOptions) -> dict:
+    """Metadata that comes from the options: the note and the recipient list."""
+    meta = {}
+    if opts.note:
+        meta["note"] = opts.note
+    if opts.address_to:
+        meta["to"] = [_b64(recipient_tag(r)) for r in dict.fromkeys(opts.recipients)]
+    return meta
+
+
+def _recipient_list(meta: dict) -> set[bytes] | None:
+    """A metadata recipient list, or None when there is none or it isn't well formed."""
+    to = meta.get("to")
+    if not isinstance(to, list) or not 1 <= len(to) <= MAX_SLOTS:
+        return None
+    try:
+        return {_b64len(entry, 32) for entry in to}
+    except (ValueError, TypeError):
+        return None
+
+
+def _intent(meta: dict, signature: signing.LockedSignature | None, k: _Keys, keys: DecryptKeys) -> str | None:
+    """What a validly signed file's recipient list says about this reader (FORMAT.md §7). Only a
+    verified signature vouches for the list: anyone who can open a file can rewrite its metadata."""
+    listed = _recipient_list(meta)
+    if listed is None or signature is None or not signature.verified:
+        return None
+    mine = {*keys.own_keys, *(_Identity(raw).public for raw in keys.identities), *(s.public_raw for s in keys.ssh)}
+    if any(recipient_tag(key) in listed for key in mine):
+        return "listed"
+    return "password" if k.opened_by is None else "not_listed"
 
 
 class _Checker:
@@ -356,6 +432,8 @@ class _Checker:
 class _Keys:
     def __init__(self, dek: bytes, salt: bytes, suite_id: str, fmt: Format):
         self.fmt = fmt
+        self.dek = dek                       # kept for rewriting the key slots
+        self.opened_by: bytes | None = None  # the identity's public key whose slot opened the file; None: password
         suite = SUITES.get(suite_id)
         if suite is None:
             raise CorruptedError(f"Unsupported cipher suite: {suite_id}")
@@ -435,13 +513,7 @@ def _build_header(opts: EncryptOptions, meta: dict, chk: _Checker,
 
     if opts.password or opts.keyfile:
         chk.report(None, "Deriving key")
-        kf_hash = hash_keyfile(opts.keyfile) if opts.keyfile else None
-        psalt = kdfmod.new_salt()
-        params = kdfmod.params_for(opts.kdf, opts.preset)
-        kek = _password_kek(opts.password, kf_hash, psalt, opts.kdf, params, fmt)
-        nonce, wrapped = _wrap(kek, dek, b"pw", fmt)
-        slots.append({"t": "pw", "kdf": opts.kdf, "p": params, "salt": _b64(psalt),
-                      "kf": bool(kf_hash), "n": _b64(nonce), "w": _b64(wrapped)})
+        slots.append(_password_slot(opts.password, opts.keyfile, opts.kdf, opts.preset, dek, fmt))
 
     for rpk in opts.recipients:
         slots.append(_recipient_slot(rpk, dek, fmt))
@@ -489,7 +561,31 @@ def _build_header(opts: EncryptOptions, meta: dict, chk: _Checker,
     return _Written(preamble, fixed, keys, dek)
 
 
+def _password_slot(password: str | None, keyfile: str | None, kdf: str, preset: str, dek: bytes,
+                   fmt: Format) -> dict:
+    kf_hash = hash_keyfile(keyfile) if keyfile else None
+    psalt = kdfmod.new_salt()
+    params = kdfmod.params_for(kdf, preset)
+    kek = _password_kek(password, kf_hash, psalt, kdf, params, fmt)
+    nonce, wrapped = _wrap(kek, dek, b"pw", fmt)
+    return {"t": "pw", "kdf": kdf, "p": params, "salt": _b64(psalt), "kf": bool(kf_hash),
+            "n": _b64(nonce), "w": _b64(wrapped)}
+
+
+def _rsa_kek(secret: bytes, ciphertext: bytes, rpk: bytes, fmt: Format) -> bytes:
+    return _hkdf(secret, 32, hashlib.sha256(ciphertext + rpk).digest(), fmt.label + SSH_RSA.encode())
+
+
 def _recipient_slot(rpk: bytes, dek: bytes, fmt: Format) -> dict:
+    if sshkeys.is_rsa_raw(rpk):
+        # RSA can't take part in a key exchange: a random secret is sent under RSA-OAEP, and the
+        # slot's key is derived from it, the ciphertext and the recipient's key (FORMAT.md §3).
+        if fmt.version < 2:
+            raise LocksmithError("Only version 2 files can have SSH RSA recipients.")
+        secret = secrets.token_bytes(32)
+        ct = sshkeys.rsa_encrypt(rpk, secret, fmt.label + SSH_RSA.encode())
+        nonce, wrapped = _wrap(_rsa_kek(secret, ct, rpk, fmt), dek, SSH_RSA.encode(), fmt)
+        return {"t": SSH_RSA, "c": _b64(ct), "n": _b64(nonce), "w": _b64(wrapped)}
     eph = X25519PrivateKey.generate()
     epk = eph.public_key().public_bytes_raw()
     ss_x = _x25519_exchange(eph, rpk[:X25519_LEN])
@@ -519,7 +615,10 @@ def _dummy_recipients(opts: EncryptOptions) -> list[bytes]:
         return []
     n = recipient_slot_target(len(opts.recipients), bool(opts.password or opts.keyfile)) - len(opts.recipients)
     # Same kind as the real recipients (post-quantum if any is), so the slot types reveal nothing more.
-    hybrid = any(len(r) > X25519_LEN for r in opts.recipients)
+    return _decoy_keys(n, any(len(r) == X25519_LEN + MLKEM_PUBLIC_LEN for r in opts.recipients))
+
+
+def _decoy_keys(n: int, hybrid: bool) -> list[bytes]:
     keys = []
     for _ in range(n):
         raw = X25519PrivateKey.generate().public_key().public_bytes_raw()
@@ -613,6 +712,10 @@ def _check_header(h: dict, fmt: Format):
         elif kind == HYBRID and fmt.allows_hybrid:
             _b64len(slot["epk"], X25519_LEN)
             _b64len(slot["kct"], MLKEM_CT_LEN)
+        elif kind == SSH_RSA and fmt.version >= 2:
+            # RSA-OAEP ciphertext: as long as the key's modulus, 2048 to 16384 bits.
+            if len(_b64len(slot["c"], max_len=sshkeys.MAX_RSA_BITS // 8)) < sshkeys.MIN_RSA_BITS // 8:
+                raise ValueError
         else:
             raise ValueError
 
@@ -624,11 +727,12 @@ def _info_from_header(header: dict, raw: bytes, fmt: Format) -> FileInfo:
         chunk_size=header["chunk"],
         password_slots=[{"kdf": s["kdf"], "params": s["p"], "keyfile": s.get("kf", False)}
                         for s in pw],
-        recipient_slots=sum(1 for s in header["slots"] if s.get("t") in ("x25519", HYBRID)),
+        recipient_slots=sum(1 for s in header["slots"] if s.get("t") in RECIPIENT_SLOTS),
         post_quantum_slots=sum(1 for s in header["slots"] if s.get("t") == HYBRID),
         needs_keyfile=any(s.get("kf") for s in pw),
         header_size=len(raw),
         format_name=fmt.name,
+        format_version=fmt.version,
     )
 
 
@@ -669,8 +773,25 @@ def _unlock(header: dict, raw: bytes, keys: DecryptKeys, chk: _Checker, fmt: For
         ok = hmac.compare_digest(_commitment(candidate, salt, fmt, raw), commitment)
         return candidate if ok else None
 
-    idents = [_Identity(raw) for raw in keys.identities]
+    idents = [_Identity(raw) for raw in keys.identities] + \
+        [_Identity(s.x25519) for s in keys.ssh if s.x25519 is not None]
+    rsa_keys = [s for s in keys.ssh if s.rsa_key is not None]
+    opened_by = None
     for slot in header["slots"]:
+        if slot["t"] == SSH_RSA:
+            for ident in rsa_keys:
+                ct = _unb64(slot["c"])
+                secret = sshkeys.rsa_decrypt(ident.rsa_key, ct, fmt.label + SSH_RSA.encode())
+                if secret is None:
+                    continue
+                kek = _rsa_kek(secret, ct, ident.public_raw, fmt)
+                dek = committed(_unwrap(kek, _unb64(slot["n"]), _unb64(slot["w"]), SSH_RSA.encode(), fmt))
+                if dek:
+                    opened_by = ident.public_raw
+                    break
+            if dek:
+                break
+            continue
         if slot["t"] not in ("x25519", HYBRID) or not idents:
             continue
         epk = _unb64(slot["epk"])
@@ -691,6 +812,7 @@ def _unlock(header: dict, raw: bytes, keys: DecryptKeys, chk: _Checker, fmt: For
                 continue
             dek = committed(_unwrap(kek, _unb64(slot["n"]), _unb64(slot["w"]), kind, fmt))
             if dek:
+                opened_by = ident.public
                 break
         if dek:
             break
@@ -717,7 +839,9 @@ def _unlock(header: dict, raw: bytes, keys: DecryptKeys, chk: _Checker, fmt: For
             raise WrongKeyError("None of your identities can open this file.")
         raise WrongKeyError("Wrong password, keyfile or identity.")
 
-    return _Keys(dek, salt, header["suite"], fmt)
+    k = _Keys(dek, salt, header["suite"], fmt)
+    k.opened_by = opened_by
+    return k
 
 
 # Expected type of each metadata field. The sender chooses the metadata, so a
@@ -738,6 +862,49 @@ def _read_meta(header: dict, keys: _Keys) -> dict:
         raise CorruptedError("The encrypted metadata is damaged.") from e
     return {k: v for k, v in meta.items()
             if k not in _META_TYPES or (isinstance(v, _META_TYPES[k]) and not isinstance(v, bool))}
+
+
+# ── free disk space ──────────────────────────────────────────────────────────
+
+DISK_RESERVE = 1 << 30   # free space a decryption never goes below (or 2% of the disk, if larger)
+
+
+def _size_text(n: int) -> str:
+    for unit in ("bytes", "KiB", "MiB", "GiB"):
+        if n < 1024 or unit == "GiB":
+            return f"{n} {unit}" if unit == "bytes" else f"{n:.1f} {unit}"
+        n /= 1024
+    return ""
+
+
+class _DiskGuard:
+    """Stops decryption before it fills the disk. A small crafted file can expand into
+    tens of GiB, and a full disk makes other programs' writes fail, which can damage their
+    data. Writing stops while the larger of 1 GiB and 2% of the disk is still free, or half
+    the space that was free at the start when that is less, so even a nearly full disk
+    never fills up. A real file that doesn't fit stops the same way, only earlier."""
+
+    def __init__(self, folder: Path):
+        self.folder = folder
+        try:
+            usage = shutil.disk_usage(folder)
+        except OSError:
+            self.reserve = None   # a file system that can't say (some network or FUSE mounts): no guard
+            return
+        self.reserve = min(max(DISK_RESERVE, usage.total // 50), usage.free // 2)
+
+    def need(self, n: int):
+        """Raise unless ``n`` more bytes can be written without going below the reserve."""
+        if n <= 0 or self.reserve is None:
+            return
+        try:
+            free = shutil.disk_usage(self.folder).free
+        except OSError:
+            return   # the folder is being removed, or the drive went away: the write itself will say
+        if free - n < self.reserve:
+            raise LocksmithError(f"Stopped before the disk filled up: decrypting this needs more space than "
+                                 f"{self.folder} has free (Locksmith always leaves {_size_text(self.reserve)}). "
+                                 "Free up space or choose another output folder. Nothing was kept.")
 
 
 # ── frame streams ────────────────────────────────────────────────────────────
@@ -877,12 +1044,13 @@ def _frames(f: BinaryIO, limit: int):
 
 def _decrypt_stream(f: BinaryIO, total: int, header: dict, raw_header: bytes,
                     keys: _Keys, meta: dict, out: BinaryIO, threads: int, chk: _Checker,
-                    max_output: int | None = None) -> tuple[bytes, bytes]:
+                    max_output: int | None = None, space: _DiskGuard | None = None) -> tuple[bytes, bytes]:
     """Decrypt the frames after the header into ``out``. ``max_output`` caps the total
     plaintext: chunks are capped one by one, but many small chunks can still expand
-    without limit, which matters when ``out`` is in memory. Returns the SHA-512 of the
-    content and the signature frames' bytes (empty when the file isn't signed), which the
-    caller checks before anything is shown or moved into place."""
+    without limit, which matters when ``out`` is in memory. ``space`` stops the writing
+    before it would fill the disk ``out`` is on. Returns the SHA-512 of the content and
+    the signature frames' bytes (empty when the file isn't signed), which the caller
+    checks before anything is shown or moved into place."""
     prefix = _unb64(header["np"])
     aad = hashlib.sha256(raw_header).digest()
     chunk = header["chunk"]
@@ -936,7 +1104,10 @@ def _decrypt_stream(f: BinaryIO, total: int, header: dict, raw_header: bytes,
                     break
             if not items:
                 break
-            for kind, plain in pool.map(open_frame, items):
+            opened = list(pool.map(open_frame, items))
+            if space is not None:
+                space.need(sum(len(plain) for kind, plain in opened if kind in (KIND_RAW, KIND_COMPRESSED)))
+            for kind, plain in opened:
                 frame_stage = 2 if kind == KIND_SIG else 1 if kind == KIND_PAD else 0
                 if frame_stage < stage or (frame_stage and not seen):   # content always comes first
                     raise CorruptedError("A chunk is malformed.")
@@ -1094,6 +1265,11 @@ def encrypt_paths(paths: list[Path], out_dir: Path | None, opts: EncryptOptions,
     if not paths:
         raise LocksmithError("Nothing to encrypt.")
     for p in paths:
+        # A link given directly would encrypt (or, for a folder, only store) the link while
+        # shredding removed just the link, leaving the real data in plaintext. Links inside
+        # a folder are fine: they are stored as links.
+        if is_link(p):
+            raise LocksmithError(f"{p.name} is a link. Add the file or folder it points to instead.")
         if not p.exists():
             raise LocksmithError(f"{p.name} no longer exists.")
     out_dir = Path(out_dir) if out_dir else paths[0].parent
@@ -1136,9 +1312,7 @@ def encrypt_paths(paths: list[Path], out_dir: Path | None, opts: EncryptOptions,
         raise LocksmithError(f"Text (ASCII armor) output is limited to {MAX_ARMOR_INPUT >> 20} MiB. "
                            "Turn off ASCII armor for larger files.")
     codec_id = _codec_for(opts, paths)
-    meta = {"name": name, "kind": kind, "comp": codec_id, "created": now, **meta_extra}
-    if opts.note:
-        meta["note"] = opts.note
+    meta = {"name": name, "kind": kind, "comp": codec_id, "created": now, **meta_extra, **_option_meta(opts)}
 
     out_dir.mkdir(parents=True, exist_ok=True)
     target = unique_path(out_dir / _output_name(opts, name))
@@ -1208,9 +1382,7 @@ def encrypt_bytes(data: bytes, opts: EncryptOptions, name: str = "message.txt",
     chk = _Checker(None, None)
     codec_id = _codec_for(opts, [])
     meta = {"name": name, "kind": kind, "comp": codec_id, "created": int(time.time()),
-            "size": len(data)}
-    if opts.note:
-        meta["note"] = opts.note
+            "size": len(data), **_option_meta(opts)}
     head = _build_header(opts, meta, chk)
     out = io.BytesIO()
     _encrypt_stream(io.BytesIO(data), len(data), out, head, opts, codec_id, chk)
@@ -1289,7 +1461,8 @@ def decrypt_pasted(blob: bytes, out_dir: Path, keys: DecryptKeys, threads: int =
     if meta.get("kind", "file") == "text":
         out = io.BytesIO()
         digest, sig = _decrypt_stream(f, len(blob), header, raw, k, meta, out, 1, chk, max_output=MAX_ARMOR_INPUT)
-        return DecryptResult(None, meta, out.getvalue(), signature=_signature_status(sig, raw, digest, keys))
+        signature = _signature_status(sig, raw, digest, keys)
+        return DecryptResult(None, meta, out.getvalue(), signature=signature, intent=_intent(meta, signature, k, keys))
     res = _decrypt_into(f, len(blob), header, raw, k, meta, Path(out_dir), "decrypted", threads, chk, keys,
                         max_output=MAX_ARMOR_INPUT)
     mark_untrusted(res.path)
@@ -1309,11 +1482,12 @@ def _decrypt_into(f: BinaryIO, total: int, header: dict, raw: bytes, k: _Keys, m
     tmp = out_dir / f".locksmith-{secrets.token_hex(6)}.part"
     skipped: list[str] = []
     complete = True
+    space = _DiskGuard(out_dir)
     with scratch.tracked(tmp):  # removed on the next start if this run is killed
         try:
             with create_private(tmp) as out:
                 digest, sig = _decrypt_stream(f, total, header, raw, k, meta, out, threads, chk,
-                                              max_output=max_output)
+                                              max_output=max_output, space=space)
                 out.flush()
                 os.fsync(out.fileno())
             signature = _signature_status(sig, raw, digest, keys)   # raises (and removes tmp) if invalid
@@ -1324,7 +1498,7 @@ def _decrypt_into(f: BinaryIO, total: int, header: dict, raw: bytes, k: _Keys, m
                 if kind == "dir":
                     staging = out_dir / f".locksmith-{secrets.token_hex(6)}"
                     with scratch.tracked(staging):
-                        ext = extract_archive(tmp, staging)
+                        ext = extract_archive(tmp, staging, space=space)
                         # Unwrap the archive's top-level folder (stored under its original
                         # name, which may differ from the safe one). Only a real folder: a
                         # symlink moved out of staging would resolve against the output folder.
@@ -1336,7 +1510,7 @@ def _decrypt_into(f: BinaryIO, total: int, header: dict, raw: bytes, k: _Keys, m
                             ext.skipped += sorted(e.name for e in staging.iterdir())
                         shutil.rmtree(staging, ignore_errors=True)
                 else:
-                    ext = extract_archive(tmp, target)
+                    ext = extract_archive(tmp, target, space=space)
                 skipped = ext.skipped
                 complete = ext.flushed and not ext.skipped and not ext.renamed
                 tmp.unlink(missing_ok=True)
@@ -1354,7 +1528,8 @@ def _decrypt_into(f: BinaryIO, total: int, header: dict, raw: bytes, k: _Keys, m
         except BaseException:
             tmp.unlink(missing_ok=True)
             raise
-    return DecryptResult(target, meta, skipped=skipped, complete=complete, signature=signature)
+    return DecryptResult(target, meta, skipped=skipped, complete=complete, signature=signature,
+                         intent=_intent(meta, signature, k, keys))
 
 
 def decrypt_bytes(blob: bytes, keys: DecryptKeys) -> DecryptResult:
@@ -1365,7 +1540,8 @@ def decrypt_bytes(blob: bytes, keys: DecryptKeys) -> DecryptResult:
     meta = _read_meta(header, k)
     out = io.BytesIO()
     digest, sig = _decrypt_stream(f, len(blob), header, raw, k, meta, out, 1, chk, max_output=MAX_ARMOR_INPUT)
-    return DecryptResult(None, meta, out.getvalue(), signature=_signature_status(sig, raw, digest, keys))
+    signature = _signature_status(sig, raw, digest, keys)
+    return DecryptResult(None, meta, out.getvalue(), signature=signature, intent=_intent(meta, signature, k, keys))
 
 
 def safe_name(name) -> str:
@@ -1383,13 +1559,42 @@ def safe_name(name) -> str:
     return name if name not in ("", ".", "..") else "decrypted"
 
 
-def _extracted_key(dest: str, name: str) -> str:
+def _extracted_key(dest: str, name: str, fold: bool) -> str:
     """Identify the file an archive member would be written to. The folder part is
     resolved as it stands on disk, so a path through an extracted folder link matches
-    the real path; Windows compares names without case."""
+    the real path. ``fold``: the destination ignores case, so names are compared without it."""
     parent, leaf = os.path.split(os.path.normpath(name))
     key = os.path.join(os.path.realpath(os.path.join(dest, parent)), leaf)
-    return key.casefold() if IS_WINDOWS else key
+    return key.casefold() if fold else key
+
+
+def _ignores_case(folder: Path) -> bool:
+    """Whether names in ``folder`` are compared without case: Windows, but also FAT and
+    exFAT drives and casefolded ext4 folders on Linux. Probed by creating a file and looking
+    for its upper-case name. If the probe fails, assume it does: that only reports names
+    differing in case as collisions, never lets one overwrite another."""
+    if IS_WINDOWS:
+        return True
+    probe = folder / f".locksmith-case-{secrets.token_hex(6)}"
+    try:
+        os.close(open_new(probe))
+    except OSError:
+        return True
+    try:
+        return os.path.lexists(folder / probe.name.upper())
+    finally:
+        try:
+            probe.unlink()
+        except OSError:
+            pass
+
+
+def _name_too_long(part: str) -> bool:
+    """A path component the file system can't create: over 255 bytes (Linux) or 255 UTF-16
+    units (Windows). A name made on one may be valid there and too long here."""
+    if IS_WINDOWS:
+        return len(part.encode("utf-16-le", "surrogatepass")) // 2 > 255
+    return len(os.fsencode(part)) > 255
 
 
 # Long names, link targets and PAX records are a few KB at most. tarfile reads such a
@@ -1421,14 +1626,17 @@ class _BoundedTarInfo(tarfile.TarInfo):
         raise CorruptedError(_SPARSE)
 
 
-def extract_archive(archive: Path, dest: Path) -> Extraction:
-    """Extract with the tarfile "data" filter. Members the filter rejects (such as
-    links pointing outside the folder, or device files) are skipped and reported
-    instead of aborting, so one odd entry cannot make a whole folder unrecoverable.
-    Everything extracted is then fsynced."""
+def extract_archive(archive: Path, dest: Path, space: _DiskGuard | None = None) -> Extraction:
+    """Extract with the tarfile "data" filter, one member at a time. Members the filter
+    rejects (such as links pointing outside the folder, or device files), names the file
+    system can't hold and members that fail to be created are skipped and reported instead
+    of aborting, so one odd entry cannot make a whole folder unrecoverable. A damaged
+    archive, a full disk or ``space`` running out stops everything. Everything extracted is
+    then fsynced."""
     result = Extraction()
     skipped = result.skipped
     extracted: dict[str, bool] = {}  # _extracted_key -> is a folder
+    current: dict = {}               # the member being extracted: where it goes
 
     def keep_safe(member, path):
         name = member.name
@@ -1441,16 +1649,19 @@ def extract_archive(archive: Path, dest: Path) -> Extraction:
         if "\x00" in name or "\x00" in (member.linkname or ""):
             skipped.append(name.replace("\x00", "\\0"))
             return None
+        if any(_name_too_long(part) for part in name.split("/")):
+            skipped.append(name)
+            return None
         try:
             member = tarfile.data_filter(member, path)
         except tarfile.FilterError:
             skipped.append(name)
             return None
         # A later member must never replace an earlier one: an exact duplicate, a name
-        # differing only in case on Windows (Notes.txt, notes.txt), or a path through a
-        # folder link. The first is kept and the collision reported. A folder listed
-        # twice just merges, overwriting nothing.
-        key = _extracted_key(path, member.name)
+        # differing only in case where the destination ignores case (Notes.txt, notes.txt),
+        # or a path through a folder link. The first is kept and the collision reported.
+        # A folder listed twice just merges, overwriting nothing.
+        key = _extracted_key(path, member.name, fold)
         if key in extracted and not (extracted[key] and member.isdir()):
             skipped.append(name)
             return None
@@ -1463,13 +1674,42 @@ def extract_archive(archive: Path, dest: Path) -> Extraction:
             member = member.replace(mode=0o700, deep=False)
         elif (member.isreg() or member.islnk()) and member.mode is not None:
             member = member.replace(mode=member.mode & 0o700, deep=False)
+        if not current:   # tarfile calls this again for a hard link's target; the member itself comes first
+            current.update(path=os.path.join(path, member.name), member=member)
         return member
 
     dest.mkdir(mode=0o700, parents=True, exist_ok=False)
+    fold = _ignores_case(dest)
+    folders = []
     try:
         with tarfile.open(archive, "r:", tarinfo=_BoundedTarInfo) as tar:
-            tar.extractall(dest, filter=keep_safe)
-    except CorruptedError:
+            for member in tar:
+                if space is not None and member.isreg():
+                    space.need(member.size)
+                current.clear()
+                try:
+                    # Folders get their times at the end, as extractall does: extracting
+                    # what is inside would change them.
+                    tar.extract(member, dest, set_attrs=not member.isdir(), filter=keep_safe)
+                except (OSError, UnicodeEncodeError) as e:
+                    if isinstance(e, OSError) and e.errno in (errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)):
+                        raise
+                    skipped.append(member.name)
+                    target = current.get("path")
+                    if target and not os.path.isdir(target) and os.path.lexists(target):
+                        os.unlink(target)   # a partly written file
+                    continue
+                if current.get("member") is not None and current["member"].isdir():
+                    folders.append(current["member"])
+            for info in sorted(folders, key=lambda m: m.name, reverse=True):
+                folder = os.path.join(dest, info.name)
+                try:
+                    if stat.S_ISDIR(os.lstat(folder).st_mode):   # chmod would follow a link
+                        tar.utime(info, folder)
+                        tar.chmod(info, folder)
+                except (OSError, tarfile.ExtractError):
+                    pass
+    except LocksmithError:
         shutil.rmtree(dest, ignore_errors=True)
         raise
     except (tarfile.TarError, OSError, ValueError) as e:
@@ -1494,4 +1734,140 @@ def verify_path(path: Path, keys: DecryptKeys, threads: int = 0,
         digest, sig = _decrypt_stream(f, total, header, raw, k, meta, _NullWriter(), threads, chk)
     signature = _signature_status(sig, raw, digest, keys)
     chk.report(1.0, "Verified")
-    return DecryptResult(None, meta, signature=signature)
+    return DecryptResult(None, meta, signature=signature, intent=_intent(meta, signature, k, keys))
+
+
+# ── changing who can open a file ─────────────────────────────────────────────
+
+@dataclass
+class AccessChange:
+    """How ``change_access`` rewrites a file's key slots. The data is never re-encrypted."""
+    set_password: bool = False      # replace every password slot with ``password``/``keyfile`` (none: remove them)
+    password: str | None = None
+    keyfile: str | None = None
+    kdf: str = "argon2id"
+    preset: str = "balanced"
+    replace_recipients: bool = False   # drop every recipient slot (decoys included) before adding
+    add_recipients: list[bytes] = field(default_factory=list)
+    hide_recipients: bool = False      # round the recipient slots up to 8, 16, 32 or 64 with decoys
+
+
+@dataclass
+class AccessResult:
+    path: Path
+    password_slots: int
+    recipient_slots: int
+    you_can_open: bool     # whether the keys used to open it (or the new password) still do
+
+
+def _opens_any(header: dict, raw: bytes, fmt: Format, slots: list[dict], keys: DecryptKeys) -> bool:
+    """Whether one of ``keys``' identities opens one of these recipient slots."""
+    if not slots or not (keys.identities or keys.ssh):
+        return False
+    try:
+        _unlock({**header, "slots": slots}, raw, DecryptKeys(identities=keys.identities, ssh=keys.ssh),
+                _Checker(None, None), fmt)
+    except WrongKeyError:
+        return False
+    return True
+
+
+class LockoutError(LocksmithError):
+    """The change would leave none of the keys that opened the file able to open it."""
+
+
+def change_access(path: Path, keys: DecryptKeys, change: AccessChange, allow_lockout: bool = False,
+                  progress: Progress | None = None, cancel: threading.Event | None = None) -> AccessResult:
+    """Rewrite who can open a version 2 file: its password (and keyfile) and recipients.
+
+    Only the key slots change (FORMAT.md §3): the commitment, the fixed header, the data and
+    any signature stay byte for byte as they are. That also means a change revokes nothing:
+    anyone who could open the file before may have kept its file key, which still opens
+    every copy. Real revocation is encrypting the content again.
+
+    Recipients aren't named in a file, so a recipient slot can't be told apart from another
+    (or from a decoy): recipients can be added, or all of them replaced with a new list.
+    Raises LockoutError, unless ``allow_lockout``, when the keys given would no longer open it."""
+    chk = _Checker(cancel, progress)
+    path = Path(path)
+    if change.set_password:
+        if change.kdf not in kdfmod.KDFS or change.preset not in kdfmod.PRESETS:
+            raise LocksmithError("Unknown key derivation setting.")
+        _check_keyfile(change.password, change.keyfile)
+    adding = list(dict.fromkeys(change.add_recipients))
+    _check_recipients(adding)
+    armored = is_armored(path)
+    with _open_source(path) as f:
+        header, raw, fmt = _read_header(f)
+        if fmt.version < 2:
+            raise LocksmithError("This file uses format version 1, where every part of the file depends on its "
+                                 "key slots. Decrypt it and encrypt it again to change who can open it.")
+        start = f.tell()
+        k = _unlock(header, raw, keys, chk, fmt)
+        old = header["slots"]
+        kept = [s for s in old if not ((s["t"] == "pw" and change.set_password)
+                                       or (s["t"] != "pw" and change.replace_recipients))]
+        new = list(kept)
+        if change.set_password and (change.password or change.keyfile):
+            chk.report(None, "Deriving key")
+            new.append(_password_slot(change.password, change.keyfile, change.kdf, change.preset, k.dek, fmt))
+        new += [_recipient_slot(rpk, k.dek, fmt) for rpk in adding]
+        has_pw = any(s["t"] == "pw" for s in new)
+        recipients = [s for s in new if s["t"] != "pw"]
+        if change.hide_recipients and recipients:
+            hybrid = any(s["t"] == HYBRID for s in recipients)
+            extra = recipient_slot_target(len(recipients), has_pw) - len(recipients)
+            new += [_recipient_slot(rpk, secrets.token_bytes(32), fmt) for rpk in _decoy_keys(extra, hybrid)]
+        if not new:
+            raise LocksmithError("A file needs at least one way to open it: keep or set a password, or add a "
+                                 "recipient.")
+        if len(new) > MAX_SLOTS:
+            raise LocksmithError(f"A file can have at most {MAX_SLOTS} ways to open it, counting the password as "
+                                 f"one. This change needs {len(new)}.")
+        own = {*(_Identity(r).public for r in keys.identities), *(s.public_raw for s in keys.ssh)}
+        you_can_open = bool(
+            (change.set_password and (change.password or change.keyfile))
+            or own.intersection(adding)
+            or (k.opened_by is None and not change.set_password)            # its password slot is kept
+            or (k.opened_by is not None and not change.replace_recipients)   # its recipient slot is kept
+            or _opens_any(header, raw, fmt, [s for s in kept if s["t"] != "pw"], keys))
+        if not you_can_open and not allow_lockout:
+            raise LockoutError("After this change, none of the passwords, keyfiles or unlocked identities used "
+                               "here would open the file.")
+        secrets.SystemRandom().shuffle(new)
+        slots_raw = json.dumps(new, separators=(",", ":")).encode()
+        if len(slots_raw) > MAX_HEADER:
+            raise LocksmithError("The key slots would be too large to store.")
+        preamble = fmt.magic + base64.b64decode(header["kc"]) + U32.pack(len(raw)) + raw + \
+            U32.pack(len(slots_raw)) + slots_raw
+        try:
+            _read_header(io.BytesIO(preamble))   # the reader's rules, before anything is written
+        except CorruptedError as e:
+            raise LocksmithError("The change would make a file that can't be opened. Nothing was changed.") from e
+        chk.check()
+        chk.report(None, "Saving")
+        tmp = path.with_name(f".{path.name}.{secrets.token_hex(4)}.part")
+        try:
+            if armored:
+                f.seek(start)
+                write_private(tmp, armor(preamble + f.read()).encode())
+            else:
+                with create_private(tmp) as out:
+                    out.write(preamble)
+                    f.seek(start)
+                    shutil.copyfileobj(f, out, 4 << 20)
+                    out.flush()
+                    os.fsync(out.fileno())
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
+    try:   # the source is closed first: Windows can't replace an open file
+        os.chmod(tmp, stat.S_IMODE(os.stat(path).st_mode))
+        copy_zone_identifier(path, tmp)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    fsync_dir(path.parent)
+    chk.report(1.0, "Done")
+    return AccessResult(path, sum(s["t"] == "pw" for s in new), sum(s["t"] != "pw" for s in new), you_can_open)

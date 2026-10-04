@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import BinaryIO
 
 from .errors import CancelledError, LocksmithError
-from .osutil import IS_WINDOWS, fsync_dir, open_new, windows_unsafe
+from .osutil import IS_WINDOWS, fsync_dir, is_link, open_new, windows_unsafe
 
 
 def same_secret(a: str | bytes, b: str | bytes) -> bool:
@@ -472,18 +472,31 @@ def shamir_combine(texts: list[str]) -> bytes:
 
 def shred(path: Path, passes: int = 1, cancel: threading.Event | None = None):
     """Best-effort overwrite then delete. Not reliable on SSDs or on
-    copy-on-write filesystems such as btrfs, where old blocks may survive."""
+    copy-on-write filesystems such as btrfs, where old blocks may survive.
+
+    A link given directly is refused: removing it would leave the data it points to in
+    place while looking shredded. Links inside a folder are only unlinked, which is right
+    for them: what they point to is not part of the folder."""
     path = Path(path)
-    if path.is_dir() and not path.is_symlink():
+    if is_link(path):
+        raise LocksmithError(f"{path.name} is a link. Add the file or folder it points to instead.")
+    _shred(path, passes, cancel)
+
+
+def _shred(path: Path, passes: int, cancel: threading.Event | None):
+    if path.is_dir() and not is_link(path):
         for root, dirs, files in os.walk(path, topdown=False):
             for name in files:
-                shred(Path(root) / name, passes, cancel)
+                _shred(Path(root) / name, passes, cancel)
             for name in dirs:
                 p = Path(root) / name
-                p.unlink() if p.is_symlink() else p.rmdir()
+                _remove_link(p) if is_link(p) else p.rmdir()
         path.rmdir()
         return
-    if path.is_symlink() or not path.is_file():
+    if is_link(path):
+        _remove_link(path)
+        return
+    if not path.is_file():
         path.unlink(missing_ok=True)
         return
     # O_NOFOLLOW: if the file is swapped for a symlink after the check above, fail
@@ -511,6 +524,17 @@ def shred(path: Path, passes: int = 1, cancel: threading.Event | None = None):
     scrambled = path.with_name(secrets.token_hex(8))
     os.replace(path, scrambled)
     scrambled.unlink()
+
+
+def _remove_link(path: Path):
+    """Remove a link itself, never what it points to. Windows removes junctions and links
+    to folders as folders; rmdir on them deletes only the link."""
+    try:
+        path.unlink()
+    except (IsADirectoryError, PermissionError):
+        if not IS_WINDOWS:
+            raise
+        os.rmdir(path)
 
 
 def covered_by(path: Path, inputs: list[Path]) -> bool:

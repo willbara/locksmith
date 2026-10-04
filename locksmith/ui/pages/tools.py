@@ -8,9 +8,10 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QFileDialog, QSlider
 
-from ...core import keys, minisign, signing, sshsig, tools
+from ...core import keys, minisign, openpgp, parity, signing, sshsig, tools
 from ...core.errors import LocksmithError
 from ...core.keys import write_secret_file
+from ...core.osutil import is_link
 from .. import dialogs
 from ..lock import mark_sensitive
 from ..widgets import (
@@ -30,6 +31,7 @@ from ..widgets import (
     copy_secret,
     divider,
     hrow,
+    human_size,
     label,
     toast,
 )
@@ -54,6 +56,8 @@ class ToolsPage(Page):
         self._lsig_card()
         self._minisign_card()
         self._sshsig_card()
+        self._openpgp_card()
+        self._recovery_card()
         self._keyfile_card()
         self._shred_card()
         self.finish()
@@ -691,6 +695,185 @@ class ToolsPage(Page):
                                                  lambda x: r(x, "Hashing"), c),
                  done, failed, self.ss_progress.update_progress, parent=self)
 
+    # ── OpenPGP signatures ──
+
+    def _openpgp_card(self):
+        c = Collapsible("Verify an OpenPGP signature", "Check a download against its .sig or .asc file (GnuPG)",
+                        icon="shield")
+        self.pg_file = self.pg_sig = self.pg_key = None
+        self.pg_file_name = label("No file selected", "caption", False)
+        pick = Button("Choose file…", "file")
+        pick.clicked.connect(self._pg_pick_file)
+        c.add(hrow(pick, self.pg_file_name, None))
+        self.pg_sig_name = label("No signature selected", "caption", False)
+        pick_sig = Button("Signature…", "fingerprint")
+        pick_sig.clicked.connect(self._pg_pick_sig)
+        c.add(hrow(pick_sig, self.pg_sig_name, None))
+        self.pg_key_name = label("No public key selected", "caption", False)
+        pick_key = Button("Public key…", "key")
+        pick_key.clicked.connect(self._pg_pick_key)
+        c.add(hrow(pick_key, self.pg_key_name, None))
+        self.pg_go = Button("Verify", "check", "primary")
+        self.pg_go.clicked.connect(self._pg_verify)
+        c.add(hrow(self.pg_go, None))
+        self.pg_progress = ProgressPanel()
+        self.pg_progress.cancel_btn.setVisible(False)
+        c.add(self.pg_progress)
+        self.pg_result = label("", "h2")
+        c.add(self.pg_result)
+        self.pg_detail = label("", "caption")
+        c.add(self.pg_detail)
+        c.add(label("Checks a detached signature against the one public key you choose (a .asc or .gpg file from the "
+                    "project's website), with no keyring. Version 4 keys and signatures (what GnuPG makes) with "
+                    "Ed25519, ECDSA or RSA of 2048 bits or more; SHA-1 and MD5 signatures are refused. The names on a "
+                    "key are its owner's own claims.", "faint"))
+        self.add(c)
+
+    def _pg_reset(self):
+        self.pg_result.setText("")
+        self.pg_detail.setText("")
+
+    def _pg_pick_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Choose the signed file")
+        if not path:
+            return
+        self.pg_file = Path(path)
+        self.pg_file_name.setText(self.pg_file.name)
+        for ext in (".sig", ".asc"):
+            if Path(path + ext).is_file():
+                self.pg_sig = Path(path + ext)
+                self.pg_sig_name.setText(self.pg_sig.name)
+                break
+        self._pg_reset()
+
+    def _pg_pick_sig(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Choose the signature", "",
+                                              "OpenPGP signatures (*.sig *.asc *.gpg);;All files (*)")
+        if path:
+            self.pg_sig = Path(path)
+            self.pg_sig_name.setText(self.pg_sig.name)
+            self._pg_reset()
+
+    def _pg_pick_key(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Choose the signer's public key", "",
+                                              "OpenPGP keys (*.asc *.gpg *.pgp *.key);;All files (*)")
+        if path:
+            self.pg_key = Path(path)
+            self.pg_key_name.setText(self.pg_key.name)
+            self._pg_reset()
+
+    def _pg_verify(self):
+        if not (self.pg_file and self.pg_sig and self.pg_key):
+            toast("Choose the file, its signature and the signer's public key", "alert")
+            return
+        f, sig, key = self.pg_file, self.pg_sig, self.pg_key
+        self._pg_reset()
+        self.pg_progress.start()
+        self.pg_go.setEnabled(False)
+
+        def end():
+            self.pg_progress.finish()
+            self.pg_go.setEnabled(True)
+
+        def done(v):
+            end()
+            self.pg_result.setText(f"✓  Valid signature from key {v.fingerprint}")
+            try:
+                when = time.strftime("%d %b %Y, %H:%M", time.localtime(v.created))
+            except (OverflowError, OSError, ValueError):
+                when = str(v.created)
+            lines = [f"{v.key_label}{' subkey ' + v.signing_key if v.signing_key != v.fingerprint else ''}  ·  "
+                     f"{v.hash_name}{'  ·  text mode' if v.text_mode else ''}  ·  signed {when} (by the signer's clock)"]
+            if v.user_ids:
+                lines.append("The key says it belongs to: " + "; ".join(v.user_ids) + " (not checked by anyone)")
+            if v.expired:
+                lines.append("The key has expired since; the signature was made while it was valid.")
+            self.pg_detail.setText("\n".join(lines))
+
+        def failed(m, k):
+            end()
+            self.pg_result.setText("✕  Not verified")
+            self.pg_detail.setText(m)
+
+        run_task(lambda r, c: openpgp.verify_file(f, openpgp.read_signature_file(sig), openpgp.read_key_file(key),
+                                                  progress=lambda x: r(x, "Hashing"), cancel=c),
+                 done, failed, self.pg_progress.update_progress, parent=self)
+
+    # ── recovery data ──
+
+    def _recovery_card(self):
+        c = Collapsible("Recovery data", "Protect archives against bit rot and damaged storage", icon="layers")
+        c.add(label("Saves a .lpar file next to a file. If the file is later damaged (a failing disk, a scratched "
+                    "disc, a bad USB stick), it can be repaired from it, as long as the damage is no more than the "
+                    "chosen share of the file. Keep the .lpar file with the original.", "caption"))
+        self.rc_level = Dropdown(parity.LABELS)
+        self.rc_level.set_value("5")
+        make = Button("Create recovery data…", "plus", "primary")
+        make.clicked.connect(self._rc_create)
+        repair = Button("Check or repair…", "check", "secondary")
+        repair.clicked.connect(self._rc_repair)
+        c.add(Field("Amount", hrow(self.rc_level, make, repair)))
+        self.rc_progress = ProgressPanel()
+        self.rc_progress.cancel.connect(lambda: self._rc_task and self._rc_task.cancel())
+        c.add(self.rc_progress)
+        self.rc_result = label("", "h2")
+        c.add(self.rc_result)
+        self.rc_detail = label("", "caption")
+        c.add(self.rc_detail)
+        self._rc_task = None
+        self.add(c)
+
+    def _rc_run(self, work, done):
+        if self._rc_task is not None:
+            return
+        self.rc_result.setText("")
+        self.rc_detail.setText("")
+        self.rc_progress.start()
+
+        def end():
+            self.rc_progress.finish()
+            self._rc_task = None
+
+        def failed(m, k):
+            end()
+            self.rc_result.setText("✕  " + ("Not repaired" if "repair" in m else "Failed"))
+            self.rc_detail.setText(m)
+
+        self._rc_task = run_task(work, lambda res: (end(), done(res)), failed, self.rc_progress.update_progress,
+                                 lambda: (end(), toast("Cancelled", "x")), parent=self)
+
+    def _rc_create(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Choose the file to protect")
+        if not path:
+            return
+        level = self.rc_level.value()
+        self._rc_run(lambda r, c: parity.create(Path(path), level, progress=r, cancel=c),
+                     lambda out: (self.rc_result.setText(f"✓  Saved {out.name}"),
+                                  self.rc_detail.setText(f"{human_size(out.stat().st_size)} of recovery data.")))
+
+    def _rc_repair(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Choose the file to check")
+        if not path:
+            return
+        side = Path(path + parity.EXTENSION)
+        if Path(path).suffix == parity.EXTENSION:
+            side, path = Path(path), path[:-len(parity.EXTENSION)]
+        if not side.is_file():
+            chosen, _ = QFileDialog.getOpenFileName(self, "Choose its recovery data", str(Path(path).parent),
+                                                    "Recovery data (*.lpar);;All files (*)")
+            if not chosen:
+                return
+            side = Path(chosen)
+
+        def done(rep):
+            if rep.intact:
+                self.rc_result.setText("✓  The file is intact")
+            else:
+                self.rc_result.setText(f"✓  Repaired {Path(path).name}")
+                self.rc_detail.setText(f"{len(rep.damaged)} damaged block{'s' if len(rep.damaged) != 1 else ''} "
+                                       f"rebuilt. The damaged copy was kept as {rep.kept.name}.")
+        self._rc_run(lambda r, c: parity.repair(Path(path), side, progress=r, cancel=c), done)
+
     # ── keyfile ──
 
     def _keyfile_card(self):
@@ -737,6 +920,11 @@ class ToolsPage(Page):
         paths = self.shred_list.paths()
         if not paths:
             toast("Add files to shred first", "alert")
+            return
+        links = [Path(p).name for p in paths if is_link(p)]
+        if links:
+            dialogs.error(f"{links[0]} is a link. Removing it would leave what it points to in place. Add the file "
+                          "or folder it points to instead.", "Can't shred a link")
             return
         if not dialogs.confirm("Shred permanently?",
                                f"{len(paths)} item{'s' if len(paths) != 1 else ''} will be overwritten and "

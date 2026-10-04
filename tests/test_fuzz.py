@@ -324,3 +324,125 @@ def test_fuzz_image_metadata(tmp_path, kind):
                 r.read()
 
     fuzz(f"image-{kind}", seeds[kind], run)
+
+
+# ── age files, SSH recipients, changed slots ─────────────────────────────────
+
+def test_fuzz_age_file():
+    """age headers, stanzas and payloads, read with every kind of key we hold."""
+    from locksmith.core import age
+    sk, hybrid = os.urandom(32), os.urandom(96)
+    blobs = []
+    for recipient in (age.Recipient("X25519", keys.public_from_private(sk)),
+                      age.recipient_for(keys.public_from_private(hybrid))):
+        out = io.BytesIO()
+        age.encrypt_stream(io.BytesIO(os.urandom(100) + b"x" * 70_000), out, [recipient])
+        blobs.append(out.getvalue())
+    out = io.BytesIO()
+    age.encrypt_stream(io.BytesIO(b"pw"), out, [], "pw", work_factor=1)
+    blobs.append(out.getvalue())
+    k = age.Keys(identities=[sk, hybrid], passphrase="pw")
+    rng0 = random.Random("age-seeds")
+    fuzz("age file", lambda rng: mutate(rng, rng0.choice(blobs)),
+         lambda b: age.decrypt_stream(io.BytesIO(b), io.BytesIO(), k))
+
+
+def test_fuzz_age_armor_and_keys():
+    from locksmith.core import age
+    text = age.armor(os.urandom(500)).encode()
+    fuzz("age armor", text, age.dearmor)
+    fuzz("age recipient", age.recipient_text(keys.public_from_private(os.urandom(96))),
+         age.parse_recipient_key, mutate_text)
+    fuzz("age identity", "AGE-SECRET-KEY-1GFPYYSJZGFPYYSJZGFPYYSJZGFPYYSJZGFPYYSJZGFPYYSJZGFPQ4EGAEX",
+         age.parse_identity, mutate_text)
+
+
+def test_fuzz_ssh_recipients():
+    from pathlib import Path
+
+    from locksmith.core import sshkeys
+    here = Path(__file__).parent / "interop" / "sshkeys"
+    for name in ("id_ed25519.pub", "id_rsa3072.pub"):
+        fuzz(f"ssh recipient {name}", (here / name).read_text(encoding="utf-8"), sshkeys.parse_recipient, mutate_text)
+    for name in ("id_ed25519", "id_ed25519_protected", "id_rsa3072_protected.pem"):
+        fuzz(f"ssh private key {name}", (here / name).read_bytes(), lambda b: sshkeys.load_identity(b, "x"))
+
+
+def test_fuzz_rsa_slots(ident):
+    """A file with an ssh-rsa slot, mutated, read by an RSA identity."""
+    from pathlib import Path
+
+    from locksmith.core import sshkeys
+    here = Path(__file__).parent / "interop" / "sshkeys"
+    rsa = sshkeys.parse_recipient((here / "id_rsa3072.pub").read_text(encoding="utf-8"))
+    rsa_ident = sshkeys.load_identity(sshkeys.read_private(here / "id_rsa3072"))
+    blob = engine.encrypt_bytes(b"x" * 3000, EncryptOptions(recipients=[rsa.raw, keys.public_from_private(ident)]))
+    k = DecryptKeys(identities=[ident], ssh=[rsa_ident])
+    fuzz("rsa slots", blob, lambda b: engine.decrypt_bytes(b, k))
+
+
+def test_fuzz_openpgp():
+    from pathlib import Path
+
+    from locksmith.core import openpgp
+    here = Path(__file__).parent / "interop" / "openpgp"
+    msg = here / "message.bin"
+    for sig, key in (("ed25519.sig", "ed25519.gpg"), ("rsa-subkey.sig", "rsa.gpg"), ("p256.sig.asc", "p256.asc")):
+        sig_data = (here / sig).read_bytes() if (here / sig).exists() else (here / "ed25519.sig.asc").read_bytes()
+        key_data = (here / key).read_bytes()
+        fuzz(f"openpgp key {key}", key_data, lambda k, s=sig_data: openpgp.verify_file(msg, s, k))
+        fuzz(f"openpgp signature {sig}", sig_data, lambda s, k=key_data: openpgp.verify_file(msg, s, k))
+
+
+def test_fuzz_qr_reader():
+    """The QR reader takes photos from anywhere: damaged grids and images may only fail cleanly."""
+    import segno
+
+    from locksmith.core import qrdecode
+    text = keys.paper_qr_text(os.urandom(96))
+    grid = [[int(bool(v)) for v in row] for row in segno.make(text, error="q").matrix]
+    flat = bytes(v for row in grid for v in row)
+    n = len(grid)
+
+    def from_flat(rng):
+        b = bytearray(flat)
+        for _ in range(rng.randint(1, 120)):
+            b[rng.randrange(len(b))] ^= 1
+        return [list(b[i * n:(i + 1) * n]) for i in range(n)]
+
+    def decode_grid(g):
+        try:
+            qrdecode.decode_grid(g)
+        except qrdecode._Fail:
+            pass
+    fuzz("qr grid", from_flat, decode_grid)
+
+    scale, quiet = 2, 4
+    side = (n + 2 * quiet) * scale
+    image = bytearray([230]) * side * side
+    for y in range(n):
+        for x in range(n):
+            if grid[y][x]:
+                for dy in range(scale):
+                    start = ((y + quiet) * scale + dy) * side + (x + quiet) * scale
+                    image[start:start + scale] = bytes([20]) * scale
+
+    def damaged(rng):
+        b = bytearray(image)
+        for _ in range(rng.randint(1, 1500)):
+            b[rng.randrange(len(b))] = rng.randrange(256)
+        return bytes(b)
+    fuzz("qr image", damaged, lambda px: qrdecode.decode(side, side, px))
+
+
+def test_fuzz_recovery_data(tmp_path):
+    from locksmith.core import parity
+    f = tmp_path / "data.bin"
+    f.write_bytes(os.urandom(60_000))
+    good = parity.create(f, "20").read_bytes()
+    side = tmp_path / "mutated.lpar"
+
+    def run(blob):
+        side.write_bytes(blob)
+        parity.check(f, side)
+    fuzz("recovery data", good, run)

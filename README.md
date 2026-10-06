@@ -65,7 +65,7 @@ Files are fully compatible between the Windows and Linux versions. Differences o
 ## Develop
 
 ```sh
-python3 -m venv .venv        # Python 3.12+; older than 3.14 installs backports.zstd automatically
+python3 -m venv .venv        # Python 3.12.11+ (or 3.13.4+); older than 3.14 installs backports.zstd automatically
 .venv/bin/pip install -e ".[dev]"
 .venv/bin/python run.py      # run from source
 .venv/bin/pytest             # tests
@@ -106,8 +106,8 @@ docs/        file-format specification
 - **age files:** encrypt to and decrypt `.age` files (age-encryption.org/v1), including age's
   post-quantum recipients, so files can be exchanged with age and rage. Checked against the age
   authors' test kit.
-- **Privacy:** optional lossless removal of photo metadata (JPEG, PNG, WebP: location, camera, dates), file
-  times and archive owner names.
+- **Privacy:** optional lossless removal of photo metadata (JPEG, PNG, WebP: location, camera, dates) and
+  file times. Folder archives never record user or group names. Text messages are padded, not compressed.
 - **Extras:** streaming chunked encryption with parallel per-chunk compression (Zstandard, zlib, LZMA,
   bzip2, or automatic), size padding (Padmé, block or power-of-two), hidden file names, encrypted notes,
   folders and multi-item bundles, ASCII armor, verify-only mode, shredding of originals.

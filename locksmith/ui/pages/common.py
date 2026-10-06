@@ -5,7 +5,7 @@ from pathlib import Path
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import QFileDialog, QVBoxLayout, QWidget
 
-from ...core import keys
+from ...core import kdf, keys
 from ...core.keys import fingerprint
 from .. import dialogs, host
 from ..widgets import Dropdown, LinkButton, ToggleRow, label
@@ -162,3 +162,17 @@ class RecipientPicker(QWidget):
 
     def selected(self) -> list[bytes]:
         return [raw for row, raw in self.rows if row.isChecked()]
+
+
+def confirm_kdf_cost(infos) -> bool:
+    """Ask before trying a password on files whose key derivation costs more than any preset
+    Locksmith writes (``engine.FileInfo``s). True: go ahead."""
+    costly = [s for info in infos for s in info.password_slots if kdf.beyond_presets(s["kdf"], s["params"])]
+    if not costly:
+        return True
+    return dialogs.confirm(
+        "Unusually slow password check",
+        "Checking the password takes more memory and time than any Locksmith setting: "
+        + kdf.describe(costly[0]["kdf"], costly[0]["params"])
+        + ". Each try can use GiBs of memory and run for minutes, and can't be cancelled while it runs. "
+        "Only continue if you expect this file to be that strongly protected.", ok="Check the password")

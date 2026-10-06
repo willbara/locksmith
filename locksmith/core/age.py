@@ -831,7 +831,7 @@ def decrypt_path(path: Path, out_dir: Path | None, keys: Keys, progress=None,
             target = engine.unique_path(out_dir / target_name)
             os.replace(tmp, target)
         except BaseException:
-            tmp.unlink(missing_ok=True)
+            scratch.discard(tmp)   # partly decrypted plaintext: shredded
             raise
     complete = osutil.fsync_dir(out_dir)
     if mark_untrusted:
@@ -869,7 +869,7 @@ def decrypt_pasted(blob: bytes, out_dir: Path, keys: Keys, max_output: int):
     """Open a pasted age message (already de-armored). It has no name or kind, so content that
     reads as text stays in memory, in ``data``; anything else is written to ``out_dir`` as
     "decrypted" and marked as coming from the internet on Windows."""
-    from . import engine, osutil
+    from . import engine, osutil, scratch
     data = decrypt_bytes(blob, keys, max_output)
     try:
         text = data.decode("utf-8")
@@ -886,7 +886,7 @@ def decrypt_pasted(blob: bytes, out_dir: Path, keys: Keys, max_output: int):
         target = engine.unique_path(out_dir / "decrypted")
         os.replace(tmp, target)
     except BaseException:
-        tmp.unlink(missing_ok=True)
+        scratch.discard(tmp)
         raise
     complete = osutil.fsync_dir(out_dir)
     osutil.mark_untrusted(target)

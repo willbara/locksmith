@@ -89,7 +89,8 @@ class EncryptPage(Page):
         self.hide_recipients = ToggleRow(
             "Hide the number of recipients",
             "Adds decoy recipient slots, so the file shows 8, 16, 32 or 64 instead of how many people "
-            "can really open it.", settings["hide_recipients"])
+            "can really open it. Decoys are all of one kind, so mixing post-quantum recipients with classical "
+            "or SSH keys still shows how many of those there are.", settings["hide_recipients"])
         rl.addWidget(self.hide_recipients)
         self.rsa_note = label("An SSH RSA recipient is selected. Locksmith 3.0 and earlier can't open such a file at "
                               "all, even with its password.", "caption")

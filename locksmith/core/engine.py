@@ -38,6 +38,7 @@ import secrets
 import shutil
 import stat
 import struct
+import sys
 import tarfile
 import threading
 import time
@@ -1141,6 +1142,14 @@ def _rate(bps: float) -> str:
 
 # ── sources: files, folders, bundles ─────────────────────────────────────────
 
+def _without_owner(info: tarfile.TarInfo) -> tarfile.TarInfo:
+    """No user or group names or ids in an archive, even without metadata removal: they only
+    tell recipients the sender's login name, and extraction never uses them."""
+    info.uid = info.gid = 0
+    info.uname = info.gname = ""
+    return info
+
+
 class _TarStream(io.RawIOBase):
     """Streams a tar archive of the given paths without a temp file."""
 
@@ -1162,7 +1171,7 @@ class _TarStream(io.RawIOBase):
                     if self._strip:
                         self._add_stripped(tar, Path(path), arcname)
                     else:
-                        tar.add(str(path), arcname=arcname)
+                        tar.add(str(path), arcname=arcname, filter=_without_owner)
         except BrokenPipeError:
             pass
         except BaseException as e:  # surfaced to the reader
@@ -1477,6 +1486,8 @@ def _decrypt_into(f: BinaryIO, total: int, header: dict, raw: bytes, k: _Keys, m
     is moved into place under its sanitised name, a folder or bundle is extracted (a
     folder's top level unwrapped). Nothing is in place until every frame authenticated
     and any signature verified."""
+    if meta.get("kind") in ("dir", "bundle"):
+        _check_tarfile()   # before decrypting anything
     out_dir.mkdir(parents=True, exist_ok=True)
     name = safe_name(meta.get("name") or fallback_name)
     tmp = out_dir / f".locksmith-{secrets.token_hex(6)}.part"
@@ -1526,7 +1537,7 @@ def _decrypt_into(f: BinaryIO, total: int, header: dict, raw: bytes, k: _Keys, m
             # Callers may delete the source as soon as this returns.
             complete = fsync_dir(out_dir) and complete
         except BaseException:
-            tmp.unlink(missing_ok=True)
+            scratch.discard(tmp)   # plaintext, perhaps of a file whose signature failed: shredded
             raise
     return DecryptResult(target, meta, skipped=skipped, complete=complete, signature=signature,
                          intent=_intent(meta, signature, k, keys))
@@ -1626,6 +1637,15 @@ class _BoundedTarInfo(tarfile.TarInfo):
         raise CorruptedError(_SPARSE)
 
 
+def _check_tarfile(version: tuple = sys.version_info[:3]):
+    """Refuse to unpack folders where Python's tarfile "data" filter has known bypasses that let a
+    crafted archive write outside the output folder (CVE-2025-4517 and related, fixed in 3.12.11,
+    3.13.4 and 3.14.0). Only running from source can hit this: the builds bundle a fixed Python."""
+    if version < (3, 12, 11) or (3, 13) <= version < (3, 13, 4):
+        raise LocksmithError(f"This Python ({'.'.join(map(str, version))}) can't unpack folders safely. Update it "
+                             "to 3.12.11, 3.13.4, 3.14 or later to decrypt folders.")
+
+
 def extract_archive(archive: Path, dest: Path, space: _DiskGuard | None = None) -> Extraction:
     """Extract with the tarfile "data" filter, one member at a time. Members the filter
     rejects (such as links pointing outside the folder, or device files), names the file
@@ -1633,6 +1653,7 @@ def extract_archive(archive: Path, dest: Path, space: _DiskGuard | None = None) 
     of aborting, so one odd entry cannot make a whole folder unrecoverable. A damaged
     archive, a full disk or ``space`` running out stops everything. Everything extracted is
     then fsynced."""
+    _check_tarfile()
     result = Extraction()
     skipped = result.skipped
     extracted: dict[str, bool] = {}  # _extracted_key -> is a folder
@@ -1710,11 +1731,11 @@ def extract_archive(archive: Path, dest: Path, space: _DiskGuard | None = None) 
                 except (OSError, tarfile.ExtractError):
                     pass
     except LocksmithError:
-        shutil.rmtree(dest, ignore_errors=True)
+        scratch.discard(dest)
         raise
     except (tarfile.TarError, OSError, ValueError) as e:
         # ValueError: values tarfile itself cannot handle in a crafted header.
-        shutil.rmtree(dest, ignore_errors=True)
+        scratch.discard(dest)
         raise LocksmithError(f"Could not unpack the archive: {e}") from e
     result.flushed = fsync_tree(dest)
     return result

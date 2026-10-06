@@ -30,6 +30,7 @@ from ..widgets import (
 )
 from ..workers import run_task
 from .common import (
+    confirm_kdf_cost,
     own_encryption_keys,
     reveal,
     saved_signers,
@@ -133,7 +134,7 @@ class SharePage(Page):
         try:
             attached = host.compose_email(
                 f"Encrypted file: {self.file.name}",
-                "This file is encrypted with Locksmith. I'll send you the password separately.", self.file)
+                "This file is encrypted with Locksmith. I will send you the password separately.", self.file)
         except OSError:
             dialogs.error("No email program could be opened.")
             return
@@ -217,8 +218,11 @@ class SharePage(Page):
         if not text.strip():
             toast("Write a message first", "alert")
             return
+        # Not compressed: the ciphertext's size would follow how compressible the text is, which
+        # leaks content when part of it comes from someone else (quoted replies). Padded, so the
+        # size says less about the length.
         opts = EncryptOptions(suite=settings["suite"], kdf=settings["kdf"], preset=settings["preset"],
-                              compression="zlib")
+                              compression="none", padding="padme")
         if self.msg_mode.index() == 0:
             if not self.msg_pw.text():
                 toast("Enter a password", "alert")
@@ -262,6 +266,8 @@ class SharePage(Page):
         identities = self.store.unlocked_private_keys()
         password = None
         if info.password_slots and (not info.recipient_slots or not identities):
+            if not confirm_kdf_cost([info]):
+                return
             password = dialogs.prompt("Message password", "This message is protected by a password.",
                                       "Password", secret=True, ok="Decrypt")
             if password is None:

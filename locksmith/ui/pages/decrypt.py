@@ -9,7 +9,8 @@ from PySide6.QtWidgets import QFrame, QScrollArea, QVBoxLayout, QWidget
 from ...core import age, engine, kdf, parity, sshkeys
 from ...core.engine import AccessChange, DecryptKeys
 from ...core.errors import LocksmithError
-from ...core.tools import estimate_entropy, same_secret, strength_label
+from ...core.osutil import opens_as_program
+from ...core.tools import display_text, estimate_entropy, same_secret, strength_label
 from .. import dialogs
 from ..dialogs import Sheet
 from ..lock import is_locked, withhold
@@ -38,6 +39,7 @@ from ..workers import run_task
 from .common import (
     OutputPicker,
     RecipientPicker,
+    confirm_kdf_cost,
     open_url,
     own_encryption_keys,
     reveal,
@@ -269,6 +271,16 @@ class DecryptPage(Page):
                                own_keys=own, ssh=ssh_keys)
         return build
 
+    @staticmethod
+    def _kdf_cost_ok(paths, pasted) -> bool:
+        infos = []
+        for p in paths:
+            try:
+                infos.append(engine.inspect_bytes(pasted[p]) if p in pasted else engine.inspect(Path(p)))
+            except (LocksmithError, OSError):
+                continue   # reported when the file is opened
+        return confirm_kdf_cost(infos)
+
     def start(self):
         paths = self.files.paths()
         if not paths or self.task is not None:
@@ -279,6 +291,9 @@ class DecryptPage(Page):
         threads = self.threads.value()
         pasted = dict(self.pasted)
         ages = {p for p in paths if self._is_age(p)}
+        if (self.password.text() or self.keyfile.path) and not self._kdf_cost_ok(
+                [p for p in paths if p not in ages], pasted):
+            return
         build_keys = self._key_source()
         if build_keys is None:
             return
@@ -387,7 +402,8 @@ class DecryptPage(Page):
         scroll.setMaximumHeight(200)
         s.add(scroll)
         hide = ToggleRow("Hide the number of recipients", "Rounds the recipient slots up to 8, 16, 32 or 64 with "
-                         "decoys.", settings["hide_recipients"])
+                         "decoys. Classical, SSH and RSA recipients beside post-quantum ones stay countable.",
+                         settings["hide_recipients"])
         s.add(hide)
         s.add_button("Cancel", None, "ghost")
         s.add_button("Save changes", True, "primary")
@@ -528,6 +544,18 @@ class DecryptPage(Page):
             if w:
                 w.deleteLater()
 
+    @staticmethod
+    def _open(path: Path, sig):
+        """Open a decrypted file with its default app, asking first when that would run it."""
+        if opens_as_program(path.name) and not dialogs.confirm(
+                "Run a program?",
+                f"“{path.name}” is a program, script or shortcut: opening it runs it with your account's rights, "
+                + ("and it was signed with a key you saved. " if sig is not None and sig.verified else
+                   "and nothing shows who made it. ")
+                + "Only open it if you trust whoever made the file.", ok="Run it", icon="alert"):
+            return
+        open_url(path.resolve().as_uri())
+
     def _add_result(self, kind, value, meta):
         card = Card()
         card.lay.setContentsMargins(18, 14, 14, 14)
@@ -541,7 +569,7 @@ class DecryptPage(Page):
             card.add(label(preview, "caption"))
             dialogs_needed = True
         elif kind == "verified":
-            card.add(hrow(label(meta.get("name", Path(value).name), "mono", wrap=False), None,
+            card.add(hrow(label(engine.safe_name(meta.get("name") or Path(value).name), "mono", wrap=False), None,
                           label("✓  Authentic", "caption", wrap=False)))
             dialogs_needed = False
         else:
@@ -549,18 +577,19 @@ class DecryptPage(Page):
             show = Button("Show", "folder", "ghost")
             show.clicked.connect(lambda: reveal(path))
             open_btn = Button("Open", "arrow-right", "secondary")
-            open_btn.clicked.connect(lambda: open_url(path.resolve().as_uri()))
+            open_btn.clicked.connect(lambda: self._open(path, meta.get("_signature")))
             card.add(hrow(label(path.name, "mono", wrap=False), None, show, open_btn))
             dialogs_needed = False
         sig = meta.get("_signature")
         card.add(label(signature_text(sig, getattr(self, "_signers", {}), meta.get("_intent")), "caption"))
         if meta.get("note"):
             # The signature covers the note; without a checked one, nothing proves who wrote it.
-            card.add(label(f"Note (signed): {meta['note']}" if sig is not None and sig.verified else
-                           f"Note from the sender (not verified): {meta['note']}", "caption"))
+            note = display_text(meta["note"])
+            card.add(label(f"Note (signed): {note}" if sig is not None and sig.verified else
+                           f"Note from the sender (not verified): {note}", "caption"))
         skipped = meta.get("_skipped") or []
         if skipped:
-            shown = ", ".join(skipped[:5]) + ("…" if len(skipped) > 5 else "")
+            shown = ", ".join(display_text(name, 120) for name in skipped[:5]) + ("…" if len(skipped) > 5 else "")
             card.add(label(f"Left out {len(skipped)} unsafe item{'s' if len(skipped) != 1 else ''} "
                            f"(links pointing outside the folder or device files): {shown}", "caption"))
         if meta.get("_kept"):

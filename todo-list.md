@@ -1,298 +1,470 @@
-# Locksmith To-Do List
+# Locksmith security audit
 
-Two parts: **features** (Part 1) and **security fixes** (Part 2). Within each category, tasks are ordered
-from easiest to hardest. Categories are ordered by priority. **Signature verification is the top priority.**
+- **Code reviewed:** commit `61e83d6` (Locksmith 4.0.0), everything under `locksmith/`, plus the packaging scripts
+  as far as they affect what ships.
+- **Date:** 2026-10-05
+- **Method:** I read every module by hand. Suspected issues were checked with small proof-of-concept scripts run
+  against the real code from a scratch folder. The only change to the repository is this file. Windows-only behaviour
+  (Mark of the Web, `os.startfile`, roaming profiles) is reasoned from the code and was not run on Windows.
+- **Previous findings:** the earlier audit's items (N1–N15) are fixed in this commit, and I didn't re-raise them. The
+  findings below are new.
 
-Complexity tags: **[Easy]** about a day or less · **[Medium]** a few days · **[Hard]** a week or more, or needs a format change.
+## Severity scale
 
-## Start here: critical path for signature verification
+| Level | Meaning |
+|---|---|
+| **High** | Defeats a guarantee the app makes (confidentiality, or "signed by X") under conditions an attacker can realistically arrange |
+| **Medium** | An attacker can cause real harm (data replaced, a protection bypassed, a misleading security claim), but needs extra conditions or user steps |
+| **Low** | Narrow, needs unusual conditions, or leaks only a little information |
+| **Info** | Not a bug: a limit of the design that users or the docs should state clearly |
 
-1. ~~Part 2, "Signing prerequisites" (N7, N3).~~ Done.
-2. ~~Part 1, "Signature verification".~~ Done, including signed `.locked` files and the Decrypt signer status.
-3. Format v2 (Part 1, "Format v2"). **Done:** the v2 container (fixed header and key slots kept apart, frames
-   and the key commitment bound to the fixed header only), signed files, and the reserved `to` field
-   (`intended_recipients`) in `docs/FORMAT.md` §7. Every file is now written as v2; v1 is still read. This is
-   version 3.0.0. **Done since:** editing passwords, keyfiles and recipients in place (Decrypt → Change who can
-   open it), the recipient-list UI, and the authenticated-encryption re-evaluation (not built; see 1.2).
+## Summary
 
----
+| ID | Severity | Finding | Area | Status |
+|---|---|---|---|---|
+| A1 | **High** | A contact's signing keys can be replaced with anyone's ("update contact"), so an attacker's signatures show as "✓ Signed with the key you saved as Alice" | Keys, signing | Open |
+| A2 | **Medium** | A crafted `.lpar` makes "Repair" replace an intact file with arbitrary content | Recovery data | Open |
+| A3 | **Medium** | "Signed by a key you haven't saved (fingerprint …)" shows a fingerprint the attacker chose, without verifying anything | Signing | Open |
+| A4 | **Medium** | Share → Join strips the Mark of the Web (Windows): a way to deliver programs past SmartScreen | Share | Open |
+| A5 | **Medium** | Identity private keys are stored unencrypted by default, and on Windows in the *roaming* profile | Key storage | Open |
+| A6 | Low | Sender-controlled text (notes, names, OpenPGP user IDs) can fake status lines such as "✓ Signed with…" | UI | ✅ Patched (partly: no status badge yet) |
+| A7 | Low | "Open" on a decrypted file runs programs and scripts directly, without a warning | Decrypt | ✅ Patched |
+| A8 | Low | 80-bit fingerprints are the only thing most users compare | Keys | Skipped (needs format revision) |
+| A9 | Low | "Hide the number of recipients" still shows how many classical, SSH and RSA recipients a file has | Format privacy | Partly: help text only |
+| A10 | Low | Default settings leak usernames, file times and content sizes to recipients and observers | Privacy defaults | ✅ Patched |
+| A11 | Low | Plaintext from a failed decryption is deleted, not shredded | Decrypt | ✅ Patched |
+| A12 | Low | A crafted file can make each open use 2 GiB of RAM and minutes of CPU | Decrypt | ✅ Patched (partly: not cancellable mid-run, age not covered) |
+| A13 | Low | Folder extraction safety depends on the Python patch level when run from source | Extraction | ✅ Patched |
+| A14 | Low | The email subject passes a file name through `xdg-email`, which some mail clients parse unsafely | Share | ✅ Patched |
+| A15 | Low | A password split with Shamir shows its exact length in every share | Share | Skipped (needs share format change) |
+| I1–I8 | Info | Lock screen, network block, TPM sealing, X11, age SSH tags, OpenPGP key freshness, ICC profiles, Windows ACLs | Design limits | Info (no fix planned) |
 
-# Part 1: Features
+The core cryptography holds up well; see "Checked and found sound" at the end. The serious issues are
+about **trust and display**: who the app says signed something, and what it lets a file or sidecar from someone
+else overwrite.
 
-## 1.1 Signature verification (top priority)
+## Progress on the Low items (2026-10-05)
 
-Effort ranges come from the scope check and are rough.
+Done in order of simplicity. Each fix has a regression test (in the "2026-10-05 audit" section at the end of
+`tests/test_security.py`, or in `tests/test_ui_flows.py`) that fails without the fix. The full suite passes
+(930 passed, 5 skipped) and `ruff check` is clean. Nothing is committed yet.
 
-- [x] **[Easy]** Raise the `cryptography` floor in `pyproject.toml` (currently `>=44`; the code needs ML-KEM and
-  signing needs ML-DSA). Add an ML-DSA check to `--self-test`, since ML-DSA needs OpenSSL 3.5+, AWS-LC or BoringSSL
-- [x] **[Easy]** Verify SSH signatures (`ssh-keygen -Y sign`) on the Tools page next to minisign (2–4 days).
-  Check the namespace, refuse or handle `sk-` (FIDO) keys, and show only what the signature covers
-- [x] **[Easy]** Add interop vectors made by real `minisign` (current tests use signatures from Locksmith's own helper)
-- [x] **[Medium]** Write the signature decisions into `docs/FORMAT.md` before any code, then make vectors from that
-  text: key derivation, key string and fingerprint, hybrid combiner, exactly what is signed, domain-separation labels
-- [x] **[Medium]** Hybrid signing keys (Ed25519 + ML-DSA-65), derived from the existing hybrid identity key so
-  `keys.json`, backups, backup words and Shamir shares stay unchanged. Classical identities must upgrade to hybrid
-  first. A signature needs both parts to verify, and the stored key type decides the algorithm
-- [x] **[Medium]** New public key string for keys that can verify (new prefix, own fingerprint). It is too big for
-  a QR code, so decide: drop the QR or use multi-part. Store the verify key inside the contact's `public` field,
-  not a side field, because old builds drop unknown fields on save
-- [x] **[Medium]** Sign and Verify files with detached signatures (a Tools card pair): prehashed, labeled
-  `locksmith/v1/sig/…`, with vectors, a fuzz target and negative tests (stripped ML-DSA part, swapped Ed25519 part,
-  wrong key type, altered comment, one-bit file change, truncated signature)
-- [x] **[Hard]** Signed `.locked` files (embedded signature, format v2): sign every header field except the key
-  slots, plus the metadata (including the optional `intended_recipients` list) and the plaintext hash, inside the
-  encryption (see the decision in 1.2)
-- [x] **[Hard]** Show the signer and status on Decrypt results ("Signed by the key you saved as Alice ✓" / unknown
-  key / invalid / not signed). It must come from core, never from file metadata. Needs the item above and N3 + N7
-
-Wording rule for all of the above: a valid signature means "signed with the key you saved as X", not "from X".
-
-## 1.2 Format v2 (decide as one bundle, with signed files)
-
-These interact. Editing recipients without re-encrypting conflicts with signatures that bind the key slots, so
-decide the bundle before building any of them.
-
-- [x] **[Medium]** Decide the v2 bundle: do signatures re-sign on recipient edits, or exclude the slots?
-  Keep all v1 test vectors untouched
-  - **Decided (2026-10-03):** signatures **exclude the key slots**. This *allows* forwarding with the signature
-    intact: anyone who can open a signed file can add a slot for someone else, and it still shows as signed by
-    the original signer ("surreptitious forwarding"). Reasons for accepting that:
-    - Every key slot edit would break a signature that binds the slots, and v2 needs slot edits: changing the
-      password or keyfile is a slot edit, and so is adding or removing a recipient. Excluding the slots keeps
-      all of them working without a re-sign.
-    - It is a trade-off. Binding the slots protects the signer's intent (a forwarded copy would no longer verify
-      as signed for its new reader), but blocks those recipient, password and keyfile edits. Neither choice stops
-      plaintext forwarding: anyone who can decrypt can pass the content on unsigned. The optional list below
-      recovers most of the intent protection without blocking edits.
-    - Most files are recipient-independent (documents, releases), so the signature only needs to attest who
-      wrote the content.
-  - **Mitigation, reserved in the v2 format now (UI may follow later):** an optional `intended_recipients` field
-    inside the signed, encrypted metadata. Each entry is a domain-separated hash of a recipient's *encryption*
-    key (the 32- or 1216-byte part slots are made for), so it matches whether the contact was saved as
-    `locksmith2` or `locksmith3`; the UI shows fingerprints. What Decrypt says depends on how the file was
-    opened, and is always neutral, never accusatory:
-    - Opened with a key that is on the list: no warning.
-    - Opened with a key that isn't on the list: "Signed by <name>, but you weren't on the original recipient
-      list".
-    - Opened with a password or keyfile (any non-key slot): "Addressed to specific people; opened with its
-      password". It must not say the reader was left off.
-    - Field absent: Decrypt says nothing about intent. Keep "signed with the key you saved as X" and never imply
-      the signer sent the file to the reader.
-    - Signer UI: an "addressed to specific people" toggle, off by default.
-    - Caveats: anyone who can decrypt can read the list, so recipients learn who else was addressed. That also
-      cancels "hide recipients" (decoy slots) toward recipients: when both are on, the signer UI shows this
-      privacy trade-off before signing. Files with only password or keyfile slots can't use the list (those
-      slots have no key to list), and the UI must say so rather than silently leave it out. The list records
-      the signer's original intent and doesn't change when someone later adds a legitimate recipient, who will
-      then see the neutral "not on the original list" wording.
-  - **Spec first:** the list-entry definition goes into `docs/FORMAT.md` before any code: the hash input (the
-    exact encryption public-key bytes, as in §9: the 32-byte X25519 key, or the X25519 key followed by the
-    ML-KEM-768 key, 1216 bytes, with no prefix or checksum), a domain-separation label in the `locksmith/v2/…`
-    style, and that the reader tests every one of its saved identities' encryption keys against the list.
-  - **Required tests when it is built:** a file with a list opened by a reader who is on it (no warning), one
-    who isn't, and by password; a signed file with no list (no intent wording); the list stripped from the
-    metadata (the signature must fail); one entry altered (the signature must fail); and the signer-side
-    warning when the list and decoy slots are both enabled.
-- [x] **[Hard]** Extend the key commitment to cover the fixed header fields, so tampering fails at unlock.
-  It must also exclude the key slots, so recipient, password and keyfile edits don't break it
-- [x] **[Hard]** Change the password or keyfile without re-encrypting the data. `engine.change_access` rewrites
-  only the slots (FORMAT.md §3, "Changing the slots"); the UI is Decrypt → "Change who can open it…", which
-  unlocks with the page's inputs and asks before leaving the user unable to open the file
-- [x] **[Hard]** Add or remove recipients without re-encrypting the data. Removing a recipient does **not**
-  revoke access for anyone who already has the file key and a copy of the data; the UI and docs must say so
-  plainly. Real revocation means re-encrypting with a new file key
-  - Recipient slots are anonymous, so a single recipient can't be picked out: the UI offers "keep them, add
-    more" or "replace them" with everyone who should keep access, and says why. The sheet, README and
-    FORMAT.md all state that a change revokes nothing.
-- [x] **[Hard]** Optional authenticated public-key encryption ("from Alice ✓"). Signed files in 1.1 plus the
-  `intended_recipients` list may cover most of its use case, so re-evaluate it after signed files ship
-  - **Re-evaluated (2026-10-03): not built.** Signed files already give "signed with the key you saved as
-    Alice ✓", and the recipient list says whether the reader was addressed. What sender-authenticated
-    encryption would add is deniability (the reader can't prove to others who sent it). Against that:
-    a post-quantum version needs a post-quantum authenticated KEM, which isn't standardised (static X25519
-    authentication alone would be forgeable by a quantum computer, unlike the ML-DSA signatures we have);
-    it needs a new slot type that Locksmith 3.0 refuses, so a major version for a niche property; and two
-    ways to show a sender would confuse the "who made this" wording. Revisit if a standard PQ AKEM appears
-    and deniable messages become a concrete need.
-
-## 1.3 Interop
-
-- [x] **[Medium]** Accept SSH Ed25519 public keys as recipients (3–6 days). Convert to X25519 and reuse the
-  `x25519` slot. Classical only. Decrypting with a passphrase-protected SSH key also needs the `bcrypt` module
-  (3–5 days more, a new hash-locked dependency)
-  - Done: `core/sshkeys.py`; contacts store the SSH key line; Decrypt has an SSH key picker (the key is read
-    when needed, never stored). `bcrypt` 5.0.0 added to the lock. Vectors: `tests/interop/sshkeys` (made by
-    ssh-keygen) and `tests/vectors/v2-ssh-recipients.locked`.
-- [x] **[Hard]** Accept SSH RSA public keys as recipients
-  - New `ssh-rsa` slot (RSA-OAEP-SHA256, 2048–16384 bits, FORMAT.md §3). Locksmith 3.0 refuses files with
-    one, so under the SemVer rule the next release is 4.0.0; the Encrypt page warns when one is selected.
-- [x] **[Hard]** Read and write age-compatible files
-  - `core/age.py`: X25519, scrypt, ssh-ed25519, ssh-rsa and the post-quantum mlkem768x25519 (X-Wing in HPKE)
-    stanzas, armor, streaming. Passes all 147 vectors of the age authors' CCTV test kit
-    (`tests/interop/age-cctv`). Locksmith hybrid identities open age PQ files and export as `age1pq1…`.
-- [x] **[Hard]** OpenPGP signature verify-only (15–25 days hand-written, or 3–6 with `gpgv` on Linux only).
-  Do this only if you have a concrete need to check OpenPGP-signed downloads. A narrow option is a v4 detached-signature
-  verifier with a pinned key and no keyring
-  - Done as that narrow option: `core/openpgp.py` (v4, Ed25519/ECDSA/RSA, SHA-2/SHA-3, subkeys with
-    back-signatures, revocation and expiry), Tools card, vectors from GnuPG 2.4.9 in `tests/interop/openpgp`.
-- [ ] **[Deferred]** OpenPGP encrypt, decrypt and sign. Months of work, plus the RFC 9580 vs LibrePGP split
-
-## 1.4 Identity backup
-
-- [x] **[Medium]** Printable paper backup (QR + words). Keys → identity → "Save a printable paper backup"
-  writes an owner-only one-page PDF (FORMAT.md §10).
-- [x] **[Hard]** Restore an identity by scanning the paper backup's QR code. Keys → Restore → "Scan QR code…"
-  reads a photo or scan with a pure-Python QR reader (`core/qrdecode.py`, no new dependency); the AppImage
-  and .exe now bundle Qt's JPEG and WebP image plugins for photos. A webcam isn't used.
-
-## 1.5 Smaller features
-
-- [x] **[Medium]** File manager integration: a right-click "Encrypt with Locksmith" and a `.locked` file association.
-  Settings → Desktop integration (GNOME Files, Dolphin, Nemo, Windows Explorer; current user only)
-- [x] **[Hard]** Recovery data (parity records) for long-term archives. `.lpar` sidecar files (FORMAT.md §17,
-  Reed-Solomon/Cauchy over GF(256), spread stripes); Tools card and an Encrypt option
-
-## 1.6 Trust and hardening
-
-- [x] **[Easy]** Add a status note near the top of the README: not independently audited, built with AI-assisted
-  review, tests and fuzzing, not the only copy of irreplaceable data
-- [x] **[Easy]** Soften absolute claims in the README and FORMAT.md: "independent reader" → "second reader",
-  runtime protections → "configured to", "Recipients stay anonymous" → "recipients aren't named in the file", and
-  any implication that secrets are cleared from Python memory
-- [x] **[Medium]** Reproducible builds. `SOURCE_DATE_EPOCH`, fixed hash seed and file times in the build scripts;
-  `packaging/check_reproducible.sh` built the AppImage twice with identical results (2026-10-03)
-- [ ] **[Hard]** Independent audit (long term)
+| ID | Status | What changed |
+|---|---|---|
+| A14 | **Fixed** | `host.mail_safe` removes `' " , & % \ ;` and control characters from the subject and body before `xdg-email`; the body no longer contains "I'll" |
+| A10 | **Fixed** | Folder archives never store user or group names or ids (times are still kept unless stripping is on); Share messages are padded (Padmé) and no longer compressed |
+| A11 | **Fixed** | New `scratch.discard`: plaintext left by a failed, cancelled or signature-rejected decryption (Locksmith and age, including partly extracted folders) is shredded when it holds at most 1 GiB, then deleted. Larger leftovers are only deleted, so cancelling a huge file doesn't take minutes. The crash journal still shreds everything |
+| A13 | **Fixed** | `engine._check_tarfile` refuses to decrypt folders (checked before anything is decrypted) on Python older than 3.12.11, or on 3.13.0–3.13.3. README updated |
+| A7 | **Fixed** | Decrypt → Open asks before opening a program, script, shortcut or installer (`osutil.opens_as_program`, Windows and Linux types). The prompt says whether the file was signed with a saved key |
+| A6 | **Fixed (partly)** | `tools.display_text` turns line breaks into spaces, drops control characters and bidi overrides, and limits the length. Used for notes, skipped member names, minisign trusted comments and OpenPGP user IDs; verify-only mode now shows names through `safe_name`. **Not done:** showing the signature status as a separate badge with an icon (a UI design change) |
+| A12 | **Fixed (partly)** | `kdf.beyond_presets` flags KDF settings above every preset Locksmith writes. Decrypt and Share → Open a message then show the cost and ask before trying the password. **Not done:** running the KDF in a child process so it can be cancelled mid-run (a bigger change), and the same check for age `scrypt` work factors (`age.inspect` doesn't report them yet) |
+| A9 | **Partly: wording only** | The "Hide the number of recipients" help texts (Encrypt page, Change who can open it) now say that classical, SSH and RSA recipients beside post-quantum ones stay countable. **Skipped:** changing the decoys. Any decoy mix that follows the real recipients still leaks which kinds are present, and RSA would need decoy `ssh-rsa` slots (random ciphertexts of common modulus sizes). That is a design decision: pick a fixed policy (for example, refuse mixed kinds when hiding, or always add every kind), then test how files look with each mix |
+| A15 | **Skipped** | Needs a share format change: Shamir shares are specified in `docs/FORMAT.md` §11 (`locksmithshare2`). Padding the secret means a new `locksmithshare3` (length prefix and padding inside the shared data, with a block size to choose, for example 32 or 64 bytes), a spec update and new vectors, while still reading v1 and v2. Identity shares are fixed-size, so they don't leak and could stay on v2 |
+| A8 | **Skipped** | The fingerprint ("first 20 hex digits of SHA-256") is defined in `docs/FORMAT.md` §9, checked by committed vectors (`tests/vectors/signatures.json`, `tests/spec_reader.py`), printed on paper backups, and already compared by users. Lengthening it means a spec revision, new vectors (the old ones must stay), a decision on how old 20-digit fingerprints are shown during the transition, and UI layout checks. A lighter interim step would be to show the full 64-digit hash on a contact's details sheet |
 
 ---
 
-# Part 2: Security fixes
+## A1 (High): a contact's signing keys can be swapped for an attacker's
 
-All open items below are Medium severity. They come from the 2026-10-01 re-audit (commit `7be605e`) and keep their
-IDs from `todo-list-checked.md`, which holds the original write-ups. Every other finding from the original review
-(including N1 and N9–N15) is already fixed. Line numbers are from that commit and may have shifted since, so
-search by function name if they don't match. Each fix needs a regression test that fails before the fix and
-passes after.
+**Where:** [keys.py:718](locksmith/core/keys.py#L718) (`KeyStore.update_contact_key`), the dialog in
+[ui/pages/keys.py:205-214](locksmith/ui/pages/keys.py#L205-L214), and `add_contact`, which steers users to that dialog.
 
-## 2.1 Signing prerequisites (do before any signer UI)
+**What happens.** A `locksmith3` public key is three keys put side by side: an encryption key (X25519 + ML-KEM) and
+two verify keys (Ed25519 + ML-DSA). Nothing in the key shows that the verify keys belong to the same person as the
+encryption key. They are derived from the private key, but only its holder can check that.
+`update_contact_key` accepts any `locksmith3` key whose *encryption* part matches a saved contact, and saves the
+verify keys that came with it.
 
-- [x] **[Medium]** **N7: Files decrypted from pasted text have no Mark of the Web on Windows**
-  - **Problem:** `decrypt_path` copies the source's Zone.Identifier onto the output, but the Decrypt page's paste
-    path writes files and folders with no mark at all. Pasted text comes from someone else, through chat or email.
-    A sender can paste-deliver an `.exe`, script or macro document that, after one click on the result's Open
-    button, runs without SmartScreen or Office Protected View.
-  - **Where:** `locksmith/ui/pages/decrypt.py:245-266`, `locksmith/core/osutil.py:68-90` (originally
-    `todo-list-checked.md`, N7; the scope check also lists the paste path as `decrypt.py:244-266`, the file path
-    as `engine.py:1167-1230` and the in-memory path as `engine.py:1233-1241`)
-  - **Fix:** add `osutil.mark_untrusted(target)`, which writes `[ZoneTransfer]\r\nZoneId=3\r\n` to every file of
-    the target (no-op off Windows), and call it from `_decrypt_pasted` for files and folders. Better: move the
-    paste-to-disk logic into core so the rule lives in one place and signature checks can hook in there too. Moving
-    it also fixes two quirks of that path: when the chosen output folder doesn't exist yet, output silently goes to
-    the home folder (`decrypt_path` creates the folder), and a pasted folder isn't unwrapped, so it lands one level
-    deeper (`proj/proj/…`) than the same folder decrypted from a file.
-  - **Test (Windows suite):** decrypt a pasted file message and a pasted folder message. Every output file has a
-    `Zone.Identifier` stream with `ZoneId=3`.
+The dialog then says: *"This is the key you saved as "Alice", with its signing keys added, so you can verify their
+signatures."* The first half of that sentence can't be known. It also suggests that the fingerprint you already
+checked still applies. After one click, the contact looks the same as before. There is no "unverified" state.
 
-- [x] **[Medium]** **N3: Results that arrive after a lock are shown on top of the lock screen**
-  - **Problem:** the lock overlay and every sheet share the parent `root`, and `Sheet.open()` calls `raise_()`. A
-    task that finishes after Ctrl+L, Ctrl+Shift+L or auto-lock opens its sheet *above* the overlay (confirmed
-    offscreen). For example, a pasted message under a slow Argon2 preset, or Share → Open message, then shows the
-    decrypted text in a "Decrypted message" sheet. The Decrypt page also adds the text preview to its result list
-    after the lock already cleared it. This defeats the panic key in exactly the case it exists for.
-  - **Where:** `locksmith/ui/lock.py:137-139`, `locksmith/ui/dialogs.py:136-139`,
-    `locksmith/ui/pages/share.py:252-257`, `locksmith/ui/pages/decrypt.py:313-352`
-  - **Fix:** give `Locker` a `locked` flag (set in `lock()`, cleared in `unlock()`). While it is set, secret
-    results are not shown: `text_view(..., secret=True)` and the Decrypt page's text results are dropped, with a
-    toast after unlock saying the message was opened while locked and needs opening again. Files already written to
-    disk are fine to list. As a backstop, have `Sheet.open()` re-raise the overlay when locked.
-  - **Test:** lock the window, then deliver a text result to the Decrypt and Share pages' done handlers. No sheet is
-    visible above the overlay and the result list holds no decrypted text.
+**How it could be abused.** The user has had Alice's `locksmith2` key for months and checked its fingerprint long
+ago. Mallory sends a message: "I upgraded Locksmith, here's my new key so you can verify my signatures." It contains
+Alice's encryption key with Mallory's verify keys. The user pastes it, Locksmith says it is Alice's key, and the user
+clicks Update. From then on, every file and `.lsig` Mallory signs shows **"✓ Signed with the key you saved as
+Alice"**, including the "Note (signed)" line. Files the user encrypts still go to the real Alice, so nothing looks
+wrong.
 
-## 2.2 Shredding
+**Evidence (run):** Alice's `locksmith2` key was saved as a contact, then updated with
+`alice.public_raw + mallory_verify_keys`, which was accepted. Mallory signed with a client that writes the spliced
+key's ID. Result: `signature_text(...)` returned `✓  Signed with the key you saved as Alice`. Changing the client
+means one line of code. No secret of Alice's is needed.
 
-- [x] **[Easy]** **N2: Encrypt-and-shred on a symlink leaves the original in place**
-  - **Problem:** the file list keeps paths as given (`abspath`, not resolved). For a symlink to a file,
-    `encrypt_paths` encrypts the target's contents, but `tools.shred` only unlinks the link: the plaintext target
-    survives while the app reports it shredded. For a symlink to a folder, `tarfile.add` stores only the link, so
-    the `.locked` file holds no data. It passes verification, decrypts to nothing (the absolute link is skipped),
-    and the link is "shredded" while the folder stays in plaintext. Both confirmed. Tools → Shred has the same gap
-    for dropped links. A user who deletes the folder afterwards, believing it is encrypted, loses it.
-  - **Where:** `locksmith/core/engine.py:957-1013`, `locksmith/core/tools.py:286-301`,
-    `locksmith/ui/widgets.py:909`, `locksmith/ui/pages/tools.py:239-253`
-  - **Fix:** in `encrypt_paths`, refuse a top-level input that is a symlink: "<name> is a link. Add the file or
-    folder it points to instead." In the Tools shredder, refuse links the same way, rather than reporting a link
-    removal as a shred. Links *inside* a folder are fine: they are stored as links, and unlinking them is correct.
-  - **Test:** `encrypt_paths([link_to_file])` and `encrypt_paths([link_to_folder])` raise `LocksmithError` and
-    write nothing. A UI flow with shred on and a symlinked input is refused, and the target is untouched.
+**The reverse case.** An attacker can also publish their own encryption key with *Alice's* verify keys. Alice's
+genuine signatures then verify under the attacker's key. That gives the false impression that "this key must be
+Alice's, her files verify", while files encrypted to it go to the attacker. A fingerprint check catches this, but
+signature success should never count as evidence that an encryption key is right.
 
-## 2.3 Decrypt and extraction safety
+**Fix:**
+1. Treat an update as a new key. Don't say "this is the key you saved as X". Say "This key claims to belong to X. Its
+   new fingerprint is …; it is not verified until you compare it with them." Add a "fingerprint checked" flag to
+   contacts that is set only by an explicit confirmation. Until it is set, show signatures as "signed with a key
+   claimed to be Alice's (fingerprint not checked)", not ✓.
+2. Bind the parts of a `locksmith3` key in the format: add a self-signature by the verify keys over the encryption
+   key, plus a proof that the holder has the encryption key (for example, a signature made with a key derived from
+   the X25519/ML-KEM secret, or a challenge made at the first exchange). The self-signature alone stops the
+   reverse case. Stopping the main case needs proof that the holder has the decryption key, or the fingerprint flag
+   from item 1.
+3. In `update_contact_key`, refuse the update if the contact already verified any signature, or require the old
+   fingerprint to be checked again.
 
-- [x] **[Easy]** **N5: Decrypting a crafted file can fill the disk**
-  - **Problem:** the earlier 4.4 fix capped only in-memory output. `decrypt_path` still writes everything a file
-    expands to, so a few MB at ~22,000:1 becomes tens of GiB in the output folder (twice that for a folder: the
-    `.part` archive plus the extracted copy). The `.part` file is deleted on ENOSPC, but until then the disk is
-    full and other programs' writes fail, which can corrupt their data. (Sparse archive members are already
-    refused by the N1 fix.)
-  - **Where:** `locksmith/core/engine.py:770-840`, `engine.py:1129-1192`, `engine.py:1259-1310`
-  - **Done:** the reserve is also capped at half the space free when decryption starts, so a nearly full disk
-    still never fills up while small files still decrypt there.
-  - **Fix:** in `decrypt_path`, check `shutil.disk_usage(out_dir).free` every batch. Stop with a clear
-    `LocksmithError` when continuing would leave less than a reserve (for example, the larger of 1 GiB and 2% of
-    the disk). A legitimate file that doesn't fit fails the same way, only earlier and without filling the disk.
-    Apply the same check while extracting a folder.
-  - **Test:** monkeypatch `shutil.disk_usage` to report little free space and assert `decrypt_path` stops with
-    `LocksmithError` and leaves no `.part` file.
+---
 
-- [x] **[Medium]** **N6: One member that can't be created makes the whole folder fail to extract**
-  - **Problem:** `extractall` treats an `OSError` on any member as fatal, and `extract_archive` then deletes
-    everything already extracted. Confirmed: a folder holding `good.txt` and one file named with 90 CJK characters
-    (270 bytes in UTF-8: valid on Windows, over Linux's 255-byte limit) fails with "File name too long", and
-    `good.txt` is gone too. A folder made on Windows can therefore never be opened on Linux, and a sender can make
-    any folder unopenable. The `.locked` file is kept, so nothing is lost, but this contradicts the function's
-    promise that one odd entry can't make a folder unrecoverable.
-  - **Where:** `locksmith/core/engine.py:1259-1310` (`extract_archive`, `keep_safe`)
-  - **Fix:** in `keep_safe`, skip and report any member with a path component over 255 bytes (`os.fsencode`), or
-    over 255 UTF-16 units on Windows. Also extract members one at a time
-    (`tar.extract(member, dest, filter=keep_safe)`) and turn an `OSError` on a single member into a `skipped`
-    entry. Keep aborting on `TarError` (a damaged archive). `complete` stays false whenever anything is skipped, so
-    delete-after still keeps the source.
-  - **Test:** extract the two-member archive above. `good.txt` exists, the long name is in `skipped`, and
-    `decrypt_path` reports `complete=False`.
+## A2 (Medium): a crafted recovery file replaces an intact file with arbitrary content
 
-- [x] **[Medium]** **N8: Case collisions still overwrite on case-insensitive drives under Linux (UNSURE)**
-  - **Problem:** the earlier 5.2 fix compares names without case only when `IS_WINDOWS`. On Linux, FAT32 and exFAT
-    USB drives (and casefolded ext4 folders) are case-insensitive too. Decrypting a folder holding `Notes.txt` and
-    `notes.txt` onto one should let the second overwrite the first, report `complete=True`, and let delete-after
-    remove the only copy. Reasoned from the code, not reproduced: confirming it needs a FAT or exFAT mount.
-  - **Where:** `locksmith/core/engine.py:1221-1227`
-  - **Fix:** decide case-sensitivity from the destination, not the platform. Probe once per extraction: create a
-    file in `dest` and check whether its case-swapped name exists. Casefold the key when it does.
-  - **Test:** monkeypatch the probe to report a case-insensitive destination on Linux. The second name is skipped
-    and `complete` is false. Then reproduce on a real exFAT image (loop mount) and record the result in this entry.
-  - **Reproduced (2026-10-03)** on a 64 MiB exFAT image loop-mounted with udisksctl, decrypting a folder with
-    `Notes.txt` ("first") and `notes.txt` ("second"): the code at `5026116` left one `Notes.txt` holding "second"
-    and reported `complete=True` (so delete-after would have removed the only copy of "first"). With the fix,
-    `Notes.txt` holds "first", `proj/notes.txt` is reported skipped, and `complete` is false.
+**Where:** [parity.py:248](locksmith/core/parity.py#L248) (`_parse_meta`) and
+[parity.py:368](locksmith/core/parity.py#L368) (`repair`). UI: Tools → Recovery data
+([ui/pages/tools.py:854](locksmith/ui/pages/tools.py#L854)).
 
-## 2.4 Metadata privacy
+**What happens.** Everything `repair` checks against comes from the `.lpar` itself: the size, the per-block hashes
+and the final SHA-256. `_parse_meta` accepts any layout with `k + m ≤ 256`, including `k = 1, m = 1`. There, every
+block is its own stripe and the parity block alone rebuilds it. A sidecar that marks every block "damaged" and
+supplies parity for other content makes `repair` write that content. It passes the SHA-256 check (the attacker chose
+that hash too), renames the real file to `name.damaged`, and reports "✓ Repaired". The module docstring says
+recovery data doesn't protect "against someone who can change both files". In fact, changing **only the sidecar** is
+enough.
 
-- [x] **[Medium]** **N4: JPEG metadata stripping keeps any APP0 and APP14 segment verbatim**
-  - **Problem:** APP0 (`0xE0`) and Adobe APP14 (`0xEE`) are kept by marker alone, whatever they contain. Confirmed
-    kept: a JFIF thumbnail, a JFXX thumbnail (a full embedded JPEG, which after a crop can still show the
-    uncropped original), an unknown APP0 carrying `serial=… owner=…`, and extra bytes after the Adobe fields. This
-    breaks the module's rule that unknown data is dropped, not kept. Smaller gaps of the same kind: PNG `sPLT`
-    carries a free-text palette name, and WebP `ANMF` frames may hold unknown sub-chunks.
-  - **Where:** `locksmith/core/metadata.py:158-160`, `metadata.py:216`, `metadata.py:238`
-  - **Fix:** keep APP0 only when it starts with `JFIF\x00`, and rewrite it as the 16-byte form with a 0×0
-    thumbnail (copy the version, units and density; set Xthumbnail = Ythumbnail = 0). Drop JFXX and every other
-    APP0. Keep APP14 only when it starts with `Adobe`, rewritten to its fixed 12-byte payload. Drop `sPLT` from
-    `PNG_KEEP`.
-  - **Test:** strip a JPEG containing a JFIF thumbnail, a JFXX segment, an unknown APP0 and an oversized APP14.
-    None of their payload bytes remain, and the JFIF and Adobe fields a decoder needs are intact.
+**How it could be abused.**
+- Someone who can place or edit a `.lpar` next to a file (a shared drive, a synced folder, a download offered with
+  "recovery data") can turn `contract.pdf` into any content the next time the user checks it. The result can even be
+  a different size or type.
+- On Windows, the "repaired" file is new (`create_private`) and has **no Mark of the Web**, even if the original
+  did. The UI says the file is now repaired, so the user trusts it more than before.
+- For `.locked` files, swapped content fails authentication unless the attacker can make a valid file for the user
+  (anyone with the user's public key can), so a file signed by someone else can be replaced by an unsigned one.
 
-## Done when
+**Evidence (run):** a 7.6 KB "PDF" plus a hand-built `contract.pdf.lpar` (`k=1, m=1`, all data hashes wrong, parity
+= attacker content ÷ the Cauchy coefficient). `parity.repair()` returned `intact=False`, and afterwards the file
+matched the attacker's content byte for byte, with the original moved to `contract.pdf.damaged`.
 
-- Every box above is ticked, apart from items marked Deferred.
-- Each security fix has a regression test in `tests/` that failed before the fix and passes now.
-- `.venv/bin/pytest` and `.venv/bin/ruff check` pass on Linux, and the suite passes under Windows Python (see
-  CLAUDE.md).
-- The security verification checklist has been re-run against the fixed code with no FAIL results.
+**Fix:**
+- Accept only the layouts Locksmith writes (`LEVELS`), and refuse a repair that rebuilds more than the level's share
+  of the file (m/k). Real bit rot never "damages" 100% of the blocks while the size changes.
+- Refuse a repair when the file's size differs from the recorded size by more than one block, or when it would change
+  the file type.
+- Show the expected SHA-256 before repairing, and say plainly that the result is only as trustworthy as the `.lpar`.
+- For `.locked` files, authenticate the repaired copy (`verify_path`) before moving it into place.
+- Copy the original's Zone.Identifier to the repaired file (`osutil.copy_zone_identifier`).
+- Optional: store the `.lpar`'s own hash inside the encrypted metadata of the `.locked` file it protects, so a swapped
+  sidecar is detected.
+
+---
+
+## A3 (Medium): an unverified signer fingerprint is shown as if it meant something
+
+**Where:** [signing.py:259](locksmith/core/signing.py#L259) (`check_locked` returns `sig.fingerprint` for an unknown
+signer), [ui/pages/common.py:68](locksmith/ui/pages/common.py#L68), and
+[signing.py:211](locksmith/core/signing.py#L211) (`verify_file`: *"It was made with the key whose fingerprint is …"*).
+
+**What happens.** When no saved key matches a signature's `key_id`, nothing is verified. Still, the UI shows "Signed
+by a key you haven't saved (fingerprint XXXX …)". That `key_id` is just 32 bytes the sender wrote. The detached
+signature message goes further and states it "was made with" that key.
+
+**How it could be abused.** The attacker puts the `key_id` of a well-known key (Alice's published fingerprint) into a
+file with a random signature. A reader who knows Alice's fingerprint but hasn't saved her key sees *"Signed by a key
+you haven't saved (fingerprint 2797 6841 22F1 97C0 8DA7)"*, matches it with Alice's website, and believes Alice
+signed it. The note is shown as "not verified", but the fingerprint line works against that.
+
+**Evidence (run):** a file whose signature frame held Alice's `key_id` and 3,373 random bytes decrypted fine. The UI
+text showed exactly Alice's real fingerprint.
+
+**Fix:** never show a claimed fingerprint as a fact. Use wording like "Has a signature that claims to be from a key you
+haven't saved (claimed fingerprint …). Nothing has been checked; save that key and open the file again to check it."
+Or show no fingerprint until a key is saved. Use the same wording for `UnknownSignerError` in `verify_file`.
+
+---
+
+## A4 (Medium, Windows): Join removes the Mark of the Web
+
+**Where:** [tools.py:597](locksmith/core/tools.py#L597) (`join_parts`), [tools.py:582](locksmith/core/tools.py#L582)
+(`split_file`), UI [ui/pages/share.py:164](locksmith/ui/pages/share.py#L164).
+
+**What happens.** `join_parts` joins *any* files named `X.partNNN` into `X`, whatever the type. The new file is
+created with `open_new` and never gets the parts' Zone.Identifier. The N7 fix covered decrypted output, but this path
+writes the same kind of content (received from someone else) without the mark.
+
+**How it could be abused.** An attacker sends `Invoice.exe.part001` and `Invoice.exe.part002` (or `.js`, `.hta`, a
+macro document). Each is marked by the browser or mail client. They tell the victim "the file was too large, join it
+with Locksmith (Share → Join)". The result `Invoice.exe` has no mark, so SmartScreen, Smart App Control and Office
+Protected View don't apply. Locksmith becomes a tool for getting around the Mark of the Web, which is a common
+technique in malware delivery.
+
+**Fix:** copy the Zone.Identifier of the first marked part to the output (or call `mark_untrusted` whenever any part
+has a mark). Consider limiting Join to outputs that are `.locked`/`.age` files, which is all the feature is for. Mark
+split parts the same way as their source.
+
+---
+
+## A5 (Medium): private keys are stored unencrypted by default; on Windows they roam
+
+**Where:** [keys.py:610](locksmith/core/keys.py#L610) (`generate`), [keys.py:688](locksmith/core/keys.py#L688),
+[ui/pages/keys.py:174](locksmith/ui/pages/keys.py#L174) ("PASSPHRASE (OPTIONAL)"),
+[osutil.py:113](locksmith/core/osutil.py#L113) (`%APPDATA%`, the roaming profile).
+
+**What happens.** A new identity is saved as plain base64 in `keys.json` unless the user types a passphrase. The file
+is `0600`, which stops other users, but not:
+- backup tools, dotfile sync, cloud sync of `~/.config`;
+- any program running as the user (the in-process hardening protects memory, not this file);
+- on Windows, **roaming profiles**: `%APPDATA%\Roaming` is copied to the domain's profile server at logoff in managed
+  environments, so the private keys leave the machine.
+
+**How it could be abused.** Information-stealing malware already collects files from known paths;
+`~/.config/locksmith/keys.json` and `%APPDATA%\locksmith\keys.json` with unencrypted keys are an easy target. One copy
+opens every file ever sent to the user.
+
+**Fix:** make the passphrase (or TPM sealing) the default and require a confirmation to skip it. On Windows, keep
+`keys.json` under `%LOCALAPPDATA%` (Local, which doesn't roam) and migrate existing files. Settings → About could
+show "N identities are stored without a passphrase".
+
+---
+
+## A6 (Low): sender-controlled text can fake status lines
+
+**Status (2026-10-05):** fixed, except the status badge. See Progress above.
+
+**Where:** [ui/pages/decrypt.py:559](locksmith/ui/pages/decrypt.py#L559) (notes),
+[ui/pages/decrypt.py:544](locksmith/ui/pages/decrypt.py#L544) (verify-only mode shows `meta["name"]` without
+`safe_name`), [ui/pages/tools.py:788](locksmith/ui/pages/tools.py#L788) (OpenPGP user IDs), and minisign trusted
+comments.
+
+**What happens.** `Label` correctly refuses HTML, but plain text can still contain line breaks and Unicode bidi
+controls (U+202E etc.). An unsigned file's note can be
+`"Quarterly report\n✓  Signed with the key you saved as Bob"`. It then shows a second caption line that looks
+exactly like the real status line, a few pixels below "Not signed". OpenPGP user IDs are chosen by whoever made the
+key and can add a fake line in the same way. In verify-only mode, a file name with U+202E shows reversed
+(`invoice‮fdp.exe` → "invoiceexe.pdf").
+
+**Fix:** for every string from a file or a signer (notes, names, user IDs, comments), remove `Cc`/`Cf`/`Zl`/`Zp`
+characters (or show them as visible escapes) and limit the length. Run the verify-mode name through
+`engine.safe_name`. Show the signature status as a separate badge with an icon, not as a caption in the same style as
+sender text.
+
+---
+
+## A7 (Low): "Open" runs decrypted programs directly
+
+**Status (2026-10-05):** fixed.
+
+**Where:** [ui/pages/decrypt.py:552](locksmith/ui/pages/decrypt.py#L552) → [host.py:59](locksmith/ui/host.py#L59)
+(`os.startfile` on Windows, `xdg-open` on Linux).
+
+**What happens.** The Open button hands the decrypted file to the shell. On Windows that runs `.exe`, `.scr`, `.bat`,
+`.js`, `.hta`, `.lnk`, `.msi` and so on. The Mark of the Web is copied only when the `.locked` file had one, which
+isn't the case for files from USB drives, many chat apps, or archives extracted by tools that don't copy the mark.
+Encrypted delivery is a known way to get malware past mail scanners ("password is in the next email"), and the Open
+button saves the attacker one step.
+
+**Fix:** before opening an executable or script type (a list like the one browsers use), ask for confirmation that
+names the type, especially when the file isn't validly signed. Consider showing "Show in folder" instead of "Open"
+for those types.
+
+---
+
+## A8 (Low): 80-bit fingerprints
+
+**Status (2026-10-05):** skipped: needs a format revision. See Progress above.
+
+**Where:** [keys.py:354](locksmith/core/keys.py#L354) (`fingerprint`: the first 20 hex digits of SHA-256),
+[signing.py:90](locksmith/core/signing.py#L90).
+
+**What happens.** Users check contacts by comparing 80 bits. A second preimage (a key of the attacker's with your
+contact's fingerprint) costs about 2^80 hash operations. The attacker controls the 1952-byte ML-DSA part, so each
+try needs only one SHA-256 compression. That is out of reach for most attackers, but below the 112–128-bit level
+the rest of Locksmith aims for (hybrid post-quantum encryption, ML-DSA-65). A match would give full impersonation,
+for both encryption and signatures. The QR code already uses the full hash.
+
+**Fix:** show at least 128 bits (32 hex digits, or words) for `locksmith3` keys. Keep the short form only as a quick
+visual hint, labelled as such.
+
+---
+
+## A9 (Low): hiding the number of recipients doesn't hide their kinds
+
+**Status (2026-10-05):** help text only; the decoy policy is a design decision. See Progress above.
+
+**Where:** [engine.py:613](locksmith/core/engine.py#L613) (`_dummy_recipients`) and
+[engine.py:621](locksmith/core/engine.py#L621) (`_decoy_keys`).
+
+**What happens.** Decoys are all hybrid when any real recipient is hybrid, otherwise all X25519. With mixed
+recipients, the `x25519` slots are exactly the classical and SSH Ed25519 recipients. `ssh-rsa` slots never get decoys,
+and their ciphertext length shows the RSA key size. A file "hidden" at 16 slots with one RSA slot of 512 bytes tells
+an observer "one recipient has a 4096-bit SSH RSA key", which, together with public GitHub SSH keys, narrows down who
+it is.
+
+**Fix:** make decoys match the real slots' types in proportion. Or, when hiding is on, refuse mixed kinds or warn that
+the kinds stay visible. For RSA, add decoy `ssh-rsa` slots of common sizes, or document the leak in the toggle's help
+text.
+
+---
+
+## A10 (Low): defaults that leak to recipients and observers
+
+**Status (2026-10-05):** fixed (owner names, message padding and compression).
+
+- **Folder archives** (non-strip path, [engine.py:1165](locksmith/core/engine.py#L1165)): `tar.add` stores the local
+  username, group, uid/gid, permissions and exact modification times of every file. `strip_metadata` is off by
+  default, so every folder sent to someone carries the sender's login name.
+- **Sizes:** padding defaults to "none", and messages are compressed with zlib
+  ([ui/pages/share.py:221](locksmith/ui/pages/share.py#L221)). The per-frame ciphertext lengths show the compressed
+  size of every 1 MiB chunk. That is enough to recognise a known file (a leaked document, a specific photo) from the
+  ciphertext alone, and for messages with attacker-influenced text it opens a CRIME-style compression side channel.
+- **Fix:** always replace owner names and ids in archives (they are useless to recipients), even when stripping is
+  off. Default padding to Padmé for messages and turn compression off for short text messages. Mention per-chunk size
+  leakage in the padding help text.
+
+---
+
+## A11 (Low): plaintext from a failed decryption is only unlinked
+
+**Status (2026-10-05):** fixed (shredded up to 1 GiB, then deleted).
+
+**Where:** [engine.py:1493](locksmith/core/engine.py#L1493) and
+[engine.py:1529](locksmith/core/engine.py#L1529).
+
+Decryption writes plaintext to `.locksmith-….part` before the signature is checked. When the signature is invalid
+(or decryption fails or is cancelled), the file is removed with `unlink`. The plaintext stays in free disk blocks,
+on the same disk as the output folder, which may be a USB stick. The crash journal shreds leftovers, but the normal
+error path doesn't.
+**Fix:** use `tools.shred` (best effort) for `.part` files on the error path. For signed files, consider checking the
+signature in a first pass that writes nothing (as `verify_path` does), then decrypting to disk.
+
+---
+
+## A12 (Low): a crafted file can use a lot of memory and CPU
+
+**Status (2026-10-05):** confirmation added; cancelling a KDF mid-run and age scrypt are not done.
+
+**Where:** [kdf.py:70](locksmith/core/kdf.py#L70) (limits: Argon2id 2 GiB × 16 passes × 16 lanes; PBKDF2 20 M
+iterations), [engine.py:118](locksmith/core/engine.py#L118) (up to 4 KDF runs per file).
+
+Opening a file with a password runs up to four KDFs with parameters the sender chose: 8 GiB allocated in total, one
+after another, plus minutes of CPU. Cancel is only checked between runs. On a machine with little memory this can
+trigger the OOM killer against *other* programs. **Fix:** when a slot's cost is above the Paranoid preset, show the
+cost (the info card already shows `kdf.describe`) and ask before running it. Run the KDF in a way that can be
+cancelled, for example in a child process.
+
+---
+
+## A13 (Low): extraction safety depends on the Python version when run from source
+
+**Status (2026-10-05):** fixed.
+
+**Where:** `pyproject.toml` allows Python ≥ 3.12; [engine.py:1656](locksmith/core/engine.py#L1656) relies on
+`tarfile.data_filter`.
+
+The shipped builds use Python 3.14.7, which is fine. Running from source on an older 3.12.x or 3.13.x without the 2025
+tarfile fixes (CVE-2025-4517, CVE-2025-4330, CVE-2025-4138, CVE-2024-12718: filter bypasses that allow writing outside
+the destination) would let a crafted folder archive write outside the output folder. **Fix:** at start-up, refuse to
+extract folders (or refuse to run) on Python versions older than 3.12.11 / 3.13.4, and say why.
+
+---
+
+## A14 (Low): file names in the email subject
+
+**Status (2026-10-05):** fixed.
+
+**Where:** [ui/pages/share.py:134](locksmith/ui/pages/share.py#L134) → [host.py:79](locksmith/ui/host.py#L79).
+
+The subject is `Encrypted file: <name>`. With Thunderbird, older `xdg-email` versions decode the subject and paste it
+into `subject='…'` without escaping. That is the class of bug behind CVE-2022-4055, where crafted text adds fields
+such as `cc=` or `attachment=`. A file name such as `x',cc='attacker@example.com.locked` (no slash needed) could add
+a recipient to the message. This needs a malicious file name and a vulnerable `xdg-email`. **Fix:** leave the file
+name out of the subject, or remove `'`, `,`, `&`, `%`, `\` and control characters from it.
+
+---
+
+## A15 (Low): Shamir shares reveal the secret's length
+
+**Status (2026-10-05):** skipped: needs a share format change. See Progress above.
+
+**Where:** [tools.py:403](locksmith/core/tools.py#L403). Each share's data is `len(secret) + 8` bytes, so every share
+holder knows the exact length of the password. **Fix:** pad the secret to a fixed block (for example 32 or 64 bytes,
+with a length prefix inside the shared data) before splitting.
+
+---
+
+## Design limits worth stating (Info)
+
+- **I1 – The lock screen is a privacy screen, not access control.** Any click or key unlocks it
+  ([lock.py:104-112](locksmith/ui/lock.py#L104-L112)). Afterwards, anyone at the keyboard can decrypt with
+  unprotected identities, show backup words and export keys. That is consistent with A5, but the docs should say
+  "covers the window", not suggest that it locks anything. If real locking is wanted, require a passphrase to unlock
+  and drop unlocked identity keys on lock.
+- **I2 – The network block only protects against mistakes, not against a compromised process.** The seccomp filter
+  allows `AF_UNIX`, so code running inside Locksmith (for example after a parser memory bug in Qt's image plugins)
+  can ask the user's systemd or D-Bus to start a program that has network access, which is exactly what `host.launch`
+  does. The README wording ("configured to refuse creating any internet socket") is accurate. Don't present it as a
+  sandbox.
+- **I3 – TPM sealing protects a copied disk, not a live session.** `--user --tpm2-pcrs=` (no PCRs,
+  [keys.py:96](locksmith/core/keys.py#L96)) means any process running as the user on this machine can unseal it
+  through `systemd-creds`. Without a passphrase, a sealed identity protects against stolen disks and backups only.
+- **I4 – On X11, every X client can read keystrokes**, including passwords typed into Locksmith. Wayland doesn't allow
+  this. Consider a note in Settings → About when the session is X11.
+- **I5 – age files with SSH recipients name them.** age's `ssh-ed25519`/`ssh-rsa` stanzas carry a 4-byte tag of the
+  key ([age.py:339](locksmith/core/age.py#L339)), so anyone with a list of public SSH keys (GitHub) can tell who a file
+  is for. "Recipients aren't named in the file" is true of `.locked` files but not of these age files; say so where
+  age plus SSH is chosen.
+- **I6 – OpenPGP revocation and expiry are only as current as the key file given.** Anyone handing over the key can
+  leave out a revocation or a newer binding. Also, for subkeys the *last* valid binding in packet order wins
+  ([openpgp.py:460](locksmith/core/openpgp.py#L460)), not the newest one as for the primary key. Choose by creation
+  time for consistency.
+- **I7 – Metadata stripping keeps ICC colour profiles** ([metadata.py:169](locksmith/core/metadata.py#L169),
+  `iCCP` in `PNG_KEEP`). Phone and camera profiles often contain the device model, the maker and a creation date.
+  Consider replacing known profiles with a standard sRGB/Display P3 profile, or removing their description and date
+  tags. Formats that aren't supported (HEIC, TIFF, PDF, Office, video) pass through untouched; the UI reports them as
+  "unchanged", which is correct.
+- **I8 – Windows file permissions come from the folder.** `open_new`'s `0600` is ignored on Windows: decrypted files
+  get the output folder's access list. Decrypting into `C:\Users\Public` or a shared folder makes the plaintext
+  readable to others. Consider setting an owner-only access list on decrypted output, or warning about shared folders.
+
+---
+
+## Checked and found sound
+
+These areas were reviewed specifically and I found no problems:
+
+- **Format v2 crypto:** a random 256-bit DEK per file; HKDF-SHA512 with domain-separated labels per format version;
+  a key commitment over the DEK and the SHA-256 of the fixed header, checked with `hmac.compare_digest`, so tampering
+  with the header reads as a wrong key; frame nonces `prefix ‖ counter ‖ final` with the header hash as AAD, which
+  stops reordering, truncation and appending; zero padding checked; frame order checked (content → padding →
+  signature). No nonce reuse: `change_access` never re-encrypts frames.
+- **Key slots:** X25519 low-order points refused when writing and skipped when reading. The hybrid KEK combines both
+  shared secrets with a transcript hash (ephemeral key, KEM ciphertext, full recipient key). RSA-OAEP-SHA256 with a
+  label, at least 2048 bits. The password and keyfile KEK mixes in SHA-512(keyfile) through HKDF with its own label.
+  Slots are shuffled, and decoys are real slots for keys thrown away at once.
+- **Signed files:** the signature covers the fixed header (so the note, name and recipient list) and SHA-512 of the
+  content. Both Ed25519 and ML-DSA-65 must verify, with separate contexts and labels for detached and embedded
+  signatures. An invalid signature from a saved key refuses the whole file before anything is moved into place.
+- **Header parsing:** sizes and types checked before use, deep JSON nesting caught, KDF parameters capped, metadata
+  fields type-checked, armor and frame sizes capped, decompression output capped per chunk, LZMA memory limited.
+- **Extraction:** `data` filter, refusal of sparse and oversized headers, NUL/long-name/Windows-reserved-name
+  handling, collision detection that knows about case-insensitive drives, owner-only modes, a disk-space guard, and
+  `complete` reported honestly so "delete after decrypt" never removes the only copy.
+- **File writing:** `O_EXCL|O_NOFOLLOW` everywhere, temporary file then `rename`, `fsync` of files and folders, a
+  crash journal that only removes Locksmith-named temp paths.
+- **Shredding:** links refused at the top level, `O_NOFOLLOW`, refusal for hard-linked files, keys and keyfiles
+  protected from being shredded.
+- **age:** strict base64 and armor, `scrypt` must be the only stanza, stanza bodies checked for exact length
+  (partitioning oracles), header MAC checked before the payload, final-chunk rules followed. It passes the CCTV kit.
+- **SSH, minisign and OpenPGP verification:** the key's type decides the algorithm, sk/cert keys and SHA-1/MD5 are
+  refused, SSH namespaces are enforced, minisign trusted comments are verified, OpenPGP signing subkeys need a
+  back-signature, critical subpackets are honoured.
+- **Desktop integration:** arguments are quoted correctly for desktop files and the registry; only files and keys
+  that Locksmith wrote are touched; the file manager passes absolute paths, so Qt's own `argv` options can't be
+  injected.
+- **UI:** every label is plain text (`widgets.Label`), tooltips are escaped, secret results are held back while
+  locked, clipboard secrets carry the "don't record" hints and are cleared after 30 s.
+- **Builds:** pinned and hash-checked tools, a hash-locked `requirements.lock`, Python 3.14.7 in both builds.
+
+## Suggested order of work
+
+1. **A1:** remove the assertion from the update dialog now (a one-line change), then add the "fingerprint checked"
+   state.
+2. **A3** and **A6:** wording and sanitising, both small.
+3. **A2:** limit layouts and the share of the file a repair may rebuild, copy the Mark of the Web, authenticate
+   `.locked` files after repair.
+4. **A4:** copy the Mark of the Web on Join.
+5. **A5:** passphrase by default; move `keys.json` to `%LOCALAPPDATA%`.
+6. The rest as convenient. A1, A2, A3 and A4 each need a regression test that fails before the fix; the
+   proof-of-concepts described above translate directly into tests.

@@ -137,3 +137,19 @@ def portable_name(name: str) -> str:
     if _WINDOWS_RESERVED.match(name):
         name = "_" + name
     return name or "decrypted"
+
+
+# File types that run code when opened through the desktop (Windows Explorer, or a Linux file
+# manager or xdg-open): programs, scripts, shortcuts and installers. Decrypted files come from
+# whoever made them, so opening one of these from Locksmith asks first.
+PROGRAM_EXTENSIONS = frozenset("""
+    .exe .com .scr .pif .cpl .msi .msp .msix .appx .appxbundle .appinstaller .bat .cmd .ps1 .psm1 .vbs .vbe
+    .js .jse .wsf .wsh .hta .lnk .url .reg .inf .scf .chm .jar .library-ms .settingcontent-ms .application
+    .appref-ms .gadget .xll .msc .desktop .sh .bash .run .appimage .py .pyw .pl .rb .bin .elf .deb .rpm
+""".split())
+
+
+def opens_as_program(name: str) -> bool:
+    """Whether opening a file of this name would run it rather than show it."""
+    suffix = os.path.splitext(name.rstrip(". "))[1].lower()
+    return suffix in PROGRAM_EXTENSIONS

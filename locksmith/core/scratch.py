@@ -13,6 +13,7 @@ ever removed, so an altered journal cannot be used to delete anything else.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import threading
@@ -71,6 +72,40 @@ def tracked(path: Path) -> Iterator[Path]:
         _update(lambda entries: [e for e in entries if e != entry])
 
 
+# Plaintext that a failed or cancelled run leaves is overwritten before it is deleted when
+# there is at most this much of it, so the user isn't kept waiting long after cancelling.
+SHRED_LIMIT = 1 << 30
+
+
+def _size(path: Path) -> int:
+    if not path.is_dir() or path.is_symlink():
+        return path.lstat().st_size
+    return sum(os.lstat(os.path.join(root, name)).st_size
+               for root, _, names in os.walk(path) for name in names)
+
+
+def discard(path: Path, always_shred: bool = False):
+    """Remove temporary plaintext (a file or a folder): shredded first (best effort) when it
+    holds at most SHRED_LIMIT bytes, or ``always_shred``, then deleted. Never raises OSError."""
+    from .tools import shred
+    path = Path(path)
+    try:
+        if not os.path.lexists(path):
+            return
+        if always_shred or _size(path) <= SHRED_LIMIT:
+            shred(path)
+            return
+    except (OSError, LocksmithError):
+        pass   # shredding is best effort; removing the plaintext is what matters
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path, ignore_errors=True)
+    else:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def clean_leftovers() -> int:
     """Shred temporary files a previous run left behind. Returns how many were removed."""
     if _journal is None:
@@ -81,19 +116,11 @@ def clean_leftovers() -> int:
             _write([])
         except OSError:
             return 0
-    from .tools import shred
     removed = 0
     for entry in entries:
         path = Path(entry)
         if not _TEMP_NAME.fullmatch(path.name) or not path.is_absolute() or not path.exists():
             continue
-        try:
-            shred(path)
-        except (OSError, LocksmithError):
-            # Shredding is best effort; removing the plaintext is what matters.
-            if path.is_dir() and not path.is_symlink():
-                shutil.rmtree(path, ignore_errors=True)
-            else:
-                path.unlink(missing_ok=True)
+        discard(path, always_shred=True)
         removed += not path.exists()
     return removed

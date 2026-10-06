@@ -1881,3 +1881,99 @@ def test_disk_guard_without_free_space_information(tmp_path, monkeypatch):
     enc = _encrypt(tmp_path)
     monkeypatch.setattr(engine.shutil, "disk_usage", fail)
     assert engine.decrypt_path(enc, tmp_path / "dec", PW).path.exists()
+
+
+# ── 2026-10-05 audit: low-severity items (security-audit.md A6–A15) ──────────
+
+def test_mail_text_cannot_add_mail_fields(tmp_path, monkeypatch):
+    """A14: a file name in the subject can't smuggle cc= or attachment= into the mail client."""
+    from locksmith.ui import host
+    seen = []
+    monkeypatch.setattr(host, "IS_WINDOWS", False)
+    monkeypatch.setattr(host, "launch", lambda args: seen.append(args) or True)
+    host.compose_email("Encrypted file: x',cc='a@example.com',attachment='%2Fetc%2Fpasswd\n.locked",
+                       "I will send the password", tmp_path / "f.locked")
+    args = seen[0]
+    for flag in ("--subject", "--body"):
+        text = args[args.index(flag) + 1]
+        assert not set("'\",&%\\;\n") & set(text), text
+    assert "a@example.com" in args[args.index("--subject") + 1]   # the name stays readable
+
+
+def test_folder_archives_never_name_the_owner(tmp_path):
+    """A10: without metadata removal, times are kept but owner names and ids are not."""
+    folder = tmp_path / "proj"
+    (folder / "sub").mkdir(parents=True)
+    (folder / "sub" / "a.txt").write_text("a")
+    with engine._TarStream([(folder, "proj")]) as stream, \
+            tarfile.open(fileobj=io.BytesIO(stream.read()), mode="r:") as tar:
+        members = tar.getmembers()
+    assert len(members) == 3
+    for m in members:
+        assert (m.uid, m.gid, m.uname, m.gname) == (0, 0, "", ""), m.name
+    assert int(members[-1].mtime) == int((folder / "sub" / "a.txt").stat().st_mtime)   # times are kept
+
+
+def test_plaintext_of_a_failed_decryption_is_shredded(tmp_path, monkeypatch):
+    """A11: chunks decrypted before a later one fails are overwritten, not just unlinked."""
+    from locksmith.core import scratch
+    enc = _encrypt(tmp_path, data=os.urandom(64 << 10), chunk_size=1 << 10, compression="none")
+    blob = bytearray(enc.read_bytes())
+    blob[-5] ^= 1   # the last frame fails, after earlier ones were written
+    enc.write_bytes(blob)
+    shredded, real = [], tools.shred
+    monkeypatch.setattr(tools, "shred", lambda p, *a, **k: (shredded.append(Path(p)), real(p, *a, **k))[1])
+    out = tmp_path / "out"
+    with pytest.raises(CorruptedError):
+        engine.decrypt_path(enc, out, PW, threads=1)
+    assert [p.name.endswith(".part") for p in shredded] == [True]
+    assert list(out.iterdir()) == []
+    # Above the limit, the plaintext is only deleted, so cancelling a huge file isn't slow.
+    monkeypatch.setattr(scratch, "SHRED_LIMIT", 100)
+    big = tmp_path / ".locksmith-000000000000.part"
+    big.write_bytes(bytes(1000))
+    scratch.discard(big)
+    assert not big.exists() and len(shredded) == 1
+
+
+def test_folders_are_not_unpacked_on_a_python_with_tarfile_bypasses(tmp_path, monkeypatch):
+    """A13: a Python whose tarfile filter has known bypasses refuses folders before decrypting."""
+    for bad in ((3, 12, 3), (3, 12, 10), (3, 13, 0), (3, 13, 3)):
+        with pytest.raises(LocksmithError, match="can't unpack folders safely"):
+            engine._check_tarfile(bad)
+    for good in ((3, 12, 11), (3, 13, 4), (3, 14, 0), (3, 15, 1)):
+        engine._check_tarfile(good)
+    folder = tmp_path / "proj"
+    folder.mkdir()
+    (folder / "a.txt").write_text("a")
+    enc = engine.encrypt_paths([folder], tmp_path / "enc", EncryptOptions(password="pw", **FAST))
+    real = engine._check_tarfile
+    monkeypatch.setattr(engine, "_check_tarfile", lambda version=(3, 12, 3): real(version))
+    with pytest.raises(LocksmithError, match="can't unpack folders safely"):
+        engine.decrypt_path(enc, tmp_path / "out", PW)
+    assert not (tmp_path / "out").exists()   # refused before anything was decrypted
+    with pytest.raises(LocksmithError, match="can't unpack folders safely"):
+        engine.extract_archive(tmp_path / "any.tar", tmp_path / "dest")
+
+
+def test_display_text_cannot_fake_a_line_or_reorder_it():
+    """A6: sender text shown beside status lines stays on its line and in its order."""
+    shown = tools.display_text("Quarterly\r\n✓  Signed with the key you saved as Bob x\x00\x1b[31m")
+    assert "\n" not in shown and "\r" not in shown and " " not in shown and "\x00" not in shown
+    assert "\x1b" not in shown
+    assert tools.display_text("invoice‮fdp.exe") == "invoicefdp.exe"
+    assert tools.display_text("⁧abc⁩‏") == "abc"
+    assert tools.display_text("می‌خواهم 👩‍💻") == "می‌خواهم 👩‍💻"   # joiners kept
+    assert tools.display_text("a" * 600, 500) == "a" * 500 + "…"
+
+
+def test_kdf_settings_beyond_every_preset_are_flagged():
+    """A12: what Locksmith writes never asks; what only a crafted file asks for does."""
+    for name in kdf.KDFS:
+        for preset in kdf.PRESETS:
+            assert not kdf.beyond_presets(name, kdf.params_for(name, preset))
+    assert kdf.beyond_presets("argon2id", {"m": 2 << 20, "t": 6, "p": 4})
+    assert kdf.beyond_presets("argon2id", {"m": 1 << 20, "t": 16, "p": 4})
+    assert kdf.beyond_presets("scrypt", {"n": 2**21, "r": 8, "p": 1})
+    assert kdf.beyond_presets("pbkdf2-sha512", {"i": 20_000_000})
+    assert not kdf.beyond_presets("unknown", {"i": 1})

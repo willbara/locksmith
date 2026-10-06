@@ -12,6 +12,7 @@ import secrets
 import stat
 import string
 import threading
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,6 +28,27 @@ def same_secret(a: str | bytes, b: str | bytes) -> bool:
     a = a.encode() if isinstance(a, str) else a
     b = b.encode() if isinstance(b, str) else b
     return hmac.compare_digest(a, b)
+
+# Characters that reorder the text around them (bidi overrides, embeddings and isolates):
+# "invoice\u202efdp.exe" displays as "invoiceexe.pdf".
+_BIDI_CONTROLS = set("\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")
+
+
+def display_text(text: str, limit: int = 500) -> str:
+    """Text from a file, an archive or a signer (a note, a name, an OpenPGP user ID), made safe to
+    show next to Locksmith's own status lines: line breaks become spaces, so it can't add a line
+    that looks like one ("✓ Signed with…"); control and bidi characters are dropped, so it can't
+    reorder what is shown; and long text is cut. Other formatting characters (such as the zero-width
+    joiners Persian and emoji need) are kept."""
+    out = []
+    for c in text:
+        if c in "\n\r\t\v\f\x85\u2028\u2029":
+            out.append(" ")
+        elif c not in _BIDI_CONTROLS and unicodedata.category(c) not in ("Cc", "Cs"):
+            out.append(c)
+    shown = "".join(out)
+    return shown if len(shown) <= limit else shown[:limit] + "…"
+
 
 # ── passwords ────────────────────────────────────────────────────────────────
 

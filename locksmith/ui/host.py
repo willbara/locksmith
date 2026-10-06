@@ -68,9 +68,18 @@ def open_path(path: Path):
         QDesktopServices.openUrl(QUrl(path.as_uri()))
 
 
+def mail_safe(text: str) -> str:
+    """Text for a mail subject or body without the characters mail launchers parse. Some
+    xdg-email versions paste the decoded subject into Thunderbird's ``subject='…'`` unescaped
+    (the CVE-2022-4055 class), so a file name like ``x',cc='someone@example.com`` would add
+    a recipient. File names come from whoever made the file."""
+    return "".join(" " if c in "'\",&%\\;" or not c.isprintable() else c for c in text)
+
+
 def compose_email(subject: str, body: str, attachment: Path) -> bool:
     """Start a new email. Returns True if the file was attached automatically; on
     Windows there is no standard way to attach, so the file is shown in Explorer."""
+    subject, body = mail_safe(subject), mail_safe(body)
     if IS_WINDOWS:
         query = urllib.parse.urlencode({"subject": subject, "body": body}, quote_via=urllib.parse.quote)
         os.startfile(f"mailto:?{query}")

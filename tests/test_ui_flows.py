@@ -970,3 +970,75 @@ def test_recovery_data_through_encrypt_and_tools(tmp_path, window, monkeypatch):
     t._rc_repair()
     wait(lambda: t._rc_task is None)
     assert t.rc_result.text() == f"✓  Repaired {enc.name}" and enc.read_bytes() == original
+
+
+def test_share_messages_are_padded_not_compressed(window, monkeypatch):
+    """Audit A10: compressed messages leak through their size; padding hides the exact length."""
+    from locksmith.core import engine
+    seen, real = [], engine.encrypt_bytes
+    monkeypatch.setattr(engine, "encrypt_bytes", lambda data, opts, *a, **k: (seen.append(opts), real(data, opts))[1])
+    s = window.share
+    s.msg.setPlainText("meet at noon " * 20)
+    s.msg_pw.setText("message password 123")
+    s._encrypt_message()
+    wait(lambda: s.msg_out.toPlainText())
+    assert (seen[0].compression, seen[0].padding) == ("none", "padme")
+
+
+def test_opening_a_decrypted_program_asks_first(tmp_path, window, monkeypatch):
+    """Audit A7: Open runs programs and scripts, so it asks; documents open at once."""
+    from locksmith.core.osutil import opens_as_program
+    from locksmith.ui import dialogs
+    from locksmith.ui.pages import decrypt
+    assert opens_as_program("Invoice.PDF.exe") and opens_as_program("setup.msi.") and opens_as_program("x.desktop")
+    assert not opens_as_program("report.pdf") and not opens_as_program("exe")
+    opened = []
+    monkeypatch.setattr(decrypt, "open_url", opened.append)
+    page = window.decrypt
+    page._open(tmp_path / "notes.txt", None)
+    assert window.asked == [] and len(opened) == 1
+    page._open(tmp_path / "Invoice.exe", None)
+    assert window.asked == ["Run a program?"] and len(opened) == 2   # the fixture confirms
+    monkeypatch.setattr(dialogs, "confirm", lambda *a, **k: False)
+    page._open(tmp_path / "run.js", None)
+    assert len(opened) == 2
+
+
+def test_sender_text_cannot_fake_a_status_line(tmp_path, window, monkeypatch):
+    """Audit A6: a note, a name or a skipped member can't add a line that reads like a status."""
+    from PySide6.QtWidgets import QLabel
+    page = window.decrypt
+    fake = "Quarterly figures\n✓  Signed with the key you saved as Bob"
+    page._add_result("file", str(tmp_path / "report.pdf"), {"note": fake, "_skipped": ["a\n✓  Authentic"]})
+    page._add_result("verified", str(tmp_path / "x.locked"), {"name": "invoice‮fdp.exe\n✓  Authentic"})
+    texts = [lab.text() for lab in page.findChildren(QLabel)]
+    assert any("Quarterly figures ✓  Signed with the key you saved as Bob" in t for t in texts)
+    assert not any(line.startswith("✓  Signed") for t in texts for line in t.split("\n"))
+    assert not any("‮" in t for t in texts)
+    assert any(t.startswith("invoicefdp.exe") for t in texts)
+
+
+def test_password_check_beyond_every_preset_asks_first(tmp_path, window, monkeypatch):
+    """Audit A12: a file asking for more KDF work than any preset isn't tried without asking."""
+    import fileformat
+
+    from locksmith.core import engine
+    from locksmith.ui import dialogs
+    src = tmp_path / "a.txt"
+    src.write_text("a")
+    enc = engine.encrypt_paths([src], tmp_path, engine.EncryptOptions(password="pw", kdf="pbkdf2-sha512",
+                                                                      preset="fast"))
+    header, body = fileformat.split(enc.read_bytes())
+    header["slots"][0]["p"]["i"] = 20_000_000
+    enc.write_bytes(fileformat.join(header, body))
+    asked = []
+    monkeypatch.setattr(dialogs, "confirm", lambda title, *a, **k: (asked.append(title), False)[1])
+    page = window.decrypt
+    page.add_paths([str(enc)])
+    page.password.setText("pw")
+    page.start()
+    assert asked == ["Unusually slow password check"] and page.task is None
+    page.password.clear()   # no password given: nothing would be derived, so nothing to ask
+    page.start()
+    assert asked == ["Unusually slow password check"]
+    wait(lambda: page.task is None)

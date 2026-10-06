@@ -584,7 +584,7 @@ class ToolsPage(Page):
         def done(v):
             end()
             self.ms_result.setText(f"✓  Valid signature from key {v.key_id}")
-            self.ms_comment.setText(f"Trusted comment: {_shown(v.trusted_comment)}")
+            self.ms_comment.setText(f"Trusted comment: {tools.display_text(_shown(v.trusted_comment))}")
 
         def failed(m, k):
             end()
@@ -785,7 +785,7 @@ class ToolsPage(Page):
             lines = [f"{v.key_label}{' subkey ' + v.signing_key if v.signing_key != v.fingerprint else ''}  ·  "
                      f"{v.hash_name}{'  ·  text mode' if v.text_mode else ''}  ·  signed {when} (by the signer's clock)"]
             if v.user_ids:
-                lines.append("The key says it belongs to: " + "; ".join(v.user_ids) + " (not checked by anyone)")
+                lines.append("The key says it belongs to: " + "; ".join(tools.display_text(uid, 200) for uid in v.user_ids) + " (not checked by anyone)")
             if v.expired:
                 lines.append("The key has expired since; the signature was made while it was valid.")
             self.pg_detail.setText("\n".join(lines))

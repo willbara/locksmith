@@ -79,6 +79,17 @@ def params_for(kdf: str, preset: str) -> dict:
     return dict(_PARAMS[kdf][preset])
 
 
+def beyond_presets(kdf: str, params: dict) -> bool:
+    """Whether a file's KDF settings ask for more memory or work than any preset Locksmith
+    writes. The sender chooses them, up to _LIMITS: a crafted file can make every password
+    attempt take GiBs of memory and minutes, so the reader is asked first."""
+    presets = _PARAMS.get(kdf)
+    if presets is None or not isinstance(params, dict):
+        return False
+    return any(isinstance(params.get(k), int) and params[k] > max(p[k] for p in presets.values())
+               for k in presets["paranoid"])
+
+
 def describe(kdf: str, params: dict) -> str:
     if kdf == "argon2id":
         return f"Argon2id · {params['m'] // MiB_IN_KiB} MiB · {params['t']} passes · {params['p']} lanes"

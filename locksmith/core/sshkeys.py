@@ -203,6 +203,11 @@ def load_identity(data: bytes, passphrase: str | None = None) -> SshIdentity:
     raise LocksmithError("Only SSH Ed25519 and RSA keys can open files.")
 
 
+def public_blob(public) -> bytes:
+    """The SSH wire encoding of a cryptography public key."""
+    return _ssh_blob(public)
+
+
 def _ssh_blob(public) -> bytes:
     from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
     line = public.public_bytes(Encoding.OpenSSH, PublicFormat.OpenSSH).split()

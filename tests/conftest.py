@@ -7,6 +7,7 @@ def config_home(tmp_path, monkeypatch):
     """Point Locksmith's config folder at a temp dir on any platform."""
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     monkeypatch.setenv("APPDATA", str(tmp_path))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
     return tmp_path
 
 

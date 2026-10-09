@@ -52,6 +52,34 @@ def _exif(orientation: int) -> bytes:
     return b"Exif\x00\x00" + tiff
 
 
+def _icc() -> bytes:
+    """A real ICC profile (Qt's Display P3) with what cameras and phones add: a creation date, a
+    device maker and model in the header, and a device-model description tag."""
+    from PySide6.QtGui import QColorSpace
+    base = bytes(QColorSpace(QColorSpace.NamedColorSpace.DisplayP3).iccProfile())
+    (count,) = struct.unpack(">I", base[128:132])
+    entries = [struct.unpack(">4sII", base[132 + 12 * i:144 + 12 * i]) for i in range(count)]
+    data_start = 132 + 12 * count
+    tag = b"desc" + bytes(4) + struct.pack(">I", 14) + b"DEVICE-SECRET\x00"
+    table = struct.pack(">I", count + 1) + b"".join(struct.pack(">4sII", sig, off + 12, size)
+                                                    for sig, off, size in entries)
+    body = base[data_start:]
+    body += bytes(-len(body) % 4)
+    table += struct.pack(">4sII", b"dmdd", 128 + len(table) + 12 + len(body), len(tag))
+    profile = bytearray(base[:128] + table + body + tag)
+    profile[0:4] = struct.pack(">I", len(profile))
+    profile[24:36] = struct.pack(">6H", 2026, 10, 5, 12, 0, 0)
+    profile[48:56] = b"MAKRMODL"
+    return bytes(profile)
+
+
+def _icc_ok(profile: bytes):
+    from PySide6.QtGui import QColorSpace
+    assert profile[24:36] == bytes(12) and profile[48:64] == bytes(16) and profile[84:100] == bytes(16)
+    assert b"DEVICE-SECRET" not in profile and b"MAKRMODL" not in profile
+    assert QColorSpace.fromIccProfile(QByteArray(profile)).isValid()
+
+
 def _seg(marker: int, payload: bytes) -> bytes:
     return bytes([0xFF, marker]) + struct.pack(">H", len(payload) + 2) + payload
 
@@ -71,7 +99,7 @@ def test_jpeg(tmp_path):
     jpg, _ = _image("JPG")
     extra = (_seg(0xE1, _exif(6)) + _seg(0xE1, b"http://ns.adobe.com/xap/1.0/\x00<x>XMP-SECRET</x>")
              + _seg(0xED, b"Photoshop 3.0\x00IPTC-SECRET") + _seg(0xFE, b"COMMENT-SECRET")
-             + _seg(0xE2, b"ICC_PROFILE\x00\x01\x01fake-profile") + _seg(0xE2, b"MPF\x00MPF-SECRET")
+             + _seg(0xE2, b"ICC_PROFILE\x00\x01\x01" + _icc()) + _seg(0xE2, b"MPF\x00MPF-SECRET")
              + _seg(0xE9, b"PRIVATE-SECRET"))
     evil = jpg[:2] + extra + jpg[2:] + b"TRAILER-SECRET-video"
     out, stats = _roundtrip(tmp_path, "photo.jpg", evil)
@@ -290,3 +318,45 @@ def test_webp_animation_frames_keep_only_image_chunks(tmp_path):
     (size,) = struct.unpack("<I", out[pos + 4:pos + 8])
     assert out[pos + 8:pos + 8 + size] == frame_header + image_chunk
     assert struct.unpack("<I", out[4:8])[0] == len(out) - 8
+
+
+def test_colour_profiles_are_kept_without_device_details(tmp_path):
+    """Audit I7: a camera's or phone's profile keeps its colours but loses its date, device maker and
+    model, and device descriptions, in JPEG (split over two segments), PNG and WebP."""
+    profile = _icc()
+    for name in ("j", "j1", "p", "wTrue", "wFalse"):
+        (tmp_path / name).mkdir()
+    from PySide6.QtGui import QColorSpace
+    assert QColorSpace.fromIccProfile(QByteArray(profile)).isValid()
+    assert metadata.scrub_icc(b"not a profile") is None
+
+    jpg, _ = _image("JPG")
+    half = len(profile) // 2
+    icc = (_seg(0xE2, b"ICC_PROFILE\x00\x01\x02" + profile[:half]) +
+           _seg(0xE2, b"ICC_PROFILE\x00\x02\x02" + profile[half:]))
+    out, _ = _roundtrip(tmp_path / "j", "p.jpg", jpg[:2] + icc + jpg[2:])
+    parts = [p[14:] for marker, p in _segments(out) if marker == 0xE2]
+    assert len(parts) == 2 and len(b"".join(parts)) == len(profile)
+    _icc_ok(b"".join(parts))
+    assert _decode(out).colorSpace().isValid()
+    only_one = jpg[:2] + _seg(0xE2, b"ICC_PROFILE\x00\x01\x02" + profile[:half]) + jpg[2:]
+    out, _ = _roundtrip(tmp_path / "j1", "p.jpg", only_one)   # an incomplete profile is dropped
+    assert b"ICC_PROFILE" not in out and _decode(out)
+
+    png, img = _image("PNG")
+    iccp = _png_chunk(b"iCCP", b"Phone-SECRET\x00\x00" + zlib.compress(profile))
+    out, _ = _roundtrip(tmp_path / "p", "s.png", png[:33] + iccp + png[33:])
+    assert b"Phone-SECRET" not in out and b"ICC profile\x00" in out
+    start = out.index(b"iCCP") + 4 + len(b"ICC profile\x00\x00")
+    _icc_ok(zlib.decompressobj().decompress(out[start:]))
+    assert _decode(out).convertToFormat(QImage.Format.Format_RGB32) == img
+
+    simple, _ = _image("WEBP")
+    vp8x = bytes([0x20, 0, 0, 0]) + (63).to_bytes(3, "little") + (47).to_bytes(3, "little")
+    for icc_data, kept in ((profile, True), (b"garbage", False)):
+        body = b"WEBP" + _webp_chunk(b"VP8X", vp8x) + _webp_chunk(b"ICCP", icc_data) + simple[12:]
+        out, _ = _roundtrip(tmp_path / f"w{kept}", "i.webp", b"RIFF" + struct.pack("<I", len(body)) + body)
+        assert (b"ICCP" in out) is kept and bool(out[out.index(b"VP8X") + 8] & 0x20) is kept
+        if kept:
+            start = out.index(b"ICCP") + 8
+            _icc_ok(out[start:start + len(profile)])

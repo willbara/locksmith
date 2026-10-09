@@ -42,7 +42,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from . import age, kdf, sshkeys
 from .errors import LocksmithError, WrongKeyError
-from .osutil import config_base, fsync_dir, open_new
+from .osutil import config_base, fsync_dir, legacy_config_base, open_new
 from .sysenv import clean_env
 
 PUBKEY_PREFIX = "locksmith1"         # classical X25519
@@ -153,12 +153,28 @@ def public_from_private(raw: bytes) -> bytes:
 
 def config_dir() -> Path:
     path = config_base() / "locksmith"
+    _move_legacy_config(path)
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     try:
         os.chmod(path, 0o700)
     except OSError:
         pass
     return path
+
+
+def _move_legacy_config(path: Path):
+    """Move the config folder of an older version from the roaming profile (Windows) to ``path``,
+    so the keys stop being copied to the network with the profile."""
+    legacy = legacy_config_base()
+    old = legacy / "locksmith" if legacy is not None else None
+    if old is None or old == path or not old.is_dir() or os.path.lexists(path):
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.replace(old, path)
+    except OSError:   # another drive: copy, then remove the roaming copy
+        shutil.copytree(old, path)
+        shutil.rmtree(old, ignore_errors=True)
 
 
 def write_secret_file(path: Path, data: str | bytes):
@@ -351,9 +367,19 @@ def private_from_shares(texts: list[str]) -> bytes:
     return secret[len(_SHARE_MAGIC):]
 
 
+FINGERPRINT_DIGITS = 32   # 128 bits; Locksmith 4 and earlier showed 20 (80 bits), now its first five groups
+
+
 def fingerprint(raw: bytes) -> str:
-    h = hashlib.sha256(raw).hexdigest()[:20].upper()
-    return " ".join(h[i:i + 4] for i in range(0, 20, 4))
+    """A key's fingerprint: the first 32 hex digits of SHA-256(raw), in groups of four. 80 bits (the
+    20 digits shown before) are below the level the rest of Locksmith aims for: a second preimage
+    would give a key that passes the check as someone else's."""
+    return group_hex(hashlib.sha256(raw).hexdigest())
+
+
+def group_hex(digest_hex: str) -> str:
+    h = digest_hex[:FINGERPRINT_DIGITS].upper()
+    return " ".join(h[i:i + 4] for i in range(0, len(h), 4))
 
 
 @dataclass
@@ -474,6 +500,10 @@ class Contact:
     name: str
     public: str               # encoded public key, including any verify keys (locksmith3), or an SSH key line
     added: int
+    # Set only when the user confirms they compared the fingerprint with the key's owner. Until then a
+    # signature by this key is "claimed", never ✓: a pasted key can pair someone's encryption key with
+    # anyone's signing keys, and nothing in the key itself shows otherwise (audit A1).
+    checked: bool = False
 
     @property
     def ssh(self) -> sshkeys.SshRecipient | None:
@@ -548,6 +578,8 @@ def _from_dict(cls, data):
     when = obj.created if cls is Identity else obj.added
     if isinstance(when, bool) or not isinstance(when, int):
         raise TypeError
+    if cls is Contact and not isinstance(obj.checked, bool):
+        obj.checked = False   # only a confirmation sets it: anything else reads as not checked
     decode_public(obj.public) if cls is Identity else decode_recipient(obj.public)
     return obj
 
@@ -645,6 +677,28 @@ class KeyStore:
             raise
         return ident
 
+    def set_passphrase(self, ident: Identity, current: str | None, new: str | None) -> Identity:
+        """Add, change or (``new`` None) remove an identity's passphrase. A TPM seal is kept."""
+        raw = ident.private_raw(current)
+        was_sealed = ident.is_sealed
+        changed = replace(ident, private=None, locked=None, sealed=None, sealed_locked=False)
+        self._store_private(changed, raw, new)
+        if was_sealed:
+            self._seal(changed)
+        old = replace(ident)
+        _assign(ident, changed)
+        try:
+            self.save()
+        except BaseException:
+            _assign(ident, old)   # the save is atomic, so the file still holds the old identity
+            raise
+        return ident
+
+    @property
+    def unprotected(self) -> list[Identity]:
+        """Identities whose private key is stored as it is: no passphrase and no TPM seal."""
+        return [i for i in self.identities if i.private is not None]
+
     def seal(self, ident: Identity) -> Identity:
         """Seal an identity's stored key to this machine's TPM."""
         if not ident.is_sealed:
@@ -696,6 +750,12 @@ class KeyStore:
         part = encryption_part(raw)
         return next((c for c in self.contacts if c.public_raw == part), None)
 
+    def mark_checked(self, contact: Contact) -> Contact:
+        """Record that the user compared this contact's fingerprint with its owner."""
+        contact.checked = True
+        self.save()
+        return contact
+
     def add_contact(self, name: str, public_text: str) -> Contact:
         raw = decode_recipient(public_text)
         encoded = sshkeys.parse_recipient(public_text).text if sshkeys.is_ssh_text(public_text) else encode_public(raw)
@@ -717,7 +777,9 @@ class KeyStore:
 
     def update_contact_key(self, contact: Contact, public_text: str) -> Contact:
         """Give a contact saved without signing keys its full locksmith3 key. Only the same
-        encryption key is accepted; the fingerprint changes and should be checked again."""
+        encryption key is accepted. Nothing shows the signing keys belong to the same person (anyone
+        can pair a contact's encryption key with their own signing keys), so the new fingerprint
+        starts out unchecked, whatever was checked before."""
         raw = decode_public(public_text)
         if not can_verify(raw):
             raise LocksmithError("That key has no signing keys.")
@@ -726,6 +788,7 @@ class KeyStore:
         if contact.can_verify and contact.key_raw != raw:
             raise LocksmithError(self._FORGED.format(contact.name))
         contact.public = encode_public(raw)
+        contact.checked = False
         self.save()
         return contact
 

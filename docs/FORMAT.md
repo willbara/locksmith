@@ -138,10 +138,15 @@ this slot type and refuse the whole file, whatever else could open it.
 ### Decoy slots
 
 A writer may add recipient slots for keys that are generated and immediately discarded, wrapping a
-random value, to hide how many recipients there are (Locksmith rounds up to 8, 16, 32 or 64 in total,
-within the 64-slot limit). Decoys are hybrid if any real recipient is, otherwise classical, so a file
-with both kinds still shows that it has at least one classical recipient. They are ordinary slots that
-no key opens, so readers need nothing special.
+random value, to hide how many recipients there are. Since Locksmith 5, each kind of recipient slot
+(`x25519`, hybrid, and `ssh-rsa` of one ciphertext size) is rounded up on its own to 8, 16, 32 or
+64, the largest kind first, and a kind that no longer fits within the 64-slot limit gets as many
+decoys as there is room for. The file then shows which kinds of recipient it has, but not how many
+of each. (Locksmith 4 rounded the total and made every decoy one kind, which showed exactly how many
+recipients of the other kinds there were.) `ssh-rsa` decoys are RSA-OAEP encryptions of a random
+value to a recipient key of the same size, or to a throwaway key of that size up to 4096 bits, so
+they look like real ones even to someone who knows the recipients' keys. Decoys are ordinary slots
+that no key opens, so readers need nothing special.
 
 ### Changing the slots
 
@@ -298,13 +303,15 @@ content.
 
 A `locksmith3` key also verifies signatures (sections 13 and 14). Encrypting to it uses its first 1216
 bytes exactly as a `locksmith2` key: in a hybrid slot, `rpk` is those 1216 bytes. Readers reject
-low-order X25519 points and malformed ML-KEM keys. The fingerprint is the first 20 hex digits of
-SHA-256(raw), in groups of four, so it covers every key in `raw`. Adding signing keys to an identity
+low-order X25519 points and malformed ML-KEM keys. The fingerprint is the first 32 hex digits (128
+bits) of SHA-256(raw), in eight groups of four, so it covers every key in `raw`. Locksmith 4 and
+earlier showed only the first 20 digits (80 bits), which are the first five groups of the same
+fingerprint. Adding signing keys to an identity
 therefore gives it a new fingerprint, which contacts check once.
 
 A `locksmith3` key is too large for a QR code. Its QR code holds only its hash, as
 `LOCKSMITH3:FP:` followed by the 64 uppercase hex digits of SHA-256(raw). The key itself travels as
-text; whoever receives it compares its SHA-256 with the scanned hash (the first 20 digits are the
+text; whoever receives it compares its SHA-256 with the scanned hash (the first 32 digits are the
 fingerprint). `locksmith1` and `locksmith2` QR codes hold the whole key text.
 
 ## 10. Identity backups
@@ -332,18 +339,25 @@ nothing extra and restore them too.
 ## 11. Shamir shares
 
 Secrets are split byte-wise over GF(2^8) with the AES polynomial (0x11B), at x = 1…n, with fresh
-random coefficients. Text form (version 2, written):
+random coefficients. Text form (version 3, written since Locksmith 5):
 
 ```
-locksmithshare2-<k>-<x>-<split id: 8 hex>-<data: hex>-<check: 6 hex>
-data  = the share's bytes of (secret || SHA-256("locksmith/share/v2" || split id || secret)[0..8])
-check = hex(SHA-256(byte k || byte x || split id || data))[0..6]
+locksmithshare3-<k>-<x>-<split id: 8 hex>-<data: hex>-<check: 6 hex>
+padded = u16 len(secret) || secret || zero bytes up to a multiple of 32 bytes
+data   = the share's bytes of (padded || SHA-256("locksmith/share/v3" || split id || padded)[0..8])
+check  = hex(SHA-256(byte k || byte x || split id || data))[0..6]
 ```
 
-Every share of one split has the same random 4-byte split ID. Combining rejects mixed IDs, shares
-beyond the threshold that disagree, and a recovered secret whose tag doesn't match. Version 1
-(`locksmithshare-<k>-<x>-<data>-<check>`, no split ID or tag, check over `k || x || data`) is still
-read.
+Secrets are 1 to 4096 bytes. The padding means a share shows its holder only the secret's length
+rounded up to 32 bytes, not the exact length of a password. Every share of one split has the same
+random 4-byte split ID. Combining rejects mixed IDs, shares beyond the threshold that disagree, a
+recovered secret whose tag doesn't match, and padding that isn't all zeros or a length that doesn't
+fit.
+
+Older forms are still read. Version 2 (`locksmithshare2-…`, the same fields) shares
+`secret || SHA-256("locksmith/share/v2" || split id || secret)[0..8]`, without length or padding.
+Version 1 (`locksmithshare-<k>-<x>-<data>-<check>`, no split ID or tag, check over `k || x || data`)
+shares the secret alone.
 
 ## 12. Checksum manifests
 
@@ -416,8 +430,8 @@ A reader:
 2. Rejects the signature unless the magic matches, `alg` is 1, `clen` is at most 1024, the comment
    follows the rule above, and the length is exactly `3424 + clen` bytes.
 3. Finds the `locksmith3` key whose SHA-256 equals `key_id`. Without it, the signature can't be
-   checked, and the reader says so (it may show `key_id`'s first 20 hex digits as the signer's
-   fingerprint). A key of any other kind never verifies a signature, whatever `alg` says.
+   checked, and the reader says so (it may show `key_id`'s first 32 hex digits as the fingerprint the
+   signature claims, never as the signer's). A key of any other kind never verifies a signature, whatever `alg` says.
 4. Accepts the signature only if both `sig_ed` and `sig_ml` verify over `M`.
 
 A valid signature shows that the file was signed with that key. `created` is only the signer's claim.
@@ -447,8 +461,9 @@ A reader, after every frame has authenticated:
 1. Joins the signature blocks; anything but exactly 3424 bytes that parse as section 14 with `alg` 1
    and `clen` 0 makes the file invalid.
 2. Looks for the `locksmith3` key whose SHA-256 equals `key_id` among the keys it trusts (its contacts
-   and its own identities). Without one, the file still opens and the reader says it was signed by an
-   unknown key, showing the fingerprint from `key_id`.
+   and its own identities). Without one, the file still opens, but nothing about the signature has been
+   checked: `key_id` is only a claim that anyone can write. A reader may show the fingerprint it names,
+   but only as a claim, never as the signer.
 3. With the key, requires both `sig_ed` and `sig_ml` to verify over `M`. If either fails, the file is
    invalid: the reader reports it and writes or shows none of its content.
 
@@ -472,15 +487,20 @@ Version 1 files are still read, never written. They differ from version 2 as fol
 
 Recovery data is a separate file, by convention the protected file's name plus `.lpar`, that can
 repair storage damage to any file (Locksmith writes it for its own files on request). It doesn't
-change the protected file, and it protects against decay, not against tampering: someone who can
-change both files can change both consistently. Locksmith files are authenticated anyway.
+change the protected file, and it protects against decay, not against tampering: the block hashes and
+the whole-file hash a repair is checked against come from the sidecar itself, so whoever can change
+the sidecar alone decides what a repair rebuilds (up to `m/k` of the file). Locksmith files are
+authenticated anyway when opened; a reader repairing any other file should show how much it would
+rebuild and the expected SHA-256, and ask first.
 
 **Layout.** The protected file of `size` bytes is cut into `n = ceil(size / B)` data blocks of `B`
 bytes, the last one padded with zeros (blocks past the end are all zeros). With `k` data and `m`
 parity blocks per stripe, there are `S = max(1, ceil(n / k))` stripes, and data block `b` is at
 position `t = b div S` of stripe `j = b mod S`, so each stripe's blocks are spread evenly over the
-file. Writers choose `B` as a multiple of 4096 from 4096 to 1 MiB, and `(k, m)` as (200, 2), (80, 4),
-(40, 4) or (20, 4) (1, 5, 10 or 20% of the file).
+file. `(k, m)` is (200, 2), (80, 4), (40, 4) or (20, 4) (1, 5, 10 or 20% of the file), and `B` is
+`ceil(size / 65536)` rounded up to a multiple of 4096, at least 4096 and at most 1 MiB. Readers refuse
+any other layout: with `k = m = 1`, for example, a crafted sidecar would have every block rebuilt from
+its parity, which is the whole file.
 
 **Parity.** Over GF(2^8) with the polynomial `x^8 + x^4 + x^3 + x^2 + 1` (0x11D), parity block `i`
 of stripe `j` is, byte by byte,

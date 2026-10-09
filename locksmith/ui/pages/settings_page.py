@@ -16,8 +16,8 @@ from .common import open_url
 from .encrypt import THREADS
 
 
-def protection_summary(h) -> list[str]:
-    """One honest line per protection, for this platform."""
+def protection_summary(h, display: str = "") -> list[str]:
+    """One honest line per protection, for this platform. ``display``: Qt's platform plugin name."""
     if IS_WINDOWS:
         return [
             "DLL-injection protection: " + ("active (extension points disabled, no remote or low-integrity "
@@ -31,7 +31,9 @@ def protection_summary(h) -> list[str]:
         "process's memory)" if h.ok else "Memory protection: unavailable. " + " ".join(h.problems),
         "Network block: on (a seccomp filter refuses internet sockets)"
         if h.network_blocked else "Network block: unavailable on this system.",
-    ]
+    ] + (["Display: X11. Any program on this display can read what you type, passwords included, and what "
+          "Locksmith shows. A Wayland session keeps each app's input and window to itself."]
+         if display == "xcb" else [])
 
 
 class SettingsPage(Page):
@@ -123,15 +125,29 @@ class SettingsPage(Page):
             "recipient. Frames are bound to their position and to the file header, so reordering, "
             "truncation and tampering are detected. Keys are derived with HKDF-SHA512 and include a key "
             "commitment. Public-key sharing uses X25519 + ML-KEM-768 (post-quantum).", "caption"))
+        from PySide6.QtGui import QGuiApplication
+
         from ...hardening import status as hardening
-        for line in protection_summary(hardening):
+        for line in protection_summary(hardening, QGuiApplication.platformName()):
             about.add(label(line, "caption"))
+        self.key_protection = label("", "caption")
+        self.key_protection.setVisible(False)
+        about.add(self.key_protection)
         about.add(label(f"Settings and keys live in {config_dir()}", "faint"))
         folder = Button("Open settings folder", "folder", "ghost")
         folder.clicked.connect(lambda: open_url(config_dir().as_uri()))
         about.add(hrow(folder, None))
         self.add(about)
         self.finish()
+
+    def show_key_protection(self, store):
+        """Say how many identities are stored without a passphrase or TPM seal (audit A5)."""
+        n = len(store.unprotected)
+        self.key_protection.setText(
+            f"{n} identit{'ies are' if n != 1 else 'y is'} stored without a passphrase or TPM seal: any program "
+            "running as you, or a copy of the settings folder, can use "
+            f"{'them' if n != 1 else 'it'}. Add a passphrase on the Keys page." if n else "")
+        self.key_protection.setVisible(bool(n))
 
     def _integration_status(self):
         on = desktop.installed()

@@ -685,6 +685,14 @@ def open_source(path: Path) -> BinaryIO:
 @dataclass
 class AgeInfo:
     stanza_types: list[str]
+    work_factor: int | None = None   # a passphrase stanza's scrypt cost (log2 N), as the file states it
+
+    @property
+    def password_slots(self) -> list[dict]:
+        """The passphrase stanza in the shape of engine.FileInfo.password_slots, for cost checks."""
+        if self.work_factor is None:
+            return []
+        return [{"kdf": "scrypt", "params": {"n": 1 << self.work_factor, "r": 8, "p": 1}, "keyfile": False}]
 
     @property
     def summary(self) -> str:
@@ -699,8 +707,19 @@ class AgeInfo:
 
 def inspect(path: Path) -> AgeInfo:
     with open_source(Path(path)) as f:
-        header = read_header(f)
-    return AgeInfo([st.type.decode("ascii", "replace") for st in header.stanzas])
+        return _info(read_header(f))
+
+
+def inspect_bytes(blob: bytes) -> AgeInfo:
+    return _info(read_header(io.BytesIO(blob)))
+
+
+def _info(header: Header) -> AgeInfo:
+    work = None
+    for st in header.stanzas:
+        if st.type == b"scrypt" and len(st.args) == 3 and re.fullmatch(rb"[1-9][0-9]?", st.args[2]):
+            work = int(st.args[2])
+    return AgeInfo([st.type.decode("ascii", "replace") for st in header.stanzas], work)
 
 
 # ── files ────────────────────────────────────────────────────────────────────

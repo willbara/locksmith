@@ -518,10 +518,9 @@ def _build_header(opts: EncryptOptions, meta: dict, chk: _Checker,
 
     for rpk in opts.recipients:
         slots.append(_recipient_slot(rpk, dek, fmt))
-    for rpk in _dummy_recipients(opts):
-        # A genuine slot for a key that is thrown away at once, wrapping a random value:
-        # it looks exactly like a real one, and nothing can ever open it.
-        slots.append(_recipient_slot(rpk, secrets.token_bytes(32), fmt))
+    if opts.hide_recipients and opts.recipients:
+        slots += _decoy_slots([s for s in slots if s["t"] != "pw"], bool(opts.password or opts.keyfile),
+                              opts.recipients, fmt)
 
     # Shuffle so slot order leaks nothing about who was added first.
     secrets.SystemRandom().shuffle(slots)
@@ -611,12 +610,53 @@ def recipient_slot_target(real: int, password: bool) -> int:
     return max(real, min(target, MAX_SLOTS - password))
 
 
-def _dummy_recipients(opts: EncryptOptions) -> list[bytes]:
-    if not (opts.hide_recipients and opts.recipients):
+MAX_THROWAWAY_RSA_BITS = 4096   # larger RSA keys take too long to generate just for decoys
+
+
+def _slot_shape(slot: dict) -> tuple[str, int]:
+    """What an observer sees of a recipient slot: its type, and for RSA its ciphertext length."""
+    return slot["t"], len(_unb64(slot["c"])) if slot["t"] == SSH_RSA else 0
+
+
+def _decoy_slots(recipient_slots: list[dict], password: bool, known: list[bytes], fmt: Format) -> list[dict]:
+    """Decoy slots that hide how many recipients a file has (FORMAT.md §3, "Decoy slots"). Each kind
+    of slot present (X25519, hybrid, or RSA with one ciphertext size) is rounded up on its own to 8,
+    16, 32 or 64, so the file shows which kinds it has but not how many of each; one shared total
+    would show exactly how many of the rarer kinds there are (audit A9). Within MAX_SLOTS the largest
+    kinds are rounded first; one that no longer fits gets as many decoys as there is room for. Every decoy is a genuine slot wrapping a random
+    value: X25519 and hybrid ones for keys thrown away at once; RSA ones for a recipient key of the
+    same size (``known`` raw keys), or a throwaway key of that size up to 4096 bits, so their
+    ciphertexts look like real ones even to someone who knows the recipients' keys."""
+    counts: dict[tuple[str, int], int] = {}
+    for slot in recipient_slots:
+        counts[_slot_shape(slot)] = counts.get(_slot_shape(slot), 0) + 1
+    room = MAX_SLOTS - password - len(recipient_slots)
+    rsa_keys = {}
+    for raw in known:
+        if sshkeys.is_rsa_raw(raw):
+            rsa_keys.setdefault((sshkeys.rsa_public(raw).key_size + 7) // 8, []).append(raw)
+    decoys = []
+    for (kind, size), count in sorted(counts.items(), key=lambda kv: -kv[1]):
+        extra = min(recipient_slot_target(count, False) - count, room)
+        if extra <= 0:
+            continue
+        if kind == SSH_RSA:
+            targets = rsa_keys.get(size) or _throwaway_rsa(size)
+            if not targets:
+                continue
+            decoys += [_recipient_slot(secrets.choice(targets), secrets.token_bytes(32), fmt) for _ in range(extra)]
+        else:
+            decoys += [_recipient_slot(raw, secrets.token_bytes(32), fmt) for raw in _decoy_keys(extra, kind == HYBRID)]
+        room -= extra
+    return decoys
+
+
+def _throwaway_rsa(size: int) -> list[bytes]:
+    """An RSA key blob with ``size``-byte ciphertexts, made for decoys and then forgotten."""
+    if size * 8 > MAX_THROWAWAY_RSA_BITS:
         return []
-    n = recipient_slot_target(len(opts.recipients), bool(opts.password or opts.keyfile)) - len(opts.recipients)
-    # Same kind as the real recipients (post-quantum if any is), so the slot types reveal nothing more.
-    return _decoy_keys(n, any(len(r) == X25519_LEN + MLKEM_PUBLIC_LEN for r in opts.recipients))
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    return [sshkeys.public_blob(rsa.generate_private_key(public_exponent=65537, key_size=size * 8).public_key())]
 
 
 def _decoy_keys(n: int, hybrid: bool) -> list[bytes]:
@@ -1836,9 +1876,7 @@ def change_access(path: Path, keys: DecryptKeys, change: AccessChange, allow_loc
         has_pw = any(s["t"] == "pw" for s in new)
         recipients = [s for s in new if s["t"] != "pw"]
         if change.hide_recipients and recipients:
-            hybrid = any(s["t"] == HYBRID for s in recipients)
-            extra = recipient_slot_target(len(recipients), has_pw) - len(recipients)
-            new += [_recipient_slot(rpk, secrets.token_bytes(32), fmt) for rpk in _decoy_keys(extra, hybrid)]
+            new += _decoy_slots(recipients, has_pw, adding, fmt)
         if not new:
             raise LocksmithError("A file needs at least one way to open it: keep or set a password, or add a "
                                  "recipient.")

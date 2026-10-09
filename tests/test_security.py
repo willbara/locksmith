@@ -775,6 +775,7 @@ def test_join_parts_edge_cases(tmp_path):
 
 
 def _parts(tmp_path, data: bytes) -> list[Path]:
+    data = b"LOCKED\x00\x02" + data[8:]   # Join only rebuilds encrypted files
     (tmp_path / "big.bin").write_bytes(data)
     (tmp_path / "parts").mkdir()
     return tools.split_file(tmp_path / "big.bin", 4000, tmp_path / "parts")
@@ -798,8 +799,8 @@ def test_failed_join_leaves_no_output(tmp_path, monkeypatch):
 
 
 def test_join_is_made_durable(tmp_path, monkeypatch):
-    data = os.urandom(10_000)
-    parts = _parts(tmp_path, data)
+    parts = _parts(tmp_path, os.urandom(10_000))
+    data = (tmp_path / "big.bin").read_bytes()
     synced = []
     monkeypatch.setattr(tools, "fsync_dir", synced.append)
     target = tools.join_parts(parts, tmp_path / "parts")
@@ -1120,10 +1121,10 @@ def test_shares_from_same_length_secrets_rejected():
 
 
 def _reshare(share, data):
-    """Replace a v2 share's data and recompute its typo check, as a deliberate forger would."""
-    _, k, x, split_id, _, _ = share.split("-")
+    """Replace a share's data and recompute its typo check, as a deliberate forger would."""
+    prefix, k, x, split_id, _, _ = share.split("-")
     body = bytes([int(k), int(x)]) + bytes.fromhex(split_id) + data
-    return f"locksmithshare2-{k}-{x}-{split_id}-{data.hex()}-{hashlib.sha256(body).hexdigest()[:6]}"
+    return f"{prefix}-{k}-{x}-{split_id}-{data.hex()}-{hashlib.sha256(body).hexdigest()[:6]}"
 
 
 def test_altered_share_with_valid_checksum_rejected():
@@ -1977,3 +1978,233 @@ def test_kdf_settings_beyond_every_preset_are_flagged():
     assert kdf.beyond_presets("scrypt", {"n": 2**21, "r": 8, "p": 1})
     assert kdf.beyond_presets("pbkdf2-sha512", {"i": 20_000_000})
     assert not kdf.beyond_presets("unknown", {"i": 1})
+
+
+# ── 2026-10-05 audit: High and Medium items (A1–A5) and the rest ──────────────
+
+def test_unknown_signer_fingerprint_is_only_a_claim(tmp_path, monkeypatch):
+    """A3: a signature can name any key; an unsaved signer's fingerprint is never shown as the signer."""
+    from locksmith.core import signing
+    from locksmith.ui.pages.common import signature_text
+    alice = keys.KeyStore(tmp_path / "a").generate("Alice")
+    reader = keys.KeyStore(tmp_path / "r").generate("Reader")
+    real_sign = signing.sign_locked
+
+    def forged(private, fixed, digest, created=None):   # names Alice's key, signs nothing
+        head = signing.HEAD.pack(signing.MAGIC, 1, 1_700_000_000, signing.key_id(alice.key_raw), 0)
+        return head + os.urandom(signing.ED_LEN + signing.ML_LEN)
+    monkeypatch.setattr(signing, "sign_locked", forged)
+    blob = engine.encrypt_bytes(b"pay X", EncryptOptions(recipients=[reader.public_raw], signer=reader.private_raw()))
+    monkeypatch.setattr(signing, "sign_locked", real_sign)
+    res = engine.decrypt_bytes(blob, DecryptKeys(identities=[reader.private_raw()]))
+    text = signature_text(res.signature, {})
+    assert "claims" in text and "Nothing was checked" in text and not text.startswith("Signed by")
+    sig_file = tmp_path / "f.lsig"
+    target = tmp_path / "f"
+    target.write_bytes(b"x")
+    sig_file.write_text(signing.sign_file(target, reader.private_raw()))
+    with pytest.raises(signing.UnknownSignerError, match="nothing has been verified. It claims"):
+        signing.verify_file(target, sig_file.read_text(), [alice.key_raw])
+
+
+def test_join_rebuilds_only_encrypted_files_and_keeps_their_mark(tmp_path, monkeypatch):
+    """A4: Join can't turn marked parts of a program into an unmarked program."""
+    from locksmith.core import osutil
+    program = tmp_path / "Invoice.exe"
+    program.write_bytes(b"MZ" + os.urandom(3000))
+    (tmp_path / "parts").mkdir()
+    parts = tools.split_file(program, 1000, tmp_path / "parts")
+    with pytest.raises(LocksmithError, match="Join only puts encrypted files back together"):
+        tools.join_parts(parts, tmp_path)
+    assert not (tmp_path / "parts" / "Invoice.exe").exists()
+
+    mark = b"[ZoneTransfer]\r\nZoneId=3\r\n"
+    marked = {tmp_path / "x.locked.part002"}
+    written = {}
+    monkeypatch.setattr(osutil, "zone_mark", lambda p: mark if Path(p) in marked else None)
+    monkeypatch.setattr(osutil, "_write_zone_mark", lambda target, m: written.update({Path(target): m}))
+    enc = tmp_path / "x.locked"
+    enc.write_bytes(b"LOCKED\x00\x02" + os.urandom(2500))
+    parts = tools.split_file(enc, 1000)
+    joined = tools.join_parts(parts, tmp_path / "parts")
+    assert joined.read_bytes() == enc.read_bytes() and written[joined] == mark   # from the one marked part
+    marked.add(enc)
+    for p in parts:
+        p.unlink()
+    assert all(written[p] == mark for p in tools.split_file(enc, 1000))   # parts inherit their source's mark
+
+
+def _crafted_lpar(target: Path, content: bytes, k: int, m: int, block: int = 4096) -> Path:
+    """Recovery data that says ``target`` should be ``content``, with any layout (the A2 attack)."""
+    from locksmith.core import parity
+    lay = parity.Layout(len(content), block, k, m)
+    data_hashes = [b"\xff" * 16] * lay.blocks
+    parity_blocks = [bytes(block)] * (lay.stripes * m)   # wrong parity is fine: the layout check comes first
+    meta = parity._meta(lay, target.name, hashlib.sha256(content).digest(), data_hashes,
+                        [hashlib.sha256(p).digest()[:16] for p in parity_blocks])
+    ck = hashlib.sha256(meta).digest()
+    lpar = target.with_name(target.name + ".lpar")
+    lpar.write_bytes(parity.MAGIC + struct.pack(">I", len(meta)) + meta + ck + b"".join(parity_blocks) + meta + ck
+                     + struct.pack(">I", len(meta)) + parity.END_MAGIC)
+    return lpar
+
+
+def test_recovery_data_with_a_layout_locksmith_never_writes_is_refused(tmp_path):
+    """A2: k = m = 1 would let a sidecar rebuild every block of a file as anything."""
+    from locksmith.core import parity
+    victim = tmp_path / "contract.pdf"
+    victim.write_bytes(b"%PDF genuine\n" * 2000)
+    for k, m, block in ((1, 1, 4096), (20, 4, 8192), (200, 3, 4096)):
+        _crafted_lpar(victim, b"MZ evil\n" * 3000, k, m, block)
+        with pytest.raises(LocksmithError, match="damaged beyond use"):
+            parity.repair(victim)
+    assert victim.read_bytes() == b"%PDF genuine\n" * 2000
+
+
+def test_repair_keeps_encrypted_files_encrypted_and_marked(tmp_path, monkeypatch):
+    """A2: a sidecar that would rebuild a .locked header into something else is refused, and a
+    repaired file keeps the damaged original's Mark of the Web."""
+    from locksmith.core import osutil, parity
+    enc = _encrypt(tmp_path, data=os.urandom(40_000), compression="none")
+    good = enc.read_bytes()
+    other = tmp_path / "other"
+    other.write_bytes(b"MZ" + bytes(4094) + good[4096:])   # the same file with its first block replaced
+    lpar = parity.create(other, "20", out=enc.with_name(enc.name + ".lpar"))
+    with pytest.raises(LocksmithError, match="wouldn't be a valid encrypted file"):
+        parity.repair(enc, lpar)
+    assert enc.read_bytes() == good and not list(tmp_path.glob("**/*.damaged"))
+
+    parity.create(enc, "20", out=lpar)
+    damaged = bytearray(good)
+    damaged[100:200] = bytes(100)
+    enc.write_bytes(bytes(damaged))
+    written = {}
+    monkeypatch.setattr(osutil, "zone_mark", lambda p: b"mark" if Path(p).name.endswith(".damaged") else None)
+    monkeypatch.setattr(osutil, "_write_zone_mark", lambda t, m: written.update({Path(t): m}))
+    rep = parity.check(enc, lpar)
+    assert rep.repairable and rep.sha256 == hashlib.sha256(good).hexdigest() and 0 < rep.rebuilt_fraction < 0.2
+    parity.repair(enc, lpar)
+    assert enc.read_bytes() == good and written == {enc: b"mark"}
+
+
+def test_passphrases_can_be_added_changed_and_removed(tmp_path):
+    """A5: an identity created without a passphrase can get one later, and it is counted until then."""
+    store = keys.KeyStore(tmp_path / "k")
+    ident = store.generate("Me")
+    raw = ident.private_raw()
+    assert store.unprotected == [ident]
+    store.set_passphrase(ident, None, "first passphrase")
+    assert ident.is_locked and store.unprotected == [] and "private" not in json.dumps(
+        keys.KeyStore(tmp_path / "k").identities[0].locked)
+    with pytest.raises(WrongKeyError):
+        store.set_passphrase(ident, "wrong", "second")
+    store.set_passphrase(ident, "first passphrase", "second passphrase")
+    again = keys.KeyStore(tmp_path / "k").identities[0]
+    assert again.private_raw("second passphrase") == raw and again.private is None
+    store.set_passphrase(ident, "second passphrase", None)
+    assert keys.KeyStore(tmp_path / "k").identities[0].private_raw() == raw
+
+
+def test_windows_keys_move_out_of_the_roaming_profile(tmp_path, monkeypatch):
+    """A5: Windows keeps keys in %LOCALAPPDATA%; an older version's %APPDATA% folder is moved there."""
+    monkeypatch.setattr(osutil, "IS_WINDOWS", True)
+    monkeypatch.setenv("APPDATA", str(tmp_path / "Roaming"))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "Local"))
+    old = tmp_path / "Roaming" / "locksmith"
+    old.mkdir(parents=True)
+    (old / "keys.json").write_text('{"identities": []}')
+    folder = keys.config_dir()
+    assert folder == tmp_path / "Local" / "locksmith"
+    assert (folder / "keys.json").read_text() == '{"identities": []}' and not old.exists()
+    old.mkdir()   # a folder made again later is left alone: the local one wins
+    assert keys.config_dir() == folder and old.exists()
+
+
+def test_spliced_signing_keys_never_show_as_verified(tmp_path, monkeypatch):
+    """A1: a key pairing Alice's encryption key with Mallory's signing keys can be saved as an update,
+    but its signatures aren't ✓ until the user marks the new fingerprint as checked."""
+    from locksmith.core import signing
+    from locksmith.ui.pages.common import saved_signers, signature_text
+    reader = keys.KeyStore(tmp_path / "r")
+    me = reader.generate("Reader")
+    alice = keys.KeyStore(tmp_path / "a").generate("Alice")
+    mallory = keys.KeyStore(tmp_path / "m").generate("Mallory")
+    contact = reader.add_contact("Alice", keys.encode_public(alice.public_raw))
+    reader.mark_checked(contact)   # the user checked Alice's old fingerprint
+    spliced = alice.public_raw + mallory.key_raw[keys.HYBRID_PUBLIC_LEN:]
+    reader.update_contact_key(contact, keys.encode_public(spliced))
+    assert not contact.checked and not keys.KeyStore(tmp_path / "r").contacts[0].checked
+
+    monkeypatch.setattr(signing, "public_key", lambda private: spliced)   # Mallory's modified client
+    blob = engine.encrypt_bytes(b"x", EncryptOptions(recipients=[me.public_raw], signer=mallory.private_raw()))
+    monkeypatch.undo()
+    names = saved_signers(reader)
+    res = engine.decrypt_bytes(blob, DecryptKeys(identities=[me.private_raw()], verifiers=list(names)))
+    text = signature_text(res.signature, names)
+    assert res.signature.verified and not text.startswith("✓") and "haven't marked as checked" in text
+    reader.mark_checked(contact)
+    assert signature_text(res.signature, saved_signers(reader)).startswith("✓  Signed with the key you saved as Alice")
+    # Once checked with signing keys, a contact's signing keys can't be swapped again.
+    with pytest.raises(LocksmithError, match="different signing keys"):
+        reader.update_contact_key(contact, keys.encode_public(alice.key_raw))
+
+
+def test_contact_check_flag_is_only_ever_true_by_confirmation(tmp_path):
+    store = keys.KeyStore(tmp_path)
+    c = store.add_contact("Bob", keys.KeyStore(tmp_path / "b").generate("Bob").key_text)
+    assert not c.checked
+    data = json.loads(store.path.read_text())
+    data["contacts"][0]["checked"] = "yes"
+    store.path.write_text(json.dumps(data))
+    assert keys.KeyStore(tmp_path).contacts[0].checked is False
+
+
+def test_fingerprints_are_128_bits_and_extend_the_old_ones(tmp_path):
+    """A8: 32 hex digits; the 20 digits shown before are still their first five groups."""
+    from locksmith.core import signing
+    ident = keys.KeyStore(tmp_path).generate("Me")
+    fp = keys.fingerprint(ident.key_raw)
+    digest = hashlib.sha256(ident.key_raw).hexdigest().upper()
+    assert fp.replace(" ", "") == digest[:32] and len(fp.split()) == 8
+    assert fp.startswith(" ".join(digest[i:i + 4] for i in range(0, 20, 4)))
+    sig = signing.parse(signing.sign_file(tmp_path / "keys.json", ident.private_raw()))
+    assert sig.fingerprint == fp
+
+
+def test_shares_hide_the_secret_length():
+    """A15: v3 shares of a 1-byte and a 30-byte password look the same size; v1 and v2 still combine."""
+    short, longer = tools.shamir_split(b"a", 2, 3), tools.shamir_split(b"x" * 30, 2, 3)
+    assert all(s.startswith("locksmithshare3-") for s in short + longer)
+    assert {len(s) for s in short} == {len(s) for s in longer}
+    assert len(tools.shamir_split(b"x" * 31, 2, 2)[0]) > len(short[0])   # the next 32-byte block
+    assert tools.shamir_combine(short[:2]) == b"a" and tools.shamir_combine(longer[1:]) == b"x" * 30
+    v2 = ["locksmithshare2-2-1-b2a5bd73-4f90d9e19b16f5038af06a9901e0cba19d-5c8554",
+          "locksmithshare2-2-2-b2a5bd73-046dc94c828967a9937f492914f1a8d419-26ea5f",
+          "locksmithshare2-2-3-b2a5bd73-3dcf30de7cfce0cf6df3a1b0eefe890e65-d64be6"]
+    assert tools.shamir_combine(v2[1:]) == b"v2 secret"
+    with pytest.raises(LocksmithError, match="different secrets"):
+        tools.shamir_combine([v2[0], tools.shamir_split(b"v2 secret", 2, 3)[1]])
+    with pytest.raises(LocksmithError, match="4096"):
+        tools.shamir_split(bytes(4097), 2, 3)
+    raw = bytes(range(96))   # identity shares are v3 too and still restore
+    assert keys.private_from_shares(keys.identity_shares(raw, 2, 3)[:2]) == raw
+
+
+def test_decoys_hide_how_many_of_each_kind():
+    """A9: mixed kinds are each rounded up, so no kind's real count shows; RSA decoys are the
+    same size as the real RSA slot and look like real ciphertexts."""
+    from pathlib import Path as _P
+
+    from locksmith.core import sshkeys
+    hybrid = [keys.public_from_private(os.urandom(96)) for _ in range(2)]
+    classical = keys.public_from_private(me := os.urandom(32))
+    rsa_line = (_P(__file__).parent / "interop" / "sshkeys" / "id_rsa3072.pub").read_text(encoding="utf-8")
+    rsa_raw = sshkeys.parse_recipient(rsa_line).raw
+    blob = engine.encrypt_bytes(b"x", EncryptOptions(recipients=[*hybrid, classical, rsa_raw], hide_recipients=True,
+                                                     **FAST))
+    shapes = [engine._slot_shape(s) for s in _split(blob)[0]["slots"]]
+    assert sorted({s: shapes.count(s) for s in shapes}.items()) == [
+        (("ssh-rsa", 384), 8), (("x25519", 0), 8), (("x25519-mlkem768", 0), 8)]
+    assert engine.decrypt_bytes(blob, DecryptKeys(identities=[me])).data == b"x"
+    # Without a known key of that size (a kept slot), decoys use a throwaway key of the same size.
+    assert len(engine._throwaway_rsa(256)) == 1 and engine._throwaway_rsa(1024) == []

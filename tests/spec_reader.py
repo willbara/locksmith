@@ -275,8 +275,8 @@ def decode_public(text: str) -> bytes:
 
 
 def fingerprint(raw: bytes) -> str:
-    h = hashlib.sha256(raw).hexdigest()[:20].upper()
-    return " ".join(h[i:i + 4] for i in range(0, 20, 4))
+    h = hashlib.sha256(raw).hexdigest()[:32].upper()
+    return " ".join(h[i:i + 4] for i in range(0, 32, 4))
 
 
 def qr_payload(raw: bytes) -> str:
@@ -368,6 +368,8 @@ def read_recovery(data: bytes, lpar: bytes) -> dict:
     h = json.loads(meta[4:4 + hlen])
     size, block, k, m = h["size"], h["block"], h["k"], h["m"]
     assert size == len(data) and hashlib.sha256(data).hexdigest() == h["sha256"]
+    assert (k, m) in ((200, 2), (80, 4), (40, 4), (20, 4))
+    assert block == -(-max(4096, min(1 << 20, -(-size // 65536))) // 4096) * 4096
     n = -(-size // block)
     stripes = max(1, -(-n // k))
     table = meta[4 + hlen:]

@@ -44,7 +44,7 @@ from .common import (
     own_encryption_keys,
     reveal,
     saved_signers,
-    signature_text,
+    signature_badge,
 )
 from .encrypt import THREADS
 
@@ -272,11 +272,12 @@ class DecryptPage(Page):
         return build
 
     @staticmethod
-    def _kdf_cost_ok(paths, pasted) -> bool:
+    def _kdf_cost_ok(paths, pasted, ages) -> bool:
         infos = []
         for p in paths:
+            mod = age if p in ages else engine
             try:
-                infos.append(engine.inspect_bytes(pasted[p]) if p in pasted else engine.inspect(Path(p)))
+                infos.append(mod.inspect_bytes(pasted[p]) if p in pasted else mod.inspect(Path(p)))
             except (LocksmithError, OSError):
                 continue   # reported when the file is opened
         return confirm_kdf_cost(infos)
@@ -291,8 +292,7 @@ class DecryptPage(Page):
         threads = self.threads.value()
         pasted = dict(self.pasted)
         ages = {p for p in paths if self._is_age(p)}
-        if (self.password.text() or self.keyfile.path) and not self._kdf_cost_ok(
-                [p for p in paths if p not in ages], pasted):
+        if (self.password.text() or self.keyfile.path) and not self._kdf_cost_ok(paths, pasted, ages):
             return
         build_keys = self._key_source()
         if build_keys is None:
@@ -401,8 +401,8 @@ class DecryptPage(Page):
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setMaximumHeight(200)
         s.add(scroll)
-        hide = ToggleRow("Hide the number of recipients", "Rounds the recipient slots up to 8, 16, 32 or 64 with "
-                         "decoys. Classical, SSH and RSA recipients beside post-quantum ones stay countable.",
+        hide = ToggleRow("Hide the number of recipients", "Rounds each kind of recipient slot up to 8, 16, 32 or 64 "
+                         "with decoys: the file shows which kinds it has, not how many of each.",
                          settings["hide_recipients"])
         s.add(hide)
         s.add_button("Cancel", None, "ghost")
@@ -581,7 +581,7 @@ class DecryptPage(Page):
             card.add(hrow(label(path.name, "mono", wrap=False), None, show, open_btn))
             dialogs_needed = False
         sig = meta.get("_signature")
-        card.add(label(signature_text(sig, getattr(self, "_signers", {}), meta.get("_intent")), "caption"))
+        card.add(signature_badge(sig, getattr(self, "_signers", {}), meta.get("_intent")))
         if meta.get("note"):
             # The signature covers the note; without a checked one, nothing proves who wrote it.
             note = display_text(meta["note"])

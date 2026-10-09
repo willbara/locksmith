@@ -132,6 +132,8 @@ class KeysPage(Page):
             if needs_unlock:
                 row.action("fingerprint", "Unlock once to add its signing keys to the public key",
                            lambda _=0, i=ident: self._remember_verify(i))
+            row.action("lock", "Change the passphrase" if ident.is_locked else "Add a passphrase",
+                       lambda _=0, i=ident: self._set_passphrase(i))
             row.action("copy", "Copy public key", lambda _=0, i=ident: self._copy(i.key_text))
             row.action("share", "Copy as an age recipient (for age and rage)",
                        lambda _=0, i=ident: self._copy_age(i))
@@ -148,7 +150,11 @@ class KeysPage(Page):
                                              "key, an age key (age1…) or an SSH key.", "caption"))
         for c in self.store.contacts:
             added = time.strftime("%d %b %Y", time.localtime(c.added))
-            row = _KeyRow(c.name, c.fingerprint, f"{c.kind}  ·  added {added}")
+            checked = "fingerprint checked" if c.checked else "fingerprint not checked"
+            row = _KeyRow(c.name, c.fingerprint, f"{c.kind}  ·  {checked}  ·  added {added}")
+            if not c.checked:
+                row.action("fingerprint", "I compared this fingerprint with them",
+                           lambda _=0, c=c: self._check_fingerprint(c))
             row.action("copy", "Copy public key", lambda _=0, c=c: self._copy(c.public))
             row.action("trash", "Remove", lambda _=0, c=c: self._delete_contact(c))
             self.contact_box.addWidget(row)
@@ -171,7 +177,7 @@ class KeysPage(Page):
         s = Sheet("New identity", "A key pair for receiving encrypted files.", icon="user")
         name = LineEdit("Name, e.g. “Work laptop”")
         s.add(name)
-        s.add(label("PASSPHRASE (OPTIONAL)", "label"))
+        s.add(label("PASSPHRASE (RECOMMENDED)", "label"))
         pw = PasswordField("Protects the private key on this device", strength=True, generate=False)
         s.add(pw)
         again = PasswordField("Repeat passphrase", strength=False, generate=False)
@@ -184,9 +190,49 @@ class KeysPage(Page):
             dialogs.error("The passphrases don’t match. A typo here would lock you out of the key "
                           "for good, so nothing was created.", "Passphrases don’t match")
             return
+        if not pw.text() and not self._confirm_no_passphrase():
+            return
         n, p = name.text(), pw.text() or None
         run_task(lambda r, c: self.store.generate(n, p),
                  lambda ident: (self.reload(True), toast(f"Created “{ident.name}”", "key")),
+                 lambda m, k: dialogs.error(m), parent=self)
+
+    @staticmethod
+    def _confirm_no_passphrase() -> bool:
+        return dialogs.confirm(
+            "Store the key without a passphrase?",
+            "Without a passphrase, the private key is saved as it is in Locksmith's key file. Any program running "
+            "as you, a backup or a synced copy of that folder could then open every file sent to you. You can add "
+            "a passphrase later on the Keys page.", ok="Store without one", icon="key")
+
+    def _set_passphrase(self, ident):
+        s = Sheet(("Change the passphrase of " if ident.is_locked else "Add a passphrase to ") + f"“{ident.name}”",
+                  "The passphrase protects the private key stored on this device. Backups made before keep "
+                  "whatever protection they had.", icon="key")
+        current = None
+        if ident.is_locked:
+            s.add(label("CURRENT PASSPHRASE", "label"))
+            current = PasswordField("Current passphrase", strength=False, generate=False)
+            s.add(current)
+        s.add(label("NEW PASSPHRASE", "label"))
+        pw = PasswordField("New passphrase (empty: remove it)" if ident.is_locked else "New passphrase",
+                           strength=True, generate=False)
+        s.add(pw)
+        again = PasswordField("Repeat the new passphrase", strength=False, generate=False)
+        s.add(again)
+        s.add_button("Cancel", None, "ghost")
+        s.add_button("Save", True, "primary")
+        if not s.exec():
+            return
+        if not same_secret(pw.text(), again.text()):
+            dialogs.error("The new passphrases don’t match, so nothing was changed.", "Passphrases don’t match")
+            return
+        if not pw.text() and (not ident.is_locked or not self._confirm_no_passphrase()):
+            return
+        old, new = (current.text() or None) if current else None, pw.text() or None
+        run_task(lambda r, c: self.store.set_passphrase(ident, old, new),
+                 lambda i: (self.reload(True), toast(f"Updated the passphrase of “{i.name}”" if new else
+                                                     f"Removed the passphrase of “{i.name}”", "lock")),
                  lambda m, k: dialogs.error(m), parent=self)
 
     def _add_contact(self):
@@ -205,11 +251,15 @@ class KeysPage(Page):
             raw = keys.decode_recipient(key.text())
             same = self.store.contact_with_encryption_key(raw)
             if same is not None and not same.can_verify and keys.can_verify(raw):
+                # Nothing in a key shows its signing keys belong to the person whose encryption key it
+                # carries, so this can't say "this is their key": it starts unchecked (audit A1).
                 if not dialogs.confirm(
-                        f"Update “{same.name}”?",
-                        f"This is the key you saved as “{same.name}”, with its signing keys added, so you can "
-                        f"verify their signatures. Its fingerprint changes to {fingerprint(raw)}. Check the new "
-                        "fingerprint with them before trusting any signature.", ok="Update", icon="user"):
+                        f"Add signing keys to “{same.name}”?",
+                        f"This key encrypts to the key you saved as “{same.name}” and adds signing keys that claim "
+                        f"to be theirs. Anyone can attach their own signing keys to someone else's key, so this "
+                        f"proves nothing yet. Its new fingerprint is {fingerprint(raw)}: until you compare it with "
+                        f"{same.name} and mark it as checked, signatures by it won't show as verified.",
+                        ok="Add signing keys", icon="user"):
                     return
                 c = self.store.update_contact_key(same, key.text())
                 done = f"Updated {c.name}"
@@ -221,6 +271,7 @@ class KeysPage(Page):
             return
         self.reload(True)
         toast(done, "user")
+        self._check_fingerprint(c)
         if c.ssh is not None:
             dialogs.info(f"Added {c.name}'s SSH key",
                          f"Files you encrypt to this key open with {c.name}'s SSH private key. Check its fingerprint "
@@ -228,6 +279,16 @@ class KeysPage(Page):
                          "against future quantum computers."
                          + (" Files with an SSH RSA recipient can't be opened by Locksmith 3.0 or earlier, even "
                             "with a password." if c.ssh.key_type == "ssh-rsa" else ""), icon="user")
+
+    def _check_fingerprint(self, contact):
+        """Ask whether the user compared the contact's fingerprint with its owner; only a yes counts."""
+        if dialogs.confirm(
+                f"Did you compare {contact.name}'s fingerprint?",
+                f"Its fingerprint is {contact.fingerprint}. Compare it with {contact.name} in person, by phone or "
+                "over another channel you trust, not in the message the key came in. Until it is marked as "
+                "checked, signatures by this key show as unverified.", ok="It matches", icon="fingerprint"):
+            self.store.mark_checked(contact)
+            self.reload()
 
     def _export(self, ident):
         path, _ = QFileDialog.getSaveFileName(self, "Export identity backup",
@@ -361,7 +422,7 @@ class KeysPage(Page):
         scan.setToolTip("Read the QR code of a paper backup from a photo or scan")
         scan.clicked.connect(lambda: self._scan_qr(box))
         s.add(hrow(scan, None))
-        s.add(label("PASSPHRASE (OPTIONAL)", "label"))
+        s.add(label("PASSPHRASE (RECOMMENDED)", "label"))
         pw = PasswordField("Protects the private key on this device", strength=True, generate=False)
         s.add(pw)
         again = PasswordField("Repeat passphrase", strength=False, generate=False)
@@ -373,6 +434,8 @@ class KeysPage(Page):
         text, n, p = box.toPlainText(), name.text(), pw.text() or None
         if not same_secret(pw.text(), again.text()):
             dialogs.error("The passphrases don’t match, so nothing was restored.", "Passphrases don’t match")
+            return
+        if not pw.text() and not self._confirm_no_passphrase():
             return
 
         def work(r, c):

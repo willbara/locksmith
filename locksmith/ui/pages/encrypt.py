@@ -89,8 +89,9 @@ class EncryptPage(Page):
         self.hide_recipients = ToggleRow(
             "Hide the number of recipients",
             "Adds decoy recipient slots, so the file shows 8, 16, 32 or 64 instead of how many people "
-            "can really open it. Decoys are all of one kind, so mixing post-quantum recipients with classical "
-            "or SSH keys still shows how many of those there are.", settings["hide_recipients"])
+            "can really open it. With several kinds of key (post-quantum, classical, SSH RSA), each kind is "
+            "rounded up on its own: the file shows which kinds it has, not how many of each.",
+            settings["hide_recipients"])
         rl.addWidget(self.hide_recipients)
         self.rsa_note = label("An SSH RSA recipient is selected. Locksmith 3.0 and earlier can't open such a file at "
                               "all, even with its password.", "caption")
@@ -369,6 +370,12 @@ class EncryptPage(Page):
             ssh_blobs = {c.public_raw: c.ssh.blob for c in self.store.contacts
                          if c.ssh is not None and c.ssh.key_type == "ssh-ed25519"}
             age_recipients = [age.recipient_for(r, ssh_blobs.get(r)) for r in opts.recipients]
+            if any(r.kind.startswith("ssh-") for r in age_recipients) and not dialogs.confirm(
+                    "age names SSH recipients",
+                    "An age file labels each SSH recipient with a short tag of their key. Anyone with a list of "
+                    "public SSH keys (GitHub publishes everyone's) can tell who the file is for. Locksmith files "
+                    "don't name their recipients. Continue with age?", ok="Encrypt anyway", icon="user"):
+                return
             work_factor = {"fast": 16, "balanced": 18, "strong": 19, "paranoid": 20}[opts.preset]
 
         def work_age(report, cancel):

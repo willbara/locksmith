@@ -80,14 +80,28 @@ def copy_zone_identifier(source: Path, target: Path):
     document received encrypted would open without SmartScreen or Office Protected
     View. For a folder, every file inside is marked. Best effort, like other
     archivers: file systems without alternate streams (FAT, network shares) skip it."""
+    inherit_zone_identifier([source], target)
+
+
+def zone_mark(path: Path) -> bytes | None:
+    """Windows: a file's Mark of the Web (its Zone.Identifier stream), or None."""
     if not IS_WINDOWS:
-        return
+        return None
     try:
-        with open(f"{source}:Zone.Identifier", "rb") as f:
-            mark = f.read(4096)
+        with open(f"{path}:Zone.Identifier", "rb") as f:
+            return f.read(4096)
     except OSError:
-        return  # the source has no mark: nothing to carry over
-    _write_zone_mark(target, mark)
+        return None
+
+
+def inherit_zone_identifier(sources: list[Path], target: Path):
+    """Windows: give ``target``, made from ``sources`` (such as joined parts), the first mark any
+    of them carries, so splitting a download and joining it can't remove its mark."""
+    for source in sources:
+        mark = zone_mark(source)
+        if mark is not None:
+            _write_zone_mark(target, mark)
+            return
 
 
 def mark_untrusted(target: Path):
@@ -111,9 +125,18 @@ def _write_zone_mark(target: Path, mark: bytes):
 
 
 def config_base() -> Path:
+    """Where Locksmith's settings and keys live. On Windows the local profile (%LOCALAPPDATA%), never
+    the roaming one: managed networks copy roaming profiles to a server, keys included."""
+    if IS_WINDOWS:
+        return Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    return Path(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"))
+
+
+def legacy_config_base() -> Path | None:
+    """Where Locksmith 4 and earlier kept them on Windows (the roaming profile), to move from."""
     if IS_WINDOWS:
         return Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
-    return Path(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"))
+    return None
 
 
 _WINDOWS_BAD_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')

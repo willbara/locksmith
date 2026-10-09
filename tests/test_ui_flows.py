@@ -26,6 +26,7 @@ def wait(pred, timeout=60.0):
 def window(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     monkeypatch.setenv("APPDATA", str(tmp_path / "config"))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "config"))
     app = QApplication.instance() or QApplication([])
     from locksmith.ui import dialogs, settings
     monkeypatch.setattr(settings, "settings", settings.Settings())
@@ -510,10 +511,14 @@ def test_contact_upgrade_asks_and_shows_the_new_fingerprint(window, monkeypatch)
         return True
 
     monkeypatch.setattr(Sheet, "exec", fill)
+    store.mark_checked(store.contacts[0])
     page._add_contact()
     assert len(store.contacts) == 1 and store.contacts[0].can_verify
     title, msg = confirms[0]
-    assert title == "Update “Alice”?" and keys.fingerprint(alice.key_raw) in msg
+    assert title == "Add signing keys to “Alice”?" and keys.fingerprint(alice.key_raw) in msg
+    assert "proves nothing yet" in msg and "This is the key you saved" not in msg   # audit A1
+    assert confirms[1][0] == "Did you compare Alice's fingerprint?"   # the update reset the check; asked again
+    assert store.contacts[0].checked
 
 
 def test_share_page_shows_the_full_key_and_a_fingerprint_qr(window, monkeypatch):
@@ -633,8 +638,8 @@ def test_signed_file_through_encrypt_and_decrypt(tmp_path, window, monkeypatch):
     for f in (tmp_path / "dec").iterdir():
         f.unlink()
     texts = decrypt_and_read()
-    assert any(t.startswith("Signed by a key you haven't saved (fingerprint "
-                            f"{keys.fingerprint(me.key_raw)})") for t in texts)
+    assert any(t.startswith("Has a signature that claims a key you haven't saved (claimed fingerprint "
+                            f"{keys.fingerprint(me.key_raw)}). Nothing was checked") for t in texts)
     assert "Note from the sender (not verified): <b>from Alice</b>" in texts
 
 
@@ -775,7 +780,7 @@ def test_addressed_file_through_encrypt_and_decrypt(tmp_path, window, monkeypatc
                          engine.AccessChange(add_recipients=[carol.public_raw]))
     store.remove_identity(me)
     store.contacts.clear()
-    store.add_contact("Alice", me.key_text)
+    store.mark_checked(store.add_contact("Alice", me.key_text))
     store.identities.append(carol)
     window._keys_changed()
     d.files.add([str(enc)])
@@ -968,8 +973,10 @@ def test_recovery_data_through_encrypt_and_tools(tmp_path, window, monkeypatch):
     enc.write_bytes(bytes(damaged))
     monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: (str(enc), ""))
     t._rc_repair()
+    wait(lambda: t.rc_result.text().startswith("✓"))
     wait(lambda: t._rc_task is None)
     assert t.rc_result.text() == f"✓  Repaired {enc.name}" and enc.read_bytes() == original
+    assert "Repair this file?" in window.asked   # audit A2: the recovery data decides, so it asks first
 
 
 def test_share_messages_are_padded_not_compressed(window, monkeypatch):
@@ -1042,3 +1049,90 @@ def test_password_check_beyond_every_preset_asks_first(tmp_path, window, monkeyp
     page.start()
     assert asked == ["Unusually slow password check"]
     wait(lambda: page.task is None)
+
+
+def test_keys_without_a_passphrase_are_confirmed_and_reported(window, monkeypatch):
+    """Audit A5: a new identity without a passphrase asks first, and Settings says it is unprotected."""
+    from locksmith.ui import dialogs
+    from locksmith.ui.dialogs import Sheet
+    monkeypatch.setattr(Sheet, "exec", lambda self: True)
+    window.keys._new_identity()
+    wait(lambda: window.store.identities)
+    assert "Store the key without a passphrase?" in window.asked
+    window._keys_changed()
+    note = window.settings_page.key_protection
+    assert not note.isHidden() and note.text().startswith("1 identity is stored without a passphrase")
+    ident = window.store.identities[0]
+    window.store.set_passphrase(ident, None, "a long passphrase")
+    window._keys_changed()
+    assert note.isHidden()
+    monkeypatch.setattr(dialogs, "confirm", lambda *a, **k: False)
+    window.keys._new_identity()   # declined: nothing is created
+    QApplication.processEvents()
+    assert len(window.store.identities) == 1
+
+
+@pytest.mark.skipif(__import__("sys").platform == "win32", reason="X11 is a Linux display system")
+def test_x11_sessions_are_named_in_settings():
+    """Audit I4: on X11 every client can read keystrokes, which Settings → About says."""
+    from locksmith.hardening import HardeningStatus
+    from locksmith.ui.pages.settings_page import protection_summary
+    status = HardeningStatus(core_dumps_disabled=True, non_dumpable=True, network_blocked=True)
+    assert any("X11" in line for line in protection_summary(status, "xcb"))
+    assert not any("X11" in line for line in protection_summary(status, "wayland"))
+
+
+def test_age_with_ssh_recipients_warns_that_age_names_them(tmp_path, window, monkeypatch):
+    """Audit I5: an age file tags each SSH recipient's key, unlike a Locksmith file."""
+    from pathlib import Path
+
+    from locksmith.ui import dialogs
+    store, e = window.store, window.encrypt
+    ssh = (Path(__file__).parent / "interop" / "sshkeys" / "id_ed25519.pub").read_text(encoding="utf-8")
+    store.add_contact("Server", ssh)
+    window._keys_changed()
+    src = tmp_path / "a.txt"
+    src.write_text("x", encoding="utf-8")
+    e.files.add([str(src)])
+    e.format.set_value("age")
+    e.mode.setIndex(1)
+    for row, _ in e.recipients.rows:
+        row.setChecked(True)
+    e.output._dir = str(tmp_path / "enc")
+    e.output._rebuild()
+    asked = []
+    monkeypatch.setattr(dialogs, "confirm", lambda title, *a, **k: (asked.append(title), False)[1])
+    e.start()
+    assert asked == ["age names SSH recipients"] and e.task is None and not (tmp_path / "enc").exists()
+
+
+def test_age_passphrase_beyond_every_preset_asks_first(tmp_path, window, monkeypatch):
+    """Audit A12: an age file's scrypt cost is checked like a Locksmith file's."""
+    import io
+
+    from locksmith.core import age
+    from locksmith.ui import dialogs
+    f = tmp_path / "big.age"
+    with open(f, "wb") as out:
+        age.encrypt_stream(io.BytesIO(b"x"), out, [], "pw", work_factor=10)
+    head = f.read_bytes().replace(b" 10\n", b" 21\n", 1)   # the stated cost; the MAC no longer matters
+    f.write_bytes(head)
+    assert age.inspect(f).work_factor == 21 and age.inspect_bytes(head).work_factor == 21
+    asked = []
+    monkeypatch.setattr(dialogs, "confirm", lambda title, *a, **k: (asked.append(title), False)[1])
+    d = window.decrypt
+    d.add_paths([str(f)])
+    d.password.setText("pw")
+    d.start()
+    assert asked == ["Unusually slow password check"] and d.task is None
+
+
+def test_signature_status_is_a_badge_sender_text_never_is(tmp_path, window):
+    """Audit A6: only Locksmith's own status is drawn as a badge; a note claiming "✓ Signed" is a caption."""
+    from locksmith.ui.widgets import StatusBadge
+    page = window.decrypt
+    page._add_result("file", str(tmp_path / "report.pdf"), {"note": "✓  Signed with the key you saved as Bob"})
+    badges = page.findChildren(StatusBadge)
+    assert [b.text.text() for b in badges] == ["Not signed"] and badges[0].icon == "x"
+    notes = [lab for lab in page.findChildren(type(badges[0].text)) if "Bob" in lab.text()]
+    assert notes and not any(isinstance(lab.parent(), StatusBadge) for lab in notes)

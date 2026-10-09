@@ -17,7 +17,9 @@ from pathlib import Path
 
 def run() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="locksmith-selftest-"))
-    os.environ["XDG_CONFIG_HOME"] = str(tmp / "config")
+    # Every place a config folder can come from, so the self-test never sees (or moves) real keys.
+    for var in ("XDG_CONFIG_HOME", "APPDATA", "LOCALAPPDATA"):
+        os.environ[var] = str(tmp / "config")
     os.environ["QT_QPA_PLATFORM"] = "offscreen"
     failures = []
 

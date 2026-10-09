@@ -89,8 +89,7 @@ class Signature:
     @property
     def fingerprint(self) -> str:
         """The signer's fingerprint, which is the start of key_id."""
-        h = self.key_id.hex()[:20].upper()
-        return " ".join(h[i:i + 4] for i in range(0, 20, 4))
+        return keys.group_hex(self.key_id.hex())
 
 
 @dataclass
@@ -208,8 +207,9 @@ def verify_file(path: Path, signature: str, candidates: Iterable[bytes],
     sig = parse(signature)
     signer = next((k for k in candidates if keys.can_verify(k) and key_id(k) == sig.key_id), None)
     if signer is None:
-        raise UnknownSignerError(f"None of the keys checked made this signature. It was made with the key whose "
-                                 f"fingerprint is {sig.fingerprint}.")
+        # key_id is whatever the signature claims: nothing about it has been checked yet.
+        raise UnknownSignerError(f"None of the keys checked made this signature, so nothing has been verified. It "
+                                 f"claims to be made with the key whose fingerprint is {sig.fingerprint}.")
     message = _message(sig.head, bytes.fromhex(hash_file(path, "sha512", progress, cancel)))
     try:
         _verify_parts(signer, sig.sig_ed, sig.sig_ml, message)

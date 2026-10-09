@@ -44,11 +44,33 @@ def unlock_signer(store, choice):
     return ident, passphrase
 
 
-def saved_signers(store) -> dict[bytes, str]:
+class Signers(dict):
+    """Saved keys that can verify a signature, mapped to the name to show. ``unchecked`` holds the
+    contacts whose fingerprint the user hasn't confirmed comparing: their signatures are shown as
+    claimed, without ✓ (audit A1)."""
+
+    def __init__(self, names: dict[bytes, str], unchecked: set[bytes]):
+        super().__init__(names)
+        self.unchecked = unchecked
+
+
+def saved_signers(store) -> Signers:
     """Every saved key that can verify a signature, with the name to show for it."""
     names = {c.key_raw: c.name for c in store.contacts}
+    unchecked = {c.key_raw for c in store.contacts if not c.checked}
     names.update({i.key_raw: f"{i.name} (you)" for i in store.identities})
-    return {k: v for k, v in names.items() if keys.can_verify(k)}
+    unchecked -= {i.key_raw for i in store.identities}
+    return Signers({k: v for k, v in names.items() if keys.can_verify(k)}, {k for k in unchecked if keys.can_verify(k)})
+
+
+def signed_with(key: bytes, names: dict) -> str:
+    """"✓  Signed with the key you saved as X", or the unchecked form for a contact whose fingerprint
+    hasn't been compared."""
+    name = names.get(key, "a saved key")
+    if key in getattr(names, "unchecked", ()):
+        return (f"Signed with the key you saved as {name}, whose fingerprint you haven't marked as checked. "
+                "Compare it with them on the Keys page before trusting this signature")
+    return f"✓  Signed with the key you saved as {name}"
 
 
 def signature_text(sig, names: dict[bytes, str], intent: str | None = None) -> str:
@@ -59,13 +81,23 @@ def signature_text(sig, names: dict[bytes, str], intent: str | None = None) -> s
     if sig is None:
         return "Not signed"
     if sig.verified:
-        text = f"✓  Signed with the key you saved as {names.get(sig.key, 'a saved key')}"
+        text = signed_with(sig.key, names)
         if intent == "not_listed":
             text += ", but you weren't on its original recipient list"
         elif intent == "password":
             text += ". Addressed to specific people; opened with its password"
         return text
-    return f"Signed by a key you haven't saved (fingerprint {sig.fingerprint}), so it can't be checked"
+    # sig.fingerprint comes from the signature itself, which anyone can write: never present it as a fact.
+    return (f"Has a signature that claims a key you haven't saved (claimed fingerprint {sig.fingerprint}). Nothing "
+            "was checked: save that key, after comparing its fingerprint with its owner, and open the file again.")
+
+
+def signature_badge(sig, names: dict, intent: str | None = None):
+    """The signature status as a badge (an icon in a bordered box), never as plain text that a note
+    or a file name could imitate."""
+    from ..widgets import StatusBadge
+    text = signature_text(sig, names, intent)
+    return StatusBadge(text, "shield" if text.startswith("✓") else "alert" if sig is not None else "x")
 
 
 def own_encryption_keys(store) -> list[bytes]:

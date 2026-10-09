@@ -58,7 +58,8 @@ Files are fully compatible between the Windows and Linux versions. Differences o
   Crash-dump and memory-reading protection and the network block have no reliable unprivileged equivalent
   and are shown as unavailable in Settings → About. TPM sealing is shown greyed out as not available.
 - **Email** opens a new message and shows the file in Explorer to attach (Windows has no standard way to
-  attach automatically). Settings and keys live in `%APPDATA%\locksmith`.
+  attach automatically). Settings and keys live in `%LOCALAPPDATA%\locksmith` (the local profile,
+  which doesn't roam); Locksmith 4 kept them in `%APPDATA%` and they are moved on first start.
 - **Sharing the .exe:** it is not code-signed, so Windows SmartScreen warns on first run ("More info → Run
   anyway"). Check the SHA-256 against the `.sha256` file you sent alongside it.
 
@@ -165,9 +166,14 @@ or malware that already controls your account.
   rather than wiping it.
 - **No network:** a seccomp filter on every thread is configured to refuse creating any internet or other
   non-local socket. Programs it opens (file manager, mail) are started by systemd, outside the sandbox.
+  This keeps Locksmith from reaching the network by mistake. It is not a sandbox against a compromised
+  Locksmith: local (Unix) sockets stay open, so code running inside it could ask systemd to start a program
+  that has network access.
 - **Auto-lock and panic:** after inactivity (default 10 minutes), or with Ctrl+L, secrets are removed from
   the window and it is covered. Ctrl+Shift+L also minimizes it. A task that finishes while locked doesn't
-  show its secret result; after unlocking, you're told to open it again.
+  show its secret result; after unlocking, you're told to open it again. The lock is a privacy screen, not
+  a password lock: any click or key brings the window back, and identities without a passphrase can
+  still be used. Give your identities a passphrase if someone else may use your computer.
 - **Clipboard:** copied passwords and decrypted text are marked so clipboard managers skip them, and cleared
   after 30 seconds, on lock and on quit.
 
@@ -182,6 +188,13 @@ protected with a passphrase (Argon2id + AES-GCM).
 ## Caveats
 
 - Shredding is best effort. SSDs and copy-on-write filesystems such as btrfs can keep old copies.
+- Locksmith 5 writes Shamir shares that Locksmith 4 and earlier can't combine (they now hide the secret's
+  length). On Windows, keys and settings move from `%APPDATA%` to `%LOCALAPPDATA%` the first time
+  Locksmith 5 starts, after which Locksmith 4 no longer finds them. Files and public keys are unchanged.
+- TPM sealing keeps a copied disk or backup from using an identity. On this machine, any program running as
+  you can still ask the TPM to unseal it, unless the identity also has a passphrase.
+- On X11, every program on the display can read what you type, passwords included. Wayland doesn't allow
+  this; Settings → About says which one is in use.
 - Losing the password, keyfile or private key means losing the data. There is no recovery.
 - Changing a file's password or recipients doesn't revoke access: anyone who opened it before may have
   kept its file key. To take access away, decrypt it and encrypt it again.

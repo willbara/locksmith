@@ -143,10 +143,12 @@ def test_rsa_slots_only_in_version_2():
 
 
 def test_decoys_beside_ssh_recipients_are_classical():
+    """Each kind is rounded up on its own (audit A9): 8 x25519 slots and 8 RSA-3072 ones."""
     blob = engine.encrypt_bytes(b"x", EncryptOptions(recipients=[_pub("id_rsa3072").raw, _pub("id_ed25519").raw],
                                                      hide_recipients=True))
     info = engine.inspect_bytes(blob)
-    assert info.recipient_slots == 8 and info.post_quantum_slots == 0
+    assert info.recipient_slots == 16 and info.post_quantum_slots == 0
+    assert engine.decrypt_bytes(blob, DecryptKeys(ssh=[_ident("id_rsa3072")])).data == b"x"
 
 
 def test_adding_an_ssh_recipient_later(tmp_path):

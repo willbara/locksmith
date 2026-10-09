@@ -217,3 +217,23 @@ def test_version_6_is_refused():
 def test_malformed_signatures(blob):
     with pytest.raises(LocksmithError):
         openpgp.parse_signature(blob)
+
+
+def test_newest_subkey_binding_wins_whatever_the_packet_order(tmp_path):
+    """Audit I6: putting an older, unexpiring binding last doesn't undo a newer expiry."""
+    c = Cert()
+    sub = Ed25519PrivateKey.generate()
+    body = c._key_body(sub, c.created)
+    prefix = c.hashed_form() + c.hashed_form(body)
+    back = _sp(32, c.sign(sub, 0x19, prefix, issuer_body=body)[6:])
+
+    def binding(created, extra=b""):
+        return c.sign(c.sk, 0x18, prefix, hashed=_sp(27, b"\x02") + extra + back, created=created)
+    newer = binding(1_700_000_500, _sp(9, struct.pack(">I", 1000)))   # the subkey expires 1000 s after creation
+    older = binding(1_700_000_200)
+    late = c.file_sig(b"d", sub, body, created=c.created + 2000)
+    for order in ((newer, older), (older, newer)):
+        key = c.key(_packet(14, body), *order)
+        with pytest.raises(LocksmithError, match="after the key expired"):
+            _verify(tmp_path, b"d", late, key)
+        assert _verify(tmp_path, b"d", c.file_sig(b"d", sub, body, created=c.created + 10), key).expired

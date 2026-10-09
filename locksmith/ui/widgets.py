@@ -1656,3 +1656,25 @@ def label(text, role=None, wrap=True) -> Label:
         lab.setProperty("role", role)
     lab.setWordWrap(wrap)
     return lab
+
+
+class StatusBadge(QWidget):
+    """A status Locksmith itself vouches for, such as a signature check: drawn as a bordered box with
+    an icon, so text that comes from a file (a note, a name) can never pass for one, whatever
+    characters it holds (audit A6)."""
+
+    def __init__(self, text: str, icon: str, parent=None):
+        super().__init__(parent)
+        self.icon = icon
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(36, 7, 12, 7)
+        self.text = label(text, "caption")
+        lay.addWidget(self.text, 1)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(QPen(theme.c("border2"), 1))
+        p.setBrush(theme.c("raised"))
+        p.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 8, 8)
+        p.drawPixmap(QPointF(12, (self.height() - 16) / 2), pixmap(self.icon, 16, theme.c("text")))

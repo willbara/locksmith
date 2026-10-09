@@ -129,7 +129,9 @@ def test_signing_keys_follow_the_specification():
     assert hashlib.sha256(public[1248:]).hexdigest() == SIGS["ml_dsa_65_public_sha256"]
     assert spec_reader.encode_public(public) == SIGS["public_key"]
     assert spec_reader.decode_public(SIGS["public_key"]) == public
-    assert spec_reader.fingerprint(public) == SIGS["fingerprint"]
+    # The vector holds the 20-digit fingerprint of Locksmith 4: the first five groups of today's 32 digits.
+    assert spec_reader.fingerprint(public).startswith(SIGS["fingerprint"] + " ")
+    assert len(spec_reader.fingerprint(public)) == 39
     assert spec_reader.qr_payload(public) == SIGS["qr"]
 
 
@@ -141,7 +143,8 @@ def test_signing_keys_derive_as_specified():
     public = keys.public_from_private(SIGNER) + keys.verify_key(SIGNER)
     assert keys.encode_public(public) == SIGS["public_key"]
     assert keys.decode_public(SIGS["public_key"]) == public
-    assert keys.fingerprint(public) == SIGS["fingerprint"]
+    assert keys.fingerprint(public) == spec_reader.fingerprint(public)
+    assert keys.fingerprint(public).startswith(SIGS["fingerprint"] + " ")
     assert keys.qr_text(public) == SIGS["qr"]
     assert keys.encryption_part(public) == keys.public_from_private(SIGNER)
 
@@ -159,7 +162,8 @@ def test_signature_vector_verifies_with_locksmith(s):
     from locksmith.core import keys, signing
     text = signing.read_small(HERE / s["signature"])
     v = signing.verify_file(HERE / s["file"], text, [keys.decode_public(SIGS["public_key"])])
-    assert (v.comment, v.created, v.fingerprint) == (s["comment"], s["created"], SIGS["fingerprint"])
+    assert (v.comment, v.created) == (s["comment"], s["created"])
+    assert v.fingerprint == spec_reader.fingerprint(keys.decode_public(SIGS["public_key"]))
 
 
 def test_locksmith_signatures_verify_with_the_specification(tmp_path):

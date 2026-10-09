@@ -88,6 +88,7 @@ class MainWindow(QMainWindow):
         self.share.reload()
         self.tools.reload()
         self.encrypt.reload_signers()
+        self.settings_page.show_key_protection(self.store)
 
     def _share_file(self, path):
         self.share.set_file(path)

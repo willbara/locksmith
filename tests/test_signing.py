@@ -181,7 +181,7 @@ def test_locksmith3_qr_code_holds_the_hash(signer):
     ident, _ = signer
     qr = keys.qr_text(ident.key_raw)
     assert qr.startswith("LOCKSMITH3:FP:") and len(qr) == 14 + 64
-    assert qr[14:34] == keys.fingerprint(ident.key_raw).replace(" ", "")
+    assert qr[14:46] == keys.fingerprint(ident.key_raw).replace(" ", "")   # the fingerprint starts the hash
     assert keys.qr_text(ident.public_raw) == ident.public   # locksmith2 keys still fit whole
 
 

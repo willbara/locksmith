@@ -11,8 +11,12 @@ per stripe.
 
 The sidecar keeps its description (sizes, hashes) twice, at its start and end, each with its own
 checksum; damaged parity blocks are recognised by their hashes and simply not used. Recovery
-data protects against decay of the storage, not against someone who can change both files:
-Locksmith files are authenticated by their own encryption.
+data protects against decay of the storage, not against tampering: everything a repair checks
+against (the block hashes and the final SHA-256) comes from the sidecar, so whoever can change the
+sidecar alone decides what up to m/k of the file is rebuilt as. Readers therefore accept only the
+layouts Locksmith writes, the UI shows what a repair would rebuild and asks first, a repaired
+Locksmith or age file must still parse as one, and the repaired file keeps the original's Mark of
+the Web. Locksmith files are authenticated by their own encryption when opened.
 """
 
 from __future__ import annotations
@@ -254,10 +258,14 @@ def _parse_meta(meta: bytes) -> tuple[Layout, str, bytes, list[bytes], list[byte
     for v in (size, block, k, m):
         if isinstance(v, bool) or not isinstance(v, int):
             raise ValueError
-    if not (0 <= size < 1 << 50 and MIN_BLOCK <= block <= MAX_BLOCK and block % MIN_BLOCK == 0
-            and 1 <= k and 1 <= m and k + m <= 256):
+    if not 0 <= size < 1 << 50 or (k, m) not in LEVELS.values():
         raise ValueError
+    # Only the layouts Locksmith writes: (k, m) from LEVELS and the block size it picks for the size.
+    # A crafted sidecar could otherwise choose k = m = 1 and have every block rebuilt from its parity.
     lay = Layout(size, block, k, m)
+    level = next(name for name, km in LEVELS.items() if km == (k, m))
+    if block != layout_for(size, level).block:
+        raise ValueError
     digest = bytes.fromhex(header["sha256"])
     name = header.get("name") if isinstance(header.get("name"), str) else ""
     table = meta[4 + hlen:]
@@ -316,6 +324,13 @@ class Report:
     size_matches: bool = True
     repaired: Path | None = None
     kept: Path | None = None                           # the damaged original, kept beside it
+    blocks: int = 0                                    # data blocks in the file the sidecar describes
+    sha256: str = ""                                   # what a repair must produce, as the sidecar says
+
+    @property
+    def rebuilt_fraction(self) -> float:
+        """How much of the file a repair would write from the recovery data."""
+        return len(self.damaged) / max(self.blocks, 1)
 
     @property
     def repairable(self) -> bool:
@@ -343,7 +358,7 @@ def check(path: Path, lpar: Path | None = None, progress: Progress | None = None
     intact = not damaged and actual == lay.size and whole.digest() == rec.sha256
     if not damaged and not intact and actual == lay.size:
         damaged = list(range(lay.blocks))   # hashes matched but the whole didn't: can't say where
-    result = Report(intact, damaged, size_matches=actual == lay.size)
+    result = Report(intact, damaged, size_matches=actual == lay.size, blocks=lay.blocks, sha256=rec.sha256.hex())
     if not intact:
         good_parity = _good_parity(path, rec, lpar)
         per_stripe: dict[int, int] = {}
@@ -371,7 +386,7 @@ def repair(path: Path, lpar: Path | None = None, progress: Progress | None = Non
     the damaged original is kept beside it as ``name.damaged``. Nothing changes when the damage is
     more than the recovery data can repair."""
     from .engine import create_private, unique_path
-    from .osutil import fsync_dir
+    from .osutil import copy_zone_identifier, fsync_dir
     path = Path(path)
     lpar_path = Path(lpar) if lpar else path.with_name(path.name + EXTENSION)
     result = check(path, lpar_path, progress, cancel)
@@ -423,6 +438,7 @@ def repair(path: Path, lpar: Path | None = None, progress: Progress | None = Non
             os.fsync(out.fileno())
         if whole.digest() != rec.sha256:
             raise LocksmithError("The repair didn't reproduce the original file, so nothing was changed.")
+        _check_still_encrypted(path, tmp)
         kept = unique_path(path.with_name(path.name + ".damaged"))
         os.replace(path, kept)
         try:
@@ -430,6 +446,7 @@ def repair(path: Path, lpar: Path | None = None, progress: Progress | None = Non
         except BaseException:
             os.replace(kept, path)   # put the original back rather than leave neither in place
             raise
+        copy_zone_identifier(kept, path)   # a repaired download is still a download
         fsync_dir(path.parent)
     except BaseException:
         tmp.unlink(missing_ok=True)
@@ -437,3 +454,22 @@ def repair(path: Path, lpar: Path | None = None, progress: Progress | None = Non
     result.repaired, result.kept = path, kept
     report(1.0, "Repaired")
     return result
+
+
+def _check_still_encrypted(original: Path, repaired: Path):
+    """A Locksmith or age file must still be one after repair. A sidecar that rebuilt its header
+    into something else came from someone else, not from storage decay."""
+    from . import age, engine
+    with open(original, "rb") as f:
+        was = f.read(64)
+    with open(repaired, "rb") as f:
+        now = f.read(64)
+    try:
+        if engine.looks_encrypted(was) or engine.looks_encrypted(now) or \
+                was.lstrip().startswith(engine.ARMOR_BEGIN.encode()):
+            engine.inspect(repaired)
+        elif age.is_age(was) or age.is_age(now):
+            age.inspect(repaired)
+    except (LocksmithError, OSError) as e:
+        raise LocksmithError("The repaired file wouldn't be a valid encrypted file, so the recovery data doesn't "
+                             "belong to it. Nothing was changed.") from e

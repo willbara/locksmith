@@ -195,10 +195,10 @@ def test_shamir():
 
 def test_split_join_shred(tmp_path):
     f = tmp_path / "x.locked"
-    data = os.urandom(2500)
+    data = b"LOCKED\x00\x02" + os.urandom(2500)
     f.write_bytes(data)
     parts = tools.split_file(f, 1000)
-    assert len(parts) == 3
+    assert len(parts) == 3 and parts[-1].stat().st_size == 508
     (tmp_path / "joined").mkdir()
     out = tools.join_parts(parts[::-1], tmp_path / "joined")
     assert out.read_bytes() == data

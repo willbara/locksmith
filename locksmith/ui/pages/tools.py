@@ -36,7 +36,7 @@ from ..widgets import (
     toast,
 )
 from ..workers import run_task
-from .common import saved_signers
+from .common import saved_signers, signed_with
 
 
 def _shown(text: str) -> str:
@@ -478,8 +478,7 @@ class ToolsPage(Page):
         def done(v):
             end()
             name = candidates.get(v.key)
-            self.ls_result.setText(f"✓  Signed with the key you saved as {name}" if name else
-                                   "✓  Signed with the key you entered")
+            self.ls_result.setText(signed_with(v.key, saved) if name else "✓  Signed with the key you entered")
             try:
                 when = time.strftime("%d %b %Y, %H:%M", time.localtime(v.created))
             except (OverflowError, OSError, ValueError):
@@ -491,8 +490,8 @@ class ToolsPage(Page):
             end()
             self.ls_result.setText("✕  Not verified")
             if k == "UnknownSignerError":
-                m += (" Paste the signer's public key above, or add them as a contact after checking that "
-                      "fingerprint with them.")
+                m += (" A signature can claim any fingerprint. Paste the signer's public key above, or add them as a "
+                      "contact after checking their fingerprint with them, and verify again.")
             self.ls_detail.setText(m)
 
         run_task(lambda r, c: signing.verify_file(f, signing.read_small(sig), list(candidates),
@@ -865,14 +864,34 @@ class ToolsPage(Page):
                 return
             side = Path(chosen)
 
-        def done(rep):
+        def repaired(rep):
+            self.rc_result.setText(f"✓  Repaired {Path(path).name}")
+            self.rc_detail.setText(f"{len(rep.damaged)} damaged block{'s' if len(rep.damaged) != 1 else ''} "
+                                   f"rebuilt. The damaged copy was kept as {rep.kept.name}. SHA-256 {rep.sha256}.")
+
+        def checked(rep):
             if rep.intact:
                 self.rc_result.setText("✓  The file is intact")
-            else:
-                self.rc_result.setText(f"✓  Repaired {Path(path).name}")
-                self.rc_detail.setText(f"{len(rep.damaged)} damaged block{'s' if len(rep.damaged) != 1 else ''} "
-                                       f"rebuilt. The damaged copy was kept as {rep.kept.name}.")
-        self._rc_run(lambda r, c: parity.repair(Path(path), side, progress=r, cancel=c), done)
+                return
+            if not rep.repairable:
+                self.rc_result.setText("✕  Too damaged to repair")
+                self.rc_detail.setText(f"{rep.unrepairable} part{'s' if rep.unrepairable != 1 else ''} of the file "
+                                       "lost more blocks than the recovery data can rebuild. Nothing was changed.")
+                return
+            # Everything a repair is checked against comes from the recovery data, so a sidecar from
+            # someone else decides what these blocks become: say how much, and ask.
+            self.rc_result.setText(f"{len(rep.damaged)} damaged block{'s' if len(rep.damaged) != 1 else ''}")
+            if not dialogs.confirm(
+                    "Repair this file?",
+                    f"{len(rep.damaged)} block{'s' if len(rep.damaged) != 1 else ''} "
+                    f"({rep.rebuilt_fraction:.1%} of {Path(path).name}) don't match the recovery data and would be "
+                    f"rebuilt from it. The repaired file's SHA-256 would be {rep.sha256}. The recovery data decides "
+                    "what those blocks become, so only repair with recovery data you made or got from a source you "
+                    "trust. The damaged copy is kept.", ok="Repair", icon="shield"):
+                self.rc_detail.setText("Not repaired.")
+                return
+            self._rc_run(lambda r, c: parity.repair(Path(path), side, progress=r, cancel=c), repaired)
+        self._rc_run(lambda r, c: parity.check(Path(path), side, progress=r, cancel=c), checked)
 
     # ── keyfile ──
 

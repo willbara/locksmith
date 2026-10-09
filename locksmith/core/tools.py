@@ -19,7 +19,15 @@ from pathlib import Path
 from typing import BinaryIO
 
 from .errors import CancelledError, LocksmithError
-from .osutil import IS_WINDOWS, fsync_dir, is_link, open_new, windows_unsafe
+from .osutil import (
+    IS_WINDOWS,
+    copy_zone_identifier,
+    fsync_dir,
+    inherit_zone_identifier,
+    is_link,
+    open_new,
+    windows_unsafe,
+)
 
 
 def same_secret(a: str | bytes, b: str | bytes) -> bool:
@@ -392,19 +400,38 @@ def _div(a, b):
     return 0 if a == 0 else _EXP[(_LOG[a] - _LOG[b]) % 255]
 
 
-# Share text formats. Both end in a 6-hex-digit typo check over the share's fields.
+# Share text formats. All end in a 6-hex-digit typo check over the share's fields.
 #   locksmithshare-<k>-<x>-<data>-<check>          v1, still read
-#   locksmithshare2-<k>-<x>-<id>-<data>-<check>    v2, written
+#   locksmithshare2-<k>-<x>-<id>-<data>-<check>    v2, still read
+#   locksmithshare3-<k>-<x>-<id>-<data>-<check>    v3, written
 # v2 adds a random split ID shared by every share of one split, and splits the secret
 # followed by a tag (a hash of the ID and secret), so mixed or altered shares are caught.
+# v3 splits the secret's length and the secret padded with zeros to a multiple of 32 bytes,
+# so a share no longer tells its holder how long the password is (audit A15).
 _SHARE_V1 = re.compile(r"locksmithshare-([0-9]{1,3})-([0-9]{1,3})-()([0-9a-f]+)-([0-9a-f]{6})")
 _SHARE_V2 = re.compile(r"locksmithshare2-([0-9]{1,3})-([0-9]{1,3})-([0-9a-f]{8})-([0-9a-f]+)-([0-9a-f]{6})")
+_SHARE_V3 = re.compile(r"locksmithshare3-([0-9]{1,3})-([0-9]{1,3})-([0-9a-f]{8})-([0-9a-f]+)-([0-9a-f]{6})")
 _SPLIT_ID = 4
 _TAG = 8
+_SHARE_BLOCK = 32
+MAX_SHARED_SECRET = 4096
 
 
-def _share_tag(split_id: bytes, secret: bytes) -> bytes:
-    return hashlib.sha256(b"locksmith/share/v2" + split_id + secret).digest()[:_TAG]
+def _share_tag(split_id: bytes, secret: bytes, label: bytes = b"locksmith/share/v2") -> bytes:
+    return hashlib.sha256(label + split_id + secret).digest()[:_TAG]
+
+
+def _padded(secret: bytes) -> bytes:
+    """v3: u16 length, the secret, zeros up to a multiple of 32 bytes."""
+    body = len(secret).to_bytes(2, "big") + secret
+    return body + bytes(-len(body) % _SHARE_BLOCK)
+
+
+def _unpadded(padded: bytes) -> bytes | None:
+    n = int.from_bytes(padded[:2], "big")
+    if len(padded) < 2 + n or padded.count(0, 2 + n) != len(padded) - 2 - n:
+        return None
+    return padded[2:2 + n]
 
 
 def _interpolate(points: dict[int, bytes], xs: list[int], at: int) -> bytes:
@@ -427,8 +454,11 @@ def shamir_split(secret: bytes, threshold: int, shares: int) -> list[str]:
         raise LocksmithError("Need 2 ≤ threshold ≤ shares ≤ 255.")
     if not secret:
         raise LocksmithError("Nothing to split.")
+    if len(secret) > MAX_SHARED_SECRET:
+        raise LocksmithError(f"Secrets up to {MAX_SHARED_SECRET} bytes can be split.")
     split_id = secrets.token_bytes(_SPLIT_ID)
-    data = secret + _share_tag(split_id, secret)
+    padded = _padded(secret)
+    data = padded + _share_tag(split_id, padded, b"locksmith/share/v3")
     coeffs = [[b] + [secrets.randbelow(256) for _ in range(threshold - 1)] for b in data]
     out = []
     for x in range(1, shares + 1):
@@ -440,7 +470,7 @@ def shamir_split(secret: bytes, threshold: int, shares: int) -> list[str]:
             ys.append(y)
         body = bytes([threshold, x]) + split_id + bytes(ys)
         check = hashlib.sha256(body).hexdigest()[:6]
-        out.append(f"locksmithshare2-{threshold}-{x}-{split_id.hex()}-{ys.hex()}-{check}")
+        out.append(f"locksmithshare3-{threshold}-{x}-{split_id.hex()}-{ys.hex()}-{check}")
     return out
 
 
@@ -451,7 +481,7 @@ def shamir_combine(texts: list[str]) -> bytes:
         text = text.strip()
         if not text:
             continue
-        m = _SHARE_V2.fullmatch(text) or _SHARE_V1.fullmatch(text)
+        m = _SHARE_V3.fullmatch(text) or _SHARE_V2.fullmatch(text) or _SHARE_V1.fullmatch(text)
         if not m:
             raise LocksmithError("One of the shares is not in the right format.")
         k, x, split_id, hexdata, check = int(m[1]), int(m[2]), bytes.fromhex(m[3]), m[4], m[5]
@@ -472,7 +502,7 @@ def shamir_combine(texts: list[str]) -> bytes:
     if len(points) < threshold:
         raise LocksmithError(f"Need {threshold} different shares, got {len(points)}.")
     lengths = {len(d) for d in points.values()}
-    if len(lengths) > 1 or (version is _SHARE_V2 and lengths.pop() <= _TAG):
+    if len(lengths) > 1 or (version is not _SHARE_V1 and lengths.pop() <= _TAG):
         raise LocksmithError("The shares belong to different secrets.")
     xs = list(points)[:threshold]
     mismatch = LocksmithError("The shares don't fit together: one is damaged or belongs to a "
@@ -485,8 +515,13 @@ def shamir_combine(texts: list[str]) -> bytes:
     if version is _SHARE_V1:
         return data
     secret, tag = data[:-_TAG], data[-_TAG:]
-    if not same_secret(_share_tag(split_id, secret), tag):
+    label = b"locksmith/share/v3" if version is _SHARE_V3 else b"locksmith/share/v2"
+    if not same_secret(_share_tag(split_id, secret, label), tag):
         raise mismatch
+    if version is _SHARE_V3:
+        secret = _unpadded(secret)
+        if secret is None or not secret:
+            raise mismatch
     return secret
 
 
@@ -611,6 +646,7 @@ def split_file(path: Path, part_size: int, out_dir: Path | None = None) -> list[
             part = out_dir / f"{path.name}.part{n:03d}"
             with os.fdopen(open_new(part), "wb") as out:  # never overwrites or follows a link
                 out.write(block)
+            copy_zone_identifier(path, part)
             parts.append(part)
             n += 1
     return parts
@@ -632,6 +668,7 @@ def join_parts(parts: list[Path], out_dir: Path | None = None) -> Path:
         numbers.append(int(pm[2]))
     if numbers != list(range(1, len(numbers) + 1)):
         raise LocksmithError("Some parts are missing: they must be numbered 1…N without gaps.")
+    _check_joinable(parts[0])
     out_dir = Path(out_dir) if out_dir else parts[0].parent
     from .engine import unique_path
     target = unique_path(out_dir / base)
@@ -650,5 +687,19 @@ def join_parts(parts: list[Path], out_dir: Path | None = None) -> Path:
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
+    inherit_zone_identifier(parts, target)   # parts from a download keep their Mark of the Web
     fsync_dir(out_dir)
     return target
+
+
+def _check_joinable(first: Path):
+    """Join only rebuilds what Split makes: encrypted Locksmith or age files (binary or armored).
+    Joining any file would let someone send a program in marked parts and have it rebuilt without
+    its Mark of the Web, past SmartScreen."""
+    from . import age, engine
+    with open(first, "rb") as f:
+        head = f.read(64)
+    if not (engine.looks_encrypted(head) or age.is_age(head)
+            or head.lstrip().startswith(engine.ARMOR_BEGIN.encode())):
+        raise LocksmithError("These parts don't make up a Locksmith or age file. Join only puts encrypted files "
+                             "back together.")

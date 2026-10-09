@@ -205,6 +205,9 @@ def test_fuzz_public_keys():
 def test_fuzz_shares_and_words():
     shares = "\n".join(tools.shamir_split(b"secret password", 2, 3))
     fuzz("shares", shares, lambda t: tools.shamir_combine(t.split()), mutate_text)
+    v2 = ("locksmithshare2-2-1-b2a5bd73-4f90d9e19b16f5038af06a9901e0cba19d-5c8554\n"
+          "locksmithshare2-2-2-b2a5bd73-046dc94c828967a9937f492914f1a8d419-26ea5f")   # still read
+    fuzz("shares-v2", v2, lambda t: tools.shamir_combine(t.split()), mutate_text)
     id_shares = "\n".join(keys.identity_shares(os.urandom(32), 2, 3))
     fuzz("identity-shares", id_shares, lambda t: keys.private_from_shares(t.split()), mutate_text)
     fuzz("words", " ".join(keys.backup_words(os.urandom(96))), keys.private_from_words, mutate_text)
@@ -324,6 +327,24 @@ def test_fuzz_image_metadata(tmp_path, kind):
                 r.read()
 
     fuzz(f"image-{kind}", seeds[kind], run)
+
+
+def test_fuzz_icc_profile():
+    """ICC profiles come from whoever made the image: scrubbing returns a profile or None, never crashes."""
+    tag = b"desc" + bytes(4) + struct.pack(">I", 5) + b"name\x00"
+    header = bytearray(128)
+    header[36:40] = b"acsp"
+    table = struct.pack(">I", 2) + struct.pack(">4sII", b"desc", 156, len(tag)) + struct.pack(">4sII", b"dmnd", 156,
+                                                                                             len(tag))
+    seed = bytearray(header + table + tag)
+    seed[:4] = struct.pack(">I", len(seed))
+    assert metadata.scrub_icc(bytes(seed)) is not None
+
+    def run(data):
+        out = metadata.scrub_icc(data)
+        assert out is None or len(out) == len(data)
+
+    fuzz("icc", bytes(seed), run)
 
 
 # ── age files, SSH recipients, changed slots ─────────────────────────────────

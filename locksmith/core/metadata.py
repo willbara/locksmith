@@ -1,7 +1,9 @@
 """Lossless metadata stripping for JPEG, PNG and WebP images.
 
 Only the parts an image needs to display correctly are kept (an allowlist):
-pixel data, colour profile, transparency, animation. Everything else is dropped:
+pixel data, colour profile, transparency, animation. A colour profile is kept without what
+identifies a device or a moment: its creation date, device maker, model and creator fields and
+device-description tags are cleared in place, so its colours are unchanged. Everything else is dropped:
 EXIF (camera, GPS location, dates, serial numbers), XMP, IPTC, comments,
 thumbnails, C2PA content credentials and unknown chunks. Pixels are never
 re-encoded, so image quality is untouched. The EXIF orientation is kept in a
@@ -17,6 +19,7 @@ from __future__ import annotations
 
 import io
 import struct
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -102,6 +105,75 @@ class PlanReader(io.RawIOBase):
         super().close()
 
 
+# ── ICC colour profiles ──────────────────────────────────────────────────────
+
+ICC_HEADER = 128
+MAX_ICC = 4 << 20
+# Header fields that say when and on what a profile was made: date and time; device maker, model and
+# attributes; creator and profile ID (a hash of the original, which zero marks as not computed).
+_ICC_CLEARED = ((24, 36), (48, 64), (80, 100))
+# Tags naming the device (maker and model descriptions) or holding free-form metadata.
+_ICC_DEVICE_TAGS = {b"dmnd", b"dmdd", b"meta"}
+
+
+def scrub_icc(profile: bytes) -> bytes | None:
+    """An ICC profile, the same size, without what identifies a device or a moment (audit I7).
+    Device tags keep their place in the tag table under a signature no reader knows, with their
+    bytes zeroed unless a kept tag shares them. None when it isn't a well-formed profile: then it
+    is dropped, as unknown data always is."""
+    if not ICC_HEADER + 4 <= len(profile) <= MAX_ICC or profile[36:40] != b"acsp" \
+            or struct.unpack(">I", profile[:4])[0] != len(profile):
+        return None
+    out = bytearray(profile)
+    for start, end in _ICC_CLEARED:
+        out[start:end] = bytes(end - start)
+    (count,) = struct.unpack(">I", out[128:132])
+    if 132 + 12 * count > len(out):
+        return None
+    entries = []
+    for i in range(count):
+        pos = 132 + 12 * i
+        sig, off, size = struct.unpack(">4sII", out[pos:pos + 12])
+        if off + size > len(out):
+            return None
+        entries.append((pos, sig, off, size))
+    kept = [(off, off + size) for _, sig, off, size in entries if sig not in _ICC_DEVICE_TAGS]
+    for pos, sig, off, size in entries:
+        if sig in _ICC_DEVICE_TAGS:
+            out[pos:pos + 4] = bytes(4)
+            if not any(a < off + size and off < b for a, b in kept):
+                out[off:off + size] = bytes(size)
+    return bytes(out)
+
+
+class _IccChunk:
+    """A JPEG ICC segment in a plan, replaced once every segment of the profile has been seen."""
+
+    def __init__(self, header: bytes, data: bytes):
+        self.header, self.data = header, data   # "ICC_PROFILE\0" seq count, and this chunk's bytes
+
+
+def _resolve_icc(plan: Plan) -> Plan:
+    """Put the scrubbed profile back into the plan's ICC segments, chunk for chunk, or drop them all
+    when they don't form one complete, well-formed profile."""
+    chunks = [item for item in plan if isinstance(item, _IccChunk)]
+    if not chunks:
+        return plan
+    by_seq = {c.header[12]: c for c in chunks}
+    counts = {c.header[13] for c in chunks}
+    scrubbed = None
+    if len(counts) == 1 and len(by_seq) == len(chunks) and set(by_seq) == set(range(1, counts.pop() + 1)):
+        ordered = [by_seq[i] for i in sorted(by_seq)]
+        scrubbed = scrub_icc(b"".join(c.data for c in ordered))
+    if scrubbed is None:
+        return [item for item in plan if not isinstance(item, _IccChunk)]
+    pieces, pos = {}, 0
+    for c in ordered:
+        pieces[id(c)] = _segment(0xE2, c.header + scrubbed[pos:pos + len(c.data)])
+        pos += len(c.data)
+    return [pieces[id(item)] if isinstance(item, _IccChunk) else item for item in plan]
+
+
 # ── JPEG ─────────────────────────────────────────────────────────────────────
 
 def _read(f, off, n) -> bytes:
@@ -119,6 +191,10 @@ JPEG_KEEP = set(range(0xC0, 0xD0)) | set(range(0xDB, 0xE0))
 
 
 def _plan_jpeg(f, size) -> Plan:
+    return _resolve_icc(_plan_jpeg_segments(f, size))
+
+
+def _plan_jpeg_segments(f, size) -> Plan:
     plan: Plan = [(0, 2)]  # SOI
     pos = 2
     scanned = False
@@ -166,7 +242,11 @@ def _plan_jpeg(f, size) -> Plan:
             # Adobe: its fixed 12 bytes (version, flags, colour transform), nothing after them.
             rewritten.add("adobe")
             plan.append(_segment(0xEE, body[:12]))
-        elif (marker == 0xE2 and body.startswith(b"ICC_PROFILE\x00")) or marker in JPEG_KEEP:  # colour profile
+        elif marker == 0xE2 and body.startswith(b"ICC_PROFILE\x00"):
+            if not scanned and length - 2 > 14:   # a colour profile chunk: scrubbed once all are seen
+                whole = _read(f, pos + 4, length - 2)
+                plan.append(_IccChunk(whole[:14], whole[14:]))
+        elif marker in JPEG_KEEP:
             plan.append((pos, end - pos))
         pos = end
     if not scanned:
@@ -237,7 +317,11 @@ def _plan_png(f, size) -> Plan:
         end = pos + 12 + length
         if end > size:
             raise ValueError("truncated chunk")
-        if ctype in PNG_KEEP:
+        if ctype == b"iCCP":
+            chunk = _png_iccp(_read(f, pos + 8, length))
+            if chunk is not None:
+                plan.append(chunk)
+        elif ctype in PNG_KEEP:
             plan.append((pos, end - pos))
         pos = end
         if ctype == b"IEND":
@@ -245,9 +329,29 @@ def _plan_png(f, size) -> Plan:
     raise ValueError("missing IEND")
 
 
+def _png_iccp(data: bytes) -> bytes | None:
+    """An iCCP chunk rebuilt with a neutral profile name (the name is free text) and the scrubbed
+    profile, or None to drop it."""
+    sep = data.find(b"\x00")
+    if not 1 <= sep <= 79 or data[sep + 1:sep + 2] != b"\x00":
+        return None
+    d = zlib.decompressobj()
+    try:
+        profile = d.decompress(data[sep + 2:], MAX_ICC + 1)
+    except zlib.error:
+        return None
+    if not d.eof or len(profile) > MAX_ICC:
+        return None
+    scrubbed = scrub_icc(profile)
+    if scrubbed is None:
+        return None
+    body = b"ICC profile\x00\x00" + zlib.compress(scrubbed, 9)
+    return struct.pack(">I", len(body)) + b"iCCP" + body + struct.pack(">I", zlib.crc32(b"iCCP" + body))
+
+
 # ── WebP ─────────────────────────────────────────────────────────────────────
 
-WEBP_KEEP = {b"VP8 ", b"VP8L", b"VP8X", b"ICCP", b"ANIM", b"ALPH"}
+WEBP_KEEP = {b"VP8 ", b"VP8L", b"VP8X", b"ANIM", b"ALPH"}   # ICCP is kept scrubbed
 ANMF_KEEP = {b"ALPH", b"VP8 ", b"VP8L"}   # an animation frame's image; it may also hold unknown chunks
 
 
@@ -256,6 +360,8 @@ def _plan_webp(f, size) -> Plan:
     end_of_riff = min(size, 8 + riff_size)
     chunks: Plan = []
     pos = 12
+    vp8x = None   # its index in chunks, to clear the ICC flag if the profile is dropped
+    icc_kept = False
     while pos + 8 <= end_of_riff:
         fourcc, length = struct.unpack("<4sI", _read(f, pos, 8))
         padded = length + (length & 1)
@@ -264,12 +370,22 @@ def _plan_webp(f, size) -> Plan:
         if fourcc == b"VP8X":
             data = bytearray(_read(f, pos + 8, length))
             data[0] &= ~0x0C & 0xFF      # clear the EXIF (0x08) and XMP (0x04) flags
+            vp8x = len(chunks)
             chunks.append(_read(f, pos, 8) + bytes(data) + (b"\x00" if length & 1 else b""))
+        elif fourcc == b"ICCP":
+            scrubbed = scrub_icc(_read(f, pos + 8, length)) if not icc_kept else None
+            if scrubbed is not None:
+                icc_kept = True
+                chunks.append(b"ICCP" + struct.pack("<I", length) + scrubbed + (b"\x00" if length & 1 else b""))
         elif fourcc == b"ANMF":
             chunks.extend(_webp_frame(f, pos, length))
         elif fourcc in WEBP_KEEP:
             chunks.append((pos, 8 + padded))
         pos += 8 + padded
+    if vp8x is not None and not icc_kept:
+        head = bytearray(chunks[vp8x])
+        head[8] &= ~0x20 & 0xFF          # no profile kept: clear the ICC flag
+        chunks[vp8x] = bytes(head)
     body = sum(len(c) if isinstance(c, bytes) else c[1] for c in chunks)
     return [b"RIFF" + struct.pack("<I", 4 + body) + b"WEBP", *chunks]
 

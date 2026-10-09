@@ -179,6 +179,7 @@ class Key:
     flags: int | None = None
     expires: int | None = None   # Unix time, from the newest valid self-signature
     revoked: bool = False
+    bound_at: int | None = None  # a subkey's newest valid binding signature, which decides its flags and expiry
 
     @property
     def key_id(self) -> bytes:
@@ -441,6 +442,10 @@ def _subkey_signature(cert: Certificate, subkey: Key, sig: Signature):
         return
     if sig.sig_type != SUBKEY_BINDING or not _check(primary, sig, _subkey_hash(primary, subkey, sig)):
         return
+    if subkey.bound_at is not None and sig.created < subkey.bound_at:
+        # An older binding never overrides a newer one, wherever it sits: otherwise reordering the
+        # packets would bring back a signing flag or lift an expiry the owner has since set.
+        return
     flags = _flags(sig)
     if flags is not None and flags & FLAG_SIGN:
         # A signing subkey must sign its primary back, or anyone could claim someone else's
@@ -457,7 +462,7 @@ def _subkey_signature(cert: Certificate, subkey: Key, sig: Signature):
             return
     if subkey not in cert.subkeys:
         cert.subkeys.append(subkey)
-    subkey.flags, subkey.expires = flags, _key_expiry(subkey, sig)
+    subkey.flags, subkey.expires, subkey.bound_at = flags, _key_expiry(subkey, sig), sig.created
 
 
 def read_key_file(path: Path) -> bytes:

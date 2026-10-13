@@ -26,8 +26,19 @@ def command_line(args: list[str]) -> tuple[list[str], bool]:
     return paths, encrypt
 
 
+def qt_arguments(argv: list[str]) -> list[str]:
+    """What Qt is given of the command line: the program name only. Qt reads every argument for options
+    of its own (-platformpluginpath, -plugin, -style…) and doesn't stop at "--", so a file name passed
+    on the command line could otherwise make it load a library from a folder (audit B3)."""
+    return argv[:1]
+
+
+def _options(args: list[str]) -> list[str]:
+    return args[:args.index("--")] if "--" in args else args
+
+
 def main() -> int:
-    if "--self-test" in sys.argv[1:]:
+    if "--self-test" in _options(sys.argv[1:]):
         if sys.platform == "win32" and getattr(sys, "frozen", False):
             _attach_windows_console()
         from .selftest import run
@@ -62,7 +73,7 @@ def main() -> int:
     if linux:
         # Qt's own file dialogs: native ones go through the portal, which is unavailable.
         QApplication.setAttribute(Qt.ApplicationAttribute.AA_DontUseNativeDialogs, True)
-    app = QApplication(sys.argv)
+    app = QApplication(qt_arguments(sys.argv))
     app.setApplicationName("Locksmith")
     app.setApplicationDisplayName("Locksmith")
     app.setDesktopFileName("locksmith")
@@ -91,7 +102,22 @@ def main() -> int:
     paths, encrypt = command_line(sys.argv[1:])
     win = MainWindow(paths, encrypt)
     win.show()
+    if linux:
+        _refresh_integration()
     return app.exec()
+
+
+def _refresh_integration():
+    """Update file-manager integration this program installed earlier (best effort)."""
+    from .core import desktop
+    from .core.errors import LocksmithError
+    from .ui import host
+    try:
+        if desktop.refresh_linux():
+            for args in desktop.refresh_commands()[:2]:   # not the default-app setting: that was the user's
+                host.launch(args)
+    except (OSError, LocksmithError):
+        pass
 
 
 if __name__ == "__main__":

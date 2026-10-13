@@ -17,6 +17,12 @@ sidecar alone decides what up to m/k of the file is rebuilt as. Readers therefor
 layouts Locksmith writes, the UI shows what a repair would rebuild and asks first, a repaired
 Locksmith or age file must still parse as one, and the repaired file keeps the original's Mark of
 the Web. Locksmith files are authenticated by their own encryption when opened.
+
+Parity is not encryption: it is made of the file's own bytes. A file of at most m blocks (16 KiB at
+most levels) can be rebuilt from its sidecar alone, and a larger one partly, with each block's hash
+confirming guesses. So a sidecar is never readable by anyone the file isn't readable by, shredding a
+file shreds its sidecar too, and the UI warns before making recovery data for an unencrypted file
+(audit B2).
 """
 
 from __future__ import annotations
@@ -25,6 +31,7 @@ import hashlib
 import json
 import os
 import secrets
+import stat
 import struct
 import threading
 from collections.abc import Callable
@@ -221,7 +228,9 @@ def create(path: Path, level: str = "5", out: Path | None = None, progress: Prog
                 w.flush()
                 os.fsync(w.fileno())
             os.replace(tmp, out)
-            os.chmod(out, 0o644)
+            # No more readable than the file it describes: the owner can always write it, others may
+            # read it only where they can read the file (audit B2).
+            os.chmod(out, 0o600 | (stat.S_IMODE(os.stat(path).st_mode) & 0o044))
             fsync_dir(out.parent)
         except BaseException:
             tmp.unlink(missing_ok=True)

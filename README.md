@@ -188,6 +188,8 @@ protected with a passphrase (Argon2id + AES-GCM).
 ## Caveats
 
 - Shredding is best effort. SSDs and copy-on-write filesystems such as btrfs can keep old copies.
+- Recovery data (`.lpar`) is made of the file's own contents: a small file can be rebuilt from it alone. For an unencrypted
+  file, treat it like the file itself, or encrypt the file first. Shredding a file shreds its `.lpar` too.
 - Locksmith 5 writes Shamir shares that Locksmith 4 and earlier can't combine (they now hide the secret's
   length). On Windows, keys and settings move from `%APPDATA%` to `%LOCALAPPDATA%` the first time
   Locksmith 5 starts, after which Locksmith 4 no longer finds them. Files and public keys are unchanged.

@@ -230,10 +230,20 @@ class KeysPage(Page):
         if not pw.text() and (not ident.is_locked or not self._confirm_no_passphrase()):
             return
         old, new = (current.text() or None) if current else None, pw.text() or None
-        run_task(lambda r, c: self.store.set_passphrase(ident, old, new),
-                 lambda i: (self.reload(True), toast(f"Updated the passphrase of “{i.name}”" if new else
-                                                     f"Removed the passphrase of “{i.name}”", "lock")),
-                 lambda m, k: dialogs.error(m), parent=self)
+        was_unprotected = ident.private is not None
+
+        def done(i):
+            self.reload(True)
+            toast(f"Updated the passphrase of “{i.name}”" if new else f"Removed the passphrase of “{i.name}”", "lock")
+            if new and was_unprotected:
+                dialogs.info("Earlier copies aren't protected",
+                             "Until now this key was stored without a passphrase. Copies made before stay that way: "
+                             "backups, sync history and file-system snapshots (such as btrfs snapshots) may still "
+                             "hold it. If someone may have copied one, create a new identity and ask your contacts "
+                             "to use its key instead.", icon="key")
+
+        run_task(lambda r, c: self.store.set_passphrase(ident, old, new), done, lambda m, k: dialogs.error(m),
+                 parent=self)
 
     def _add_contact(self):
         s = Sheet("Add contact", "Paste the public key someone shared with you: a Locksmith key, or an SSH "

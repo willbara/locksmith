@@ -1305,3 +1305,82 @@ def test_signed_share_message_for_a_recipient_is_addressed(tmp_path, window):
     res = engine.decrypt_bytes(engine.dearmor(s.msg_out.toPlainText()), DecryptKeys(
         identities=[me.private_raw()], verifiers=[me.key_raw]))
     assert res.signature.verified and res.intent == "listed" and "to" in res.meta
+
+
+# ── 2026-10-13: Medium items and smaller notes ────────────────────────────────
+
+def test_recovery_data_for_an_unencrypted_file_asks_first(tmp_path, window, monkeypatch):
+    """Audit B2: the .lpar of a plain file holds enough to rebuild it, so Tools asks; encrypted files don't."""
+    from PySide6.QtWidgets import QFileDialog
+
+    from locksmith.ui import dialogs
+    t = window.tools
+    plain = tmp_path / "diary.txt"
+    plain.write_bytes(b"secret " * 500)
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", staticmethod(lambda *a, **k: (str(plain), "")))
+    monkeypatch.setattr(dialogs, "confirm", lambda title, *a, **k: (window.asked.append(title), False)[1])
+    t._rc_create()
+    assert window.asked == ["This file isn't encrypted"] and not (tmp_path / "diary.txt.lpar").exists()
+    enc = tmp_path / "x.locked"
+    enc.write_bytes(b"LOCKED\x00\x02" + os.urandom(5000))
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", staticmethod(lambda *a, **k: (str(enc), "")))
+    t._rc_create()
+    wait(lambda: t._rc_task is None)
+    assert window.asked == ["This file isn't encrypted"] and (tmp_path / "x.locked.lpar").exists()
+
+
+def test_tools_shred_refuses_locksmiths_own_keys(tmp_path, window, monkeypatch):
+    """Smaller note: Tools → Shred guards the key file as Encrypt → Shred originals does."""
+    t = window.tools
+    config = window.store.dir
+    window.store.save()
+    t.shred_list.add([str(config.parent)])
+    t._shred()
+    assert window.asked[-1].startswith("ERROR: Locksmith's own keys are inside") and window.store.path.exists()
+
+
+def test_md5_match_is_not_a_check_mark(tmp_path, window, monkeypatch):
+    """Smaller note: MD5 shows no ✓, since whoever made a file can make another with the same MD5."""
+    import hashlib as h
+
+    from PySide6.QtWidgets import QFileDialog
+    t = window.tools
+    f = tmp_path / "f.bin"
+    f.write_bytes(b"data")
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", staticmethod(lambda *a, **k: (str(f), "")))
+    t._pick_hash_file()
+    for alg, expected in (("md5", h.md5(b"data").hexdigest()), ("sha256", h.sha256(b"data").hexdigest())):
+        t.hash_alg.set_value(alg)
+        t._compute()
+        wait(lambda expected=expected: t.hash_out.text() == expected)
+        t.hash_expect.setText(expected)
+        shown = t.hash_match.text()
+        assert shown.startswith("MD5 matches, but") if alg == "md5" else shown == "✓  Checksums match"
+
+
+def test_encrypt_note_is_cleared_on_lock(window):
+    """Smaller note: the private note is cleared when the app locks, like the password fields."""
+    window.encrypt.note.setText("the plan")
+    window.locker.lock()
+    assert window.encrypt.note.text() == ""
+
+
+def test_adding_a_passphrase_says_earlier_copies_stay_unprotected(window, monkeypatch):
+    """Smaller note: protecting a key that was stored without a passphrase says copies made before aren't."""
+    from locksmith.ui import dialogs
+    from locksmith.ui.dialogs import Sheet
+    from locksmith.ui.widgets import PasswordField
+    ident = window.store.generate("Me")
+    window.keys.reload()
+
+    def fill(sheet):
+        for field in sheet.findChildren(PasswordField):
+            field.setText("a long new passphrase")
+        return True
+
+    infos = []
+    monkeypatch.setattr(Sheet, "exec", fill)
+    monkeypatch.setattr(dialogs, "info", lambda title, *a, **k: infos.append(title))
+    window.keys._set_passphrase(ident)
+    wait(lambda: infos)
+    assert infos == ["Earlier copies aren't protected"] and ident.is_locked

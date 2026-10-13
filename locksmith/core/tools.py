@@ -604,17 +604,23 @@ def shamir_combine(texts: list[str]) -> bytes:
 
 # ── shredding ────────────────────────────────────────────────────────────────
 
-def shred(path: Path, passes: int = 1, cancel: threading.Event | None = None):
+def shred(path: Path, passes: int = 1, cancel: threading.Event | None = None, recovery_data: bool = False):
     """Best-effort overwrite then delete. Not reliable on SSDs or on
     copy-on-write filesystems such as btrfs, where old blocks may survive.
 
     A link given directly is refused: removing it would leave the data it points to in
     place while looking shredded. Links inside a folder are only unlinked, which is right
-    for them: what they point to is not part of the folder."""
+    for them: what they point to is not part of the folder. ``recovery_data``: also shred the
+    file's ``.lpar`` sidecar, which can hold enough of it to rebuild it (audit B2)."""
     path = Path(path)
     if is_link(path):
         raise LocksmithError(f"{path.name} is a link. Add the file or folder it points to instead.")
     _shred(path, passes, cancel)
+    if recovery_data:
+        from .parity import EXTENSION
+        side = path.with_name(path.name + EXTENSION)
+        if side.is_file() and not is_link(side):
+            _shred(side, passes, cancel)
 
 
 def _shred(path: Path, passes: int, cancel: threading.Event | None):

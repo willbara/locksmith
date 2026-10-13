@@ -123,8 +123,10 @@ def test_source_command_runs_python_isolated(tmp_path, monkeypatch):
     (tmp_path / "locksmith").mkdir()
     (tmp_path / "locksmith" / "__init__.py").write_text("raise SystemExit('planted package ran')\n",
                                                           encoding="utf-8")
-    probe = cmd[:cmd.index("-m")] + ["-c", "import json, locksmith.core.desktop; print(locksmith.__file__)"]
-    out = subprocess.run(probe, cwd=tmp_path, capture_output=True, text=True)
+    # Whether this Python has locksmith installed (the integration needs it) or not (the build's venv runs
+    # the tests from the source tree), nothing may come from the working directory.
+    code = "import importlib.util, json; spec = importlib.util.find_spec('locksmith'); print(spec and spec.origin)"
+    out = subprocess.run(cmd[:cmd.index("-m")] + ["-c", code], cwd=tmp_path, capture_output=True, text=True)
     assert out.returncode == 0, out.stderr
     assert not out.stdout.strip().startswith(str(tmp_path))
 

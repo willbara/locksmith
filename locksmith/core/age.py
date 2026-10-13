@@ -856,7 +856,7 @@ def decrypt_path(path: Path, out_dir: Path | None, keys: Keys, progress=None,
     if mark_untrusted:
         osutil.mark_untrusted(target)
     else:
-        osutil.copy_zone_identifier(path, target)
+        osutil.mark_output(path, target, trusted=False)   # age files carry no signature
     report(1.0, "Done")
     return engine.DecryptResult(target, {"name": target.name, "kind": "file", "format": "age"}, complete=complete)
 

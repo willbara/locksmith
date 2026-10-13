@@ -517,8 +517,9 @@ def test_contact_upgrade_asks_and_shows_the_new_fingerprint(window, monkeypatch)
     title, msg = confirms[0]
     assert title == "Add signing keys to “Alice”?" and keys.fingerprint(alice.key_raw) in msg
     assert "proves nothing yet" in msg and "This is the key you saved" not in msg   # audit A1
-    assert confirms[1][0] == "Did you compare Alice's fingerprint?"   # the update reset the check; asked again
-    assert store.contacts[0].checked
+    # Audit B9: the update resets the check, and it isn't asked again on the spot: a one-click "It matches"
+    # right after pasting a key would invite a reflexive yes.
+    assert len(confirms) == 1 and not store.contacts[0].checked
 
 
 def test_share_page_shows_the_full_key_and_a_fingerprint_qr(window, monkeypatch):
@@ -1136,3 +1137,171 @@ def test_signature_status_is_a_badge_sender_text_never_is(tmp_path, window):
     assert [b.text.text() for b in badges] == ["Not signed"] and badges[0].icon == "x"
     notes = [lab for lab in page.findChildren(type(badges[0].text)) if "Bob" in lab.text()]
     assert notes and not any(isinstance(lab.parent(), StatusBadge) for lab in notes)
+
+
+# ── 2026-10-12 audit: Low items ───────────────────────────────────────────────
+
+FAST = dict(kdf="pbkdf2-sha512", preset="fast")
+
+
+def test_share_page_sends_only_encrypted_files(tmp_path, window, monkeypatch):
+    """Audit B6: an ordinary file chosen on Share can't be emailed, copied or split as if it were
+    encrypted, and Copy as text never wraps plaintext in a LOCKSMITH MESSAGE block."""
+    from locksmith.core import age, engine
+    from locksmith.core.engine import EncryptOptions
+    from locksmith.ui import host
+    s = window.share
+    plain = tmp_path / "report.pdf"
+    plain.write_bytes(b"%PDF-1.7 the secret report")
+    s.set_file(str(plain))
+    assert s.file_actions[0].isEnabled()   # Show in folder
+    assert not any(b.isEnabled() for b in (*s.file_actions[1:], s.split_btn))
+    sent = []
+    monkeypatch.setattr(host, "compose_email", lambda *a: sent.append(a))
+    QApplication.clipboard().setText("before")
+    s._email()
+    s._copy_armor()
+    s._copy_file()
+    assert sent == [] and QApplication.clipboard().text() == "before"
+    assert sum("isn't a Locksmith or age file" in a for a in window.asked) == 3
+
+    enc = tmp_path / "report.pdf.locked"
+    enc.write_bytes(engine.encrypt_bytes(b"x", EncryptOptions(password="pw", **FAST)))
+    s.set_file(str(enc))
+    assert all(b.isEnabled() for b in (*s.file_actions, s.split_btn))
+    s._copy_armor()
+    assert QApplication.clipboard().text().startswith(engine.ARMOR_BEGIN)
+    aged = tmp_path / "report.pdf.age"
+    aged.write_bytes(age.VERSION_LINE + b"-> X25519 abc\n")
+    s.set_file(str(aged))
+    s._copy_armor()
+    assert QApplication.clipboard().text().startswith(age.ARMOR_BEGIN)   # age stays age
+
+
+def test_signed_files_are_addressed_by_default(tmp_path, window):
+    """Audit B7: signing for public-key recipients lists them unless the user turns it off, and that
+    choice survives changing the recipients."""
+    from locksmith.core.keys import KeyStore
+    store, e = window.store, window.encrypt
+    me = store.generate("Alice")
+    bob = KeyStore(tmp_path / "bob").generate("Bob")
+    store.add_contact("Bob", bob.key_text)
+    window._keys_changed()
+    src = tmp_path / "plan.txt"
+    src.write_text("the plan", encoding="utf-8")
+    e.files.add([str(src)])
+    e.sign_as.set_value(store.identities.index(me))
+    assert not e.address.isChecked()   # password only: nothing to list
+
+    def choose_bob(on):
+        for row, raw in e.recipients.rows:
+            row.setChecked(on and raw == bob.public_raw)
+
+    e.mode.setIndex(1)
+    choose_bob(True)
+    assert e.address.isChecked() and e.options().address_to
+    e.address.setChecked(False)
+    choose_bob(False)
+    choose_bob(True)
+    assert not e.address.isChecked() and not e.options().address_to
+
+
+def test_unaddressed_signed_file_says_it_may_have_been_passed_on(window):
+    """Audit B7: the badge says so when one of the reader's keys opened a signed file without a list."""
+    from locksmith.core import signing
+    from locksmith.ui.pages.common import Signers, signature_text
+    key = os.urandom(96)
+    sig = signing.LockedSignature(signing.public_key(key), "", 0)
+    names = Signers({sig.key: "Alice"}, set())
+    assert "isn't addressed to anyone" in signature_text(sig, names, None, by_key=True)
+    assert signature_text(sig, names, None, by_key=False) == "✓  Signed with the key you saved as Alice"
+    assert "isn't addressed" not in signature_text(sig, names, "listed", by_key=True)
+
+
+def test_unchecked_signer_is_never_called_plainly_signed(tmp_path, window, monkeypatch):
+    """Audit B8: the note and the Run-a-program prompt say when the signer's fingerprint isn't checked."""
+    from locksmith.core import engine
+    from locksmith.core.engine import DecryptKeys, EncryptOptions
+    from locksmith.core.keys import KeyStore
+    from locksmith.ui import dialogs
+    from locksmith.ui.pages.common import saved_signers
+    from locksmith.ui.widgets import Label
+    store, d = window.store, window.decrypt
+    alice = KeyStore(tmp_path / "alice").generate("Alice")
+    contact = store.add_contact("Alice", alice.key_text)   # fingerprint not checked
+    window._keys_changed()
+    blob = engine.encrypt_bytes(b"hi", EncryptOptions(password="pw", signer=alice.private_raw(), note="pay Bob",
+                                                      **FAST))
+    enc = tmp_path / "msg.locked"
+    enc.write_bytes(blob)
+    d.files.add([str(enc)])
+    d.password.setText("pw")
+    d.output._dir = str(tmp_path / "dec")
+    d.output._rebuild()
+    d.start()
+    wait(lambda: d.task is None)
+    texts = [lab.text() for lab in d.findChildren(Label)]
+    assert "Note (signed with a key you haven't checked): pay Bob" in texts
+    assert not any(t.startswith("Note (signed): ") for t in texts)
+
+    sig = engine.decrypt_bytes(blob, DecryptKeys(password="pw", verifiers=[alice.key_raw])).signature
+    asked = []
+    monkeypatch.setattr(dialogs, "confirm", lambda title, msg, **k: (asked.append(msg), False)[1])
+    d._open(tmp_path / "run.exe", sig)
+    assert "a key whose fingerprint you haven't checked" in asked[-1]
+    store.mark_checked(contact)
+    d._signers = saved_signers(store)
+    d._open(tmp_path / "run.exe", sig)
+    assert "signed with a key you saved and checked" in asked[-1]
+
+
+def test_checking_a_fingerprint_needs_all_of_it(tmp_path, window, monkeypatch):
+    """Audit B9: adding a contact doesn't ask for a one-click "It matches"; checking it later needs the
+    whole fingerprint, typed or scanned, and a wrong one is refused."""
+    from PySide6.QtWidgets import QWidget
+
+    from locksmith.core.keys import KeyStore
+    from locksmith.ui.dialogs import Sheet
+    store, page = window.store, window.keys
+    alice = KeyStore(tmp_path / "alice").generate("Alice")
+    entered = [None, alice.key_text]
+
+    def fill(sheet):
+        edits = [w for w in sheet.findChildren(QWidget) if w.__class__.__name__ == "LineEdit"]
+        if entered[0] is None:   # the Add contact sheet: name and key
+            edits[0].setText("Alice")
+            edits[1].setText(entered[1])
+        else:
+            edits[0].setText(entered[0])
+        return True
+
+    monkeypatch.setattr(Sheet, "exec", fill)
+    page._add_contact()
+    (c,) = store.contacts
+    assert not c.checked and window.asked == []   # nothing asked on the spot
+    for wrong in (c.fingerprint[:24], "0000" + c.fingerprint[4:]):
+        entered[0] = wrong
+        page._check_fingerprint(c)
+        assert not c.checked
+    assert window.asked[-1].startswith("ERROR: That isn't the fingerprint")
+    entered[0] = c.fingerprint.lower().replace(" ", "")
+    page._check_fingerprint(c)
+    assert c.checked
+
+
+def test_signed_share_message_for_a_recipient_is_addressed(tmp_path, window):
+    """Audit B7: a message signed for a public-key recipient lists them; a password one can't."""
+    from locksmith.core import engine
+    from locksmith.core.engine import DecryptKeys
+    store, s = window.store, window.share
+    me = store.generate("Alice")
+    window._keys_changed()
+    s.msg.setPlainText("meet at noon")
+    s.msg_mode.setIndex(1)
+    s.msg_rcpt.set_value(me.public_raw)
+    s.msg_sign.set_value(store.identities.index(me))
+    s._encrypt_message()
+    wait(lambda: s.msg_out.toPlainText())
+    res = engine.decrypt_bytes(engine.dearmor(s.msg_out.toPlainText()), DecryptKeys(
+        identities=[me.private_raw()], verifiers=[me.key_raw]))
+    assert res.signature.verified and res.intent == "listed" and "to" in res.meta

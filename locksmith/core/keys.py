@@ -21,6 +21,7 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -519,6 +520,29 @@ class Contact:
         """The fingerprint its owner sees: SSH keys use SSH's own (as ``ssh-keygen -l`` prints it)."""
         ssh = self.ssh
         return ssh.fingerprint if ssh else fingerprint(self.key_raw)
+
+    def fingerprint_matches(self, typed: str) -> bool:
+        """Whether ``typed``, the fingerprint its owner read out or sent over another channel, is this key's.
+        The whole fingerprint is needed, never a prefix: whoever makes a key can grind one whose first digits
+        match (audit B9). Spaces don't matter, nor does case for hex. Also accepted: the text of the owner's
+        key QR code, which holds the full SHA-256 of a locksmith3 key, or the whole key itself."""
+        given = "".join(typed.split())
+        if not given:
+            return False
+        if given.upper().startswith(QR_FINGERPRINT):
+            return hmac.compare_digest(given[len(QR_FINGERPRINT):].upper().encode(),
+                                       hashlib.sha256(self.key_raw).hexdigest().upper().encode())
+        expected = "".join(self.fingerprint.split())
+        if expected.startswith("SHA256:"):   # an SSH fingerprint: base64, so case matters
+            expected, given = expected[7:], given.removeprefix("SHA256:")
+        else:
+            try:   # the whole public key, pasted from where its owner published it
+                if decode_recipient(typed) == self.key_raw:
+                    return True
+            except LocksmithError:
+                pass
+            expected, given = expected.upper(), given.upper()
+        return hmac.compare_digest(expected.encode(), given.encode())
 
     @property
     def kind(self) -> str:

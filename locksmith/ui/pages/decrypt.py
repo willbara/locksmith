@@ -261,6 +261,9 @@ class DecryptPage(Page):
         password, keyfile = self.password.text() or None, self.keyfile.path
         self._signers = saved_signers(self.store)   # whose signatures count, and their names
         verifiers = list(self._signers)
+        # Your own keys and contacts whose fingerprint you checked: their signed files keep no Mark of the Web
+        # they didn't arrive with (audit B10).
+        trusted = [k for k in verifiers if k not in self._signers.unchecked]
         own = own_encryption_keys(self.store)
 
         def build() -> DecryptKeys:
@@ -268,7 +271,7 @@ class DecryptPage(Page):
             identities = [ident.private_raw(passphrase)] if ident else self.store.unlocked_private_keys()
             ssh_keys = [sshkeys.load_identity(ssh_data, ssh_passphrase)] if ssh_data else []
             return DecryptKeys(password=password, keyfile=keyfile, identities=identities, verifiers=verifiers,
-                               own_keys=own, ssh=ssh_keys)
+                               own_keys=own, ssh=ssh_keys, trusted=trusted)
         return build
 
     @staticmethod
@@ -310,12 +313,14 @@ class DecryptPage(Page):
                     results.append(self._open_age(p, pasted.get(p), keys, out_dir, verify, delete, sub, cancel))
                 elif verify:
                     res = engine.verify_path(Path(p), keys, threads, sub, cancel)
-                    results.append(("verified", p, {**res.meta, "_signature": res.signature, "_intent": res.intent}))
+                    results.append(("verified", p, {**res.meta, "_signature": res.signature, "_intent": res.intent,
+                                                    "_by_key": res.opened_with_key}))
                 elif p in pasted:
                     results.append(self._decrypt_pasted(pasted[p], keys, out_dir, threads, sub, cancel))
                 else:
                     r = engine.decrypt_path(Path(p), out_dir, keys, threads, sub, cancel)
-                    meta = {**r.meta, "_skipped": r.skipped, "_signature": r.signature, "_intent": r.intent}
+                    meta = {**r.meta, "_skipped": r.skipped, "_signature": r.signature, "_intent": r.intent,
+                            "_by_key": r.opened_with_key}
                     # The source may be the only copy: delete it only when the core
                     # confirms everything was restored and is on disk.
                     if delete and r.complete:
@@ -402,7 +407,8 @@ class DecryptPage(Page):
         scroll.setMaximumHeight(200)
         s.add(scroll)
         hide = ToggleRow("Hide the number of recipients", "Rounds each kind of recipient slot up to 8, 16, 32 or 64 "
-                         "with decoys: the file shows which kinds it has, not how many of each.",
+                         "with decoys: the file shows which kinds it has, not how many of each. SSH RSA keys over "
+                         "4096 bits get no decoys.",
                          settings["hide_recipients"])
         s.add(hide)
         s.add_button("Cancel", None, "ghost")
@@ -424,7 +430,8 @@ class DecryptPage(Page):
             set_password=mode in (1, 2), password=(new_pw.text() or None) if mode == 1 else None,
             keyfile=keyfile.path if mode == 1 else None, kdf=settings["kdf"], preset=settings["preset"],
             replace_recipients=rc_mode.index() == 1, add_recipients=picker.selected(),
-            hide_recipients=hide.isChecked())
+            hide_recipients=hide.isChecked(),
+            known_recipients=[c.public_raw for c in self.store.contacts if sshkeys.is_rsa_raw(c.public_raw)])
         if not (change.set_password or change.replace_recipients or change.add_recipients):
             toast("Nothing to change", "check")
             return None
@@ -491,7 +498,7 @@ class DecryptPage(Page):
     def _decrypt_pasted(blob: bytes, keys: DecryptKeys, out_dir, threads, progress, cancel):
         # The core writes and marks files from a paste like any decrypted file.
         res = engine.decrypt_pasted(blob, DecryptPage._paste_output(out_dir), keys, threads, progress, cancel)
-        extra = {"_signature": res.signature, "_intent": res.intent}
+        extra = {"_signature": res.signature, "_intent": res.intent, "_by_key": res.opened_with_key}
         if res.path is None:
             return ("text", res.data.decode("utf-8", errors="replace"), {**res.meta, **extra})
         return ("file", res.path, {**res.meta, "_skipped": res.skipped, **extra})
@@ -544,15 +551,22 @@ class DecryptPage(Page):
             if w:
                 w.deleteLater()
 
-    @staticmethod
-    def _open(path: Path, sig):
+    def _signer_unchecked(self, sig) -> bool:
+        """A verified signature by a contact whose fingerprint the user hasn't marked as checked."""
+        return sig is not None and sig.verified and sig.key in getattr(getattr(self, "_signers", None), "unchecked", ())
+
+    def _open(self, path: Path, sig):
         """Open a decrypted file with its default app, asking first when that would run it."""
+        if sig is None or not sig.verified:
+            who = "and nothing shows who made it. "
+        elif self._signer_unchecked(sig):   # audit B8: an unchecked key vouches for nothing yet
+            who = "and it was signed with a key whose fingerprint you haven't checked, so nothing shows who made it. "
+        else:
+            who = "and it was signed with a key you saved and checked. "
         if opens_as_program(path.name) and not dialogs.confirm(
                 "Run a program?",
                 f"“{path.name}” is a program, script or shortcut: opening it runs it with your account's rights, "
-                + ("and it was signed with a key you saved. " if sig is not None and sig.verified else
-                   "and nothing shows who made it. ")
-                + "Only open it if you trust whoever made the file.", ok="Run it", icon="alert"):
+                + who + "Only open it if you trust whoever made the file.", ok="Run it", icon="alert"):
             return
         open_url(path.resolve().as_uri())
 
@@ -581,12 +595,15 @@ class DecryptPage(Page):
             card.add(hrow(label(path.name, "mono", wrap=False), None, show, open_btn))
             dialogs_needed = False
         sig = meta.get("_signature")
-        card.add(signature_badge(sig, getattr(self, "_signers", {}), meta.get("_intent")))
+        card.add(signature_badge(sig, getattr(self, "_signers", {}), meta.get("_intent"), bool(meta.get("_by_key"))))
         if meta.get("note"):
             # The signature covers the note; without a checked one, nothing proves who wrote it.
             note = display_text(meta["note"])
-            card.add(label(f"Note (signed): {note}" if sig is not None and sig.verified else
-                           f"Note from the sender (not verified): {note}", "caption"))
+            if self._signer_unchecked(sig):
+                card.add(label(f"Note (signed with a key you haven't checked): {note}", "caption"))
+            else:
+                card.add(label(f"Note (signed): {note}" if sig is not None and sig.verified else
+                               f"Note from the sender (not verified): {note}", "caption"))
         skipped = meta.get("_skipped") or []
         if skipped:
             shown = ", ".join(display_text(name, 120) for name in skipped[:5]) + ("…" if len(skipped) > 5 else "")

@@ -90,7 +90,8 @@ class EncryptPage(Page):
             "Hide the number of recipients",
             "Adds decoy recipient slots, so the file shows 8, 16, 32 or 64 instead of how many people "
             "can really open it. With several kinds of key (post-quantum, classical, SSH RSA), each kind is "
-            "rounded up on its own: the file shows which kinds it has, not how many of each.",
+            "rounded up on its own: the file shows which kinds it has, not how many of each. SSH RSA keys over "
+            "4096 bits get no decoys.",
             settings["hide_recipients"])
         rl.addWidget(self.hide_recipients)
         self.rsa_note = label("An SSH RSA recipient is selected. Locksmith 3.0 and earlier can't open such a file at "
@@ -194,14 +195,18 @@ class EncryptPage(Page):
         self.sign_field = Field("Sign as", self.sign_as, "Whoever opens the file can check it was signed with "
                                 "your key and hasn't changed since.")
         self.add(self.sign_field)
+        # On by default (audit B7): without a list, anyone who can open a signed file can re-send it to someone
+        # else, and it still shows as signed, with nothing saying it was meant for someone else.
         self.address = ToggleRow("Address it to the selected people",
                                  "Lists the recipients inside the signed file, so whoever opens it can tell whether "
-                                 "they were one of them. Everyone who can open it can read the list.")
+                                 "they were one of them, and a copy passed on to someone else says so. Everyone who "
+                                 "can open it can read the list.", True)
+        self._address_wanted = True   # the user's choice, kept while no recipient is selected
         self.address_note = label("", "caption")
         self.add(self.address)
         self.add(self.address_note)
         self.sign_as.currentIndexChanged.connect(self._update_state)
-        self.address.toggled.connect(self._update_state)
+        self.address.toggled.connect(self._address_toggled)
         self.reload_signers()
         self.output = OutputPicker("Save next to the originals")
         self.add(Field("Output", self.output))
@@ -271,8 +276,7 @@ class EncryptPage(Page):
         has_keys = mode in (1, 2) and bool(self.recipients.selected())
         self.address.setVisible(signing)
         self.address.setEnabled(has_keys)
-        if not has_keys:
-            self.address.setChecked(False)
+        self.address.setChecked(has_keys and self._address_wanted)
         self.address_note.setText("" if has_keys else
                                   "Only files with public-key recipients can be addressed: a password or keyfile "
                                   "has no key to list.")
@@ -280,6 +284,11 @@ class EncryptPage(Page):
         n = len(self.files.paths())
         self.go.setText("Encrypt" if n <= 1 else
                         (f"Encrypt {n} items" if not self.bundle.isChecked() else f"Encrypt {n} items as one"))
+
+    def _address_toggled(self, on: bool):
+        if self.address.isEnabled():   # the user's choice, not _update_state turning it off
+            self._address_wanted = on
+        self._update_state()
 
     def add_paths(self, paths):
         self.files.add(paths)

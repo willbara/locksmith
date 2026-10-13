@@ -73,11 +73,12 @@ def signed_with(key: bytes, names: dict) -> str:
     return f"✓  Signed with the key you saved as {name}"
 
 
-def signature_text(sig, names: dict[bytes, str], intent: str | None = None) -> str:
+def signature_text(sig, names: dict[bytes, str], intent: str | None = None, by_key: bool = False) -> str:
     """How a decrypted file's signature is described. Never "from X": a signature shows
     which key signed the content, not who sent the file. ``intent`` is what the signed
-    recipient list says about this reader (DecryptResult.intent); it is always neutral, and
-    without a list nothing is said about whom the file was meant for."""
+    recipient list says about this reader (DecryptResult.intent); it is always neutral. ``by_key``
+    (DecryptResult.opened_with_key): one of the reader's keys opened it, so a file without a list
+    could have been addressed and wasn't, and may have been passed on (audit B7)."""
     if sig is None:
         return "Not signed"
     if sig.verified:
@@ -86,17 +87,19 @@ def signature_text(sig, names: dict[bytes, str], intent: str | None = None) -> s
             text += ", but you weren't on its original recipient list"
         elif intent == "password":
             text += ". Addressed to specific people; opened with its password"
+        elif intent is None and by_key:
+            text += ". It isn't addressed to anyone, so whoever sent it to you may not be its signer"
         return text
     # sig.fingerprint comes from the signature itself, which anyone can write: never present it as a fact.
     return (f"Has a signature that claims a key you haven't saved (claimed fingerprint {sig.fingerprint}). Nothing "
             "was checked: save that key, after comparing its fingerprint with its owner, and open the file again.")
 
 
-def signature_badge(sig, names: dict, intent: str | None = None):
+def signature_badge(sig, names: dict, intent: str | None = None, by_key: bool = False):
     """The signature status as a badge (an icon in a bordered box), never as plain text that a note
     or a file name could imitate."""
     from ..widgets import StatusBadge
-    text = signature_text(sig, names, intent)
+    text = signature_text(sig, names, intent, by_key)
     return StatusBadge(text, "shield" if text.startswith("✓") else "alert" if sig is not None else "x")
 
 

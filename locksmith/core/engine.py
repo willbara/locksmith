@@ -70,6 +70,7 @@ from .osutil import (
     fsync_dir,
     fsync_tree,
     is_link,
+    mark_output,
     mark_untrusted,
     open_new,
     portable_name,
@@ -183,6 +184,9 @@ class DecryptKeys:
     # a signed file's recipient list. The public keys of ``identities`` are always included.
     own_keys: list[bytes] = field(default_factory=list)
     ssh: list[sshkeys.SshIdentity] = field(default_factory=list)   # SSH private keys (Ed25519, RSA)
+    # locksmith3 keys the reader trusts (their own, and contacts whose fingerprint they checked). On Windows, a
+    # file signed by one of them gets no Mark of the Web it didn't arrive with (osutil.mark_output).
+    trusted: list[bytes] = field(default_factory=list)
 
 
 @dataclass
@@ -217,6 +221,9 @@ class DecryptResult:
     # it), "not_listed" (opened with a key that isn't) or "password" (opened with a password or
     # keyfile). None: no list, or no signature that vouches for it.
     intent: str | None = None
+    # Whether one of the reader's keys (not a password or keyfile) opened it. A validly signed file opened
+    # this way without a recipient list could have been addressed but wasn't (audit B7).
+    opened_with_key: bool = False
 
 
 @dataclass
@@ -1490,7 +1497,8 @@ def decrypt_path(path: Path, out_dir: Path | None, keys: DecryptKeys, threads: i
         k = _unlock(header, raw, keys, chk, fmt)
         meta = _read_meta(header, k)
         res = _decrypt_into(f, total, header, raw, k, meta, out_dir, path.stem, threads, chk, keys)
-    copy_zone_identifier(path, res.path)
+    sig = res.signature
+    mark_output(path, res.path, trusted=sig is not None and sig.verified and sig.key in keys.trusted)
     chk.report(1.0, "Done")
     return res
 
@@ -1511,7 +1519,8 @@ def decrypt_pasted(blob: bytes, out_dir: Path, keys: DecryptKeys, threads: int =
         out = io.BytesIO()
         digest, sig = _decrypt_stream(f, len(blob), header, raw, k, meta, out, 1, chk, max_output=MAX_ARMOR_INPUT)
         signature = _signature_status(sig, raw, digest, keys)
-        return DecryptResult(None, meta, out.getvalue(), signature=signature, intent=_intent(meta, signature, k, keys))
+        return DecryptResult(None, meta, out.getvalue(), signature=signature, intent=_intent(meta, signature, k, keys),
+                             opened_with_key=k.opened_by is not None)
     res = _decrypt_into(f, len(blob), header, raw, k, meta, Path(out_dir), "decrypted", threads, chk, keys,
                         max_output=MAX_ARMOR_INPUT)
     mark_untrusted(res.path)
@@ -1580,7 +1589,7 @@ def _decrypt_into(f: BinaryIO, total: int, header: dict, raw: bytes, k: _Keys, m
             scratch.discard(tmp)   # plaintext, perhaps of a file whose signature failed: shredded
             raise
     return DecryptResult(target, meta, skipped=skipped, complete=complete, signature=signature,
-                         intent=_intent(meta, signature, k, keys))
+                         intent=_intent(meta, signature, k, keys), opened_with_key=k.opened_by is not None)
 
 
 def decrypt_bytes(blob: bytes, keys: DecryptKeys) -> DecryptResult:
@@ -1592,7 +1601,8 @@ def decrypt_bytes(blob: bytes, keys: DecryptKeys) -> DecryptResult:
     out = io.BytesIO()
     digest, sig = _decrypt_stream(f, len(blob), header, raw, k, meta, out, 1, chk, max_output=MAX_ARMOR_INPUT)
     signature = _signature_status(sig, raw, digest, keys)
-    return DecryptResult(None, meta, out.getvalue(), signature=signature, intent=_intent(meta, signature, k, keys))
+    return DecryptResult(None, meta, out.getvalue(), signature=signature, intent=_intent(meta, signature, k, keys),
+                         opened_with_key=k.opened_by is not None)
 
 
 def safe_name(name) -> str:
@@ -1795,7 +1805,8 @@ def verify_path(path: Path, keys: DecryptKeys, threads: int = 0,
         digest, sig = _decrypt_stream(f, total, header, raw, k, meta, _NullWriter(), threads, chk)
     signature = _signature_status(sig, raw, digest, keys)
     chk.report(1.0, "Verified")
-    return DecryptResult(None, meta, signature=signature, intent=_intent(meta, signature, k, keys))
+    return DecryptResult(None, meta, signature=signature, intent=_intent(meta, signature, k, keys),
+                         opened_with_key=k.opened_by is not None)
 
 
 # ── changing who can open a file ─────────────────────────────────────────────
@@ -1811,6 +1822,10 @@ class AccessChange:
     replace_recipients: bool = False   # drop every recipient slot (decoys included) before adding
     add_recipients: list[bytes] = field(default_factory=list)
     hide_recipients: bool = False      # round the recipient slots up to 8, 16, 32 or 64 with decoys
+    # Keys that may already be among the file's recipients (saved contacts). RSA decoys are made for one of
+    # them when its size fits: one for a throwaway key can be told apart by anyone who has the real
+    # recipient's key, since its ciphertext may exceed that key's modulus (audit B11).
+    known_recipients: list[bytes] = field(default_factory=list)
 
 
 @dataclass
@@ -1876,7 +1891,7 @@ def change_access(path: Path, keys: DecryptKeys, change: AccessChange, allow_loc
         has_pw = any(s["t"] == "pw" for s in new)
         recipients = [s for s in new if s["t"] != "pw"]
         if change.hide_recipients and recipients:
-            new += _decoy_slots(recipients, has_pw, adding, fmt)
+            new += _decoy_slots(recipients, has_pw, [*adding, *change.known_recipients], fmt)
         if not new:
             raise LocksmithError("A file needs at least one way to open it: keep or set a password, or add a "
                                  "recipient.")

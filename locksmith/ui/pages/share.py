@@ -5,7 +5,7 @@ from pathlib import Path
 from PySide6.QtCore import QMimeData, QUrl
 from PySide6.QtWidgets import QApplication, QFileDialog, QGridLayout, QPlainTextEdit, QVBoxLayout
 
-from ...core import engine, tools
+from ...core import age, engine, tools
 from ...core.engine import DecryptKeys, EncryptOptions
 from ...core.errors import LocksmithError
 from ...core.keys import fingerprint, is_identity_secret
@@ -104,14 +104,28 @@ class SharePage(Page):
 
     def _update_file(self):
         ok = self.file is not None and self.file.exists()
+        # Only encrypted files are sent from here: an ordinary file picked by mistake would go out as
+        # plaintext, with a message saying it is encrypted (audit B6).
+        encrypted = ok and tools.is_encrypted_file(self.file)
         if ok:
             self.file_name.setText(self.file.name)
-            self.file_meta.setText(f"{human_size(self.file.stat().st_size)}  ·  {self.file.parent}")
+            self.file_meta.setText(f"{human_size(self.file.stat().st_size)}  ·  {self.file.parent}" if encrypted else
+                                   "Not encrypted, so it can't be sent from here. Encrypt it first.")
         else:
             self.file_name.setText("No file selected")
             self.file_meta.setText("Encrypt something first, or choose a .locksmith file.")
-        for b in (*self.file_actions, self.split_btn):
-            b.setEnabled(ok)
+        self.file_actions[0].setEnabled(ok)   # Show in folder
+        for b in (*self.file_actions[1:], self.split_btn):
+            b.setEnabled(encrypted)
+
+    def _sendable(self) -> bool:
+        """Checked again when an action runs: the file may have changed since it was chosen."""
+        if self.file is not None and tools.is_encrypted_file(self.file):
+            return True
+        dialogs.error("This file isn't a Locksmith or age file, so sending it would send its contents unencrypted. "
+                      "Encrypt it first.", "Not encrypted")
+        self._update_file()
+        return False
 
     def _choose_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "Choose encrypted file", "",
@@ -123,6 +137,8 @@ class SharePage(Page):
         reveal(self.file)
 
     def _copy_file(self):
+        if not self._sendable():
+            return
         uri = QUrl.fromLocalFile(str(self.file.resolve()))
         mime = QMimeData()
         mime.setUrls([uri])
@@ -131,6 +147,8 @@ class SharePage(Page):
         toast("File copied. Paste it into any app or folder.", "copy")
 
     def _email(self):
+        if not self._sendable():
+            return
         try:
             attached = host.compose_email(
                 f"Encrypted file: {self.file.name}",
@@ -142,17 +160,29 @@ class SharePage(Page):
             toast("Email started. Drag the highlighted file into it to attach it.", "mail", 5000)
 
     def _copy_armor(self):
+        if not self._sendable():
+            return
         size = self.file.stat().st_size
         if size > ARMOR_LIMIT:
             dialogs.error(f"Files over {human_size(ARMOR_LIMIT)} are too large to paste as text. "
                           "Send the file itself, or split it into parts.")
             return
         data = self.file.read_bytes()
-        text = data.decode() if data.lstrip().startswith(engine.ARMOR_BEGIN.encode()) else engine.armor(data)
+        kind = tools.encrypted_kind(data[:64])
+        if kind == 1 or age.is_armored(data[:64]):   # already text
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                dialogs.error("This file's text is damaged, so it can't be copied as text.")
+                return
+        else:
+            text = age.armor(data) if kind == 2 else engine.armor(data)
         QApplication.clipboard().setText(text)
         toast(f"Copied {human_size(len(text))} of text. The recipient pastes it into Decrypt.", "message")
 
     def _split(self):
+        if not self._sendable():
+            return
         size = self.part_size.value()
         if self.file.stat().st_size <= size:
             toast("The file already fits in one part", "check")
@@ -240,6 +270,8 @@ class SharePage(Page):
         def work(r, c):
             ident, passphrase = signer
             opts.signer = ident.private_raw(passphrase) if ident else None
+            # A signed message for a recipient lists them, so a copy passed on says so (audit B7).
+            opts.address_to = opts.signer is not None and bool(opts.recipients)
             return engine.encrypt_bytes(text.encode(), opts)
 
         def done(blob):
@@ -279,7 +311,7 @@ class SharePage(Page):
         def done(res):
             if res.meta.get("kind") == "text":
                 dialogs.text_view("Decrypted message", res.data.decode("utf-8", errors="replace"),
-                                  signature_text(res.signature, names, res.intent), mono=False, secret=True)
+                                  signature_text(res.signature, names, res.intent, res.opened_with_key), mono=False, secret=True)
             else:
                 dialogs.info("This is a file", "Use the Decrypt page to save files and folders.")
 

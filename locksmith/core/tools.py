@@ -97,14 +97,91 @@ def passphrase_entropy(words: int) -> float:
     return words * (3 * math.log2(len(_CONS)) + 2 * math.log2(len(_VOWELS))) + math.log2(10 * words)
 
 
-_COMMON = {"password", "123456", "qwerty", "letmein", "admin", "welcome", "iloveyou",
-           "monkey", "dragon", "abc123", "111111", "secret", "master", "login"}
+# Roots of the most common passwords. Matched as a whole run of letters (after undoing l33t
+# substitutions), they cost a cracker almost nothing.
+_COMMON = {"password", "qwerty", "letmein", "admin", "welcome", "iloveyou", "monkey", "dragon", "secret",
+           "master", "login", "football", "baseball", "soccer", "hockey", "princess", "sunshine", "shadow",
+           "superman", "batman", "starwars", "whatever", "freedom", "hello", "charlie", "michael", "jordan",
+           "jennifer", "hunter", "ranger", "buster", "thomas", "robert", "daniel", "ginger", "pepper", "cookie",
+           "summer", "winter", "spring", "autumn", "love", "lovely", "angel", "flower", "computer", "internet",
+           "google", "apple", "samsung", "test", "guest", "user", "root", "changeme", "default", "trustno",
+           "access", "killer", "matrix", "mustang", "liverpool", "chelsea", "arsenal", "pokemon", "minecraft"}
+# Runs that crackers try as sequences: the alphabet, digits and common keyboard rows (forwards or back).
+_SEQUENCES = ("abcdefghijklmnopqrstuvwxyz", "0123456789", "qwertyuiopasdfghjklzxcvbnm",
+              "qwertzuiopasdfghjklyxcvbnm", "azertyuiopqsdfghjklmwxcvbn", "1qaz2wsx3edc4rfv5tgb6yhn7ujm8ik9ol0p")
+_LEET = {"0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t", "@": "a", "$": "s", "!": "i"}
+_WORD_BITS = math.log2(100_000)   # one word from a large dictionary
+_TOKENS = re.compile(r"[^\W\d_]+|\d+|[\W_]+")
 
 
 def estimate_entropy(pw: str) -> float:
-    """Rough, conservative entropy estimate in bits."""
+    """Rough, conservative entropy estimate in bits: the lower of a character-pool estimate and a
+    pattern estimate. The pattern estimate prices a password the way cracking rules guess it (audit
+    B5): dictionary-like words, common passwords, years, sequences, repeats and l33t spellings cost
+    far less than random characters, so "Summer2024!" rates as weak."""
     if not pw:
         return 0.0
+    return min(_charset_bits(pw), _pattern_bits(pw))
+
+
+def _is_sequence(run: str) -> bool:
+    return len(run) >= 3 and any(run in s or run[::-1] in s for s in _SEQUENCES)
+
+
+def _pronounceable(word: str) -> bool:
+    """Looks like a word (or several): a share of vowels and no long consonant clusters. Random
+    letters rarely pass; dictionary words and made-up pronounceable words do."""
+    vowels = sum(c in "aeiouy" for c in word)
+    return 0.25 <= vowels / len(word) <= 0.7 and not re.search(r"[^aeiouy]{4}", word)
+
+
+def _case_bits(run: str) -> float:
+    upper = sum(c.isupper() for c in run)
+    if upper == 0:
+        return 0.0
+    if upper == len(run) or (upper == 1 and run[0].isupper()):
+        return 1.0
+    return min(float(len(run)), upper * math.log2(len(run)) + 1)
+
+
+def _token_bits(token: str) -> float:
+    low = token.lower()
+    if token[0].isdigit():
+        if len(token) == 4 and 1900 <= int(token) <= 2099:
+            return math.log2(200)   # a year
+        if len(set(token)) == 1 or _is_sequence(token):
+            return 4 + math.log2(len(token))
+        return len(token) * math.log2(10)
+    if not token[0].isalpha():   # symbols and spaces
+        return math.log2(33) + (math.log2(len(token)) if len(set(token)) == 1 else (len(token) - 1) * math.log2(33))
+    pool = 26 if low.isascii() else 64
+    if low in _COMMON:
+        base = math.log2(len(_COMMON))
+    elif len(set(low)) == 1 or _is_sequence(low):
+        base = 4 + math.log2(len(low))
+    elif len(low) >= 4 and low.isascii() and _pronounceable(low):
+        base = _WORD_BITS * -(-len(low) // 10)   # a long run is likely several words
+    else:
+        base = len(low) * math.log2(pool)
+    return min(base, len(low) * math.log2(pool)) + _case_bits(token)
+
+
+def _pattern_bits(pw: str) -> float:
+    chars = list(pw)
+    subs = 0
+    for i, c in enumerate(chars):   # undo l33t spellings inside words: "Tr0ub4dor" is "troubador"
+        if c in _LEET and 0 < i < len(chars) - 1 and chars[i - 1].isalpha() and chars[i + 1].isalpha():
+            chars[i] = _LEET[c]
+            subs += 1
+    tokens = _TOKENS.findall("".join(chars))
+    bits, seen = 0.0, set()
+    for token in tokens:
+        bits += 1.0 if token.lower() in seen else _token_bits(token)   # a repeat costs almost nothing
+        seen.add(token.lower())
+    return bits + subs + (len(tokens) - 1)   # each substitution and the arrangement of the parts
+
+
+def _charset_bits(pw: str) -> float:
     pool = 0
     if re.search(r"[a-z]", pw):
         pool += 26
@@ -668,7 +745,11 @@ def join_parts(parts: list[Path], out_dir: Path | None = None) -> Path:
         numbers.append(int(pm[2]))
     if numbers != list(range(1, len(numbers) + 1)):
         raise LocksmithError("Some parts are missing: they must be numbered 1…N without gaps.")
-    _check_joinable(parts[0])
+    kind = _check_joinable(parts[0])
+    if not base.lower().endswith(ENCRYPTED_SUFFIXES):
+        # The name comes from the parts, the check from their content: "x.bat.part001" starting with an
+        # armor line would otherwise become a runnable x.bat (audit B12).
+        base += ENCRYPTED_SUFFIXES[kind]
     out_dir = Path(out_dir) if out_dir else parts[0].parent
     from .engine import unique_path
     target = unique_path(out_dir / base)
@@ -692,14 +773,37 @@ def join_parts(parts: list[Path], out_dir: Path | None = None) -> Path:
     return target
 
 
-def _check_joinable(first: Path):
+def _check_joinable(first: Path) -> int:
     """Join only rebuilds what Split makes: encrypted Locksmith or age files (binary or armored).
     Joining any file would let someone send a program in marked parts and have it rebuilt without
-    its Mark of the Web, past SmartScreen."""
-    from . import age, engine
+    its Mark of the Web, past SmartScreen. Returns the kind (an index into ENCRYPTED_SUFFIXES)."""
     with open(first, "rb") as f:
-        head = f.read(64)
-    if not (engine.looks_encrypted(head) or age.is_age(head)
-            or head.lstrip().startswith(engine.ARMOR_BEGIN.encode())):
+        kind = encrypted_kind(f.read(64))
+    if kind is None:
         raise LocksmithError("These parts don't make up a Locksmith or age file. Join only puts encrypted files "
                              "back together.")
+    return kind
+
+
+# The names encrypted files have: Locksmith (binary), Locksmith armored text, age (binary or armored).
+ENCRYPTED_SUFFIXES = (".locked", ".locked.txt", ".age")
+
+
+def encrypted_kind(head: bytes) -> int | None:
+    """What a file's first bytes say it is, as an index into ENCRYPTED_SUFFIXES, or None when it
+    isn't an encrypted Locksmith or age file."""
+    from . import age, engine
+    if engine.looks_encrypted(head):
+        return 0
+    if head.lstrip().startswith(engine.ARMOR_BEGIN.encode()):
+        return 1
+    return 2 if age.is_age(head) else None
+
+
+def is_encrypted_file(path: Path) -> bool:
+    """Whether ``path`` is a regular file holding a Locksmith or age file (binary or armored)."""
+    try:
+        with open_regular(Path(path)) as f:
+            return encrypted_kind(f.read(64)) is not None
+    except (OSError, LocksmithError):
+        return False

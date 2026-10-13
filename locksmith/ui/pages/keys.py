@@ -153,7 +153,7 @@ class KeysPage(Page):
             checked = "fingerprint checked" if c.checked else "fingerprint not checked"
             row = _KeyRow(c.name, c.fingerprint, f"{c.kind}  ·  {checked}  ·  added {added}")
             if not c.checked:
-                row.action("fingerprint", "I compared this fingerprint with them",
+                row.action("fingerprint", "Check this fingerprint with them",
                            lambda _=0, c=c: self._check_fingerprint(c))
             row.action("copy", "Copy public key", lambda _=0, c=c: self._copy(c.public))
             row.action("trash", "Remove", lambda _=0, c=c: self._delete_contact(c))
@@ -270,8 +270,9 @@ class KeysPage(Page):
             dialogs.error(str(e))
             return
         self.reload(True)
-        toast(done, "user")
-        self._check_fingerprint(c)
+        # Not asked here: right after pasting a key nobody has compared anything yet, and a question with a
+        # one-click "It matches" invites a reflexive yes (audit B9). The row's fingerprint button checks it.
+        toast(f"{done}. Compare its fingerprint with them, then check it with the fingerprint button.", "user", 5000)
         if c.ssh is not None:
             dialogs.info(f"Added {c.name}'s SSH key",
                          f"Files you encrypt to this key open with {c.name}'s SSH private key. Check its fingerprint "
@@ -281,14 +282,29 @@ class KeysPage(Page):
                             "with a password." if c.ssh.key_type == "ssh-rsa" else ""), icon="user")
 
     def _check_fingerprint(self, contact):
-        """Ask whether the user compared the contact's fingerprint with its owner; only a yes counts."""
-        if dialogs.confirm(
-                f"Did you compare {contact.name}'s fingerprint?",
-                f"Its fingerprint is {contact.fingerprint}. Compare it with {contact.name} in person, by phone or "
-                "over another channel you trust, not in the message the key came in. Until it is marked as "
-                "checked, signatures by this key show as unverified.", ok="It matches", icon="fingerprint"):
-            self.store.mark_checked(contact)
-            self.reload()
+        """Mark a contact as checked once the user enters the fingerprint its owner gave them over another
+        channel, and it matches. A button press alone isn't enough (audit B9)."""
+        s = Sheet(f"Check {contact.name}'s fingerprint",
+                  f"Ask {contact.name} for their key's fingerprint in person, by phone or over another channel you "
+                  "trust, not in the message the key came in, and enter all of it here. You can also scan the QR "
+                  "code of their public key. Until it matches, signatures by this key show as unverified.",
+                  width=600, icon="fingerprint")
+        typed = LineEdit("Their fingerprint, all of it", mono=True)
+        s.add(typed)
+        scan = s.add_button("Scan QR code…", None, "ghost", "qr", close=False)
+        scan.clicked.connect(lambda: self._scan_image(lambda text: typed.setText(text.strip())))
+        s.add_button("Cancel", None, "ghost")
+        s.add_button("Check", True, "primary")
+        if not s.exec():
+            return
+        if not contact.fingerprint_matches(typed.text()):
+            dialogs.error(f"That isn't the fingerprint of the key you saved as {contact.name}. Check you have the whole "
+                          "fingerprint. If it still differs, the key you saved may not be theirs: don't rely on it "
+                          "until you find out why.", "Fingerprints don't match")
+            return
+        self.store.mark_checked(contact)
+        self.reload()
+        toast(f"{contact.name}'s fingerprint matches. Marked as checked.", "fingerprint")
 
     def _export(self, ident):
         path, _ = QFileDialog.getSaveFileName(self, "Export identity backup",
@@ -361,7 +377,17 @@ class KeysPage(Page):
 
     def _scan_qr(self, box):
         """Read a paper backup's QR code from a photo or scan into the restore box."""
-        path, _ = QFileDialog.getOpenFileName(self, "Choose a photo or scan of the paper backup", "",
+        def done(text):
+            if not keys.is_paper_text(text):
+                dialogs.error("That QR code isn't a Locksmith paper backup.", "Not a paper backup")
+                return
+            box.setPlainText(text)
+            toast("Paper backup read. Check the name and choose Restore.", "check")
+        self._scan_image(done, "Choose a photo or scan of the paper backup")
+
+    def _scan_image(self, then, title="Choose a photo or screenshot of the QR code"):
+        """Read a QR code from an image the user picks, off the UI thread, and hand its text to ``then``."""
+        path, _ = QFileDialog.getOpenFileName(self, title, "",
                                               "Images (*.png *.jpg *.jpeg *.bmp *.webp *.gif);;All files (*)")
         if not path:
             return
@@ -375,14 +401,7 @@ class KeysPage(Page):
         except (LocksmithError, OSError, ValueError) as e:
             dialogs.error(str(e) if isinstance(e, LocksmithError) else "That image can't be read.")
             return
-
-        def done(text):
-            if not keys.is_paper_text(text):
-                dialogs.error("That QR code isn't a Locksmith paper backup.", "Not a paper backup")
-                return
-            box.setPlainText(text)
-            toast("Paper backup read. Check the name and choose Restore.", "check")
-        run_task(lambda r, c: qrdecode.decode(w, h, gray), done, lambda m, k: dialogs.error(m, "No QR code found"),
+        run_task(lambda r, c: qrdecode.decode(w, h, gray), then, lambda m, k: dialogs.error(m, "No QR code found"),
                  parent=self)
 
     def _split_identity(self, ident):

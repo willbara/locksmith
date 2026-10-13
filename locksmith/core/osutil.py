@@ -104,6 +104,23 @@ def inherit_zone_identifier(sources: list[Path], target: Path):
             return
 
 
+def mark_output(source: Path, target: Path, trusted: bool):
+    """Windows: the Mark of the Web of what ``source`` decrypted to (``target``, a file or folder). It inherits
+    the source's mark. Without one (files from USB drives, many chat apps, extractors that drop marks), any
+    program, script or macro document in it is marked as from the internet, unless the file was signed by a
+    key the user trusts: otherwise encrypting a program would be a way past SmartScreen (audit B10)."""
+    if zone_mark(source) is not None:
+        inherit_zone_identifier([source], target)
+        return
+    if not IS_WINDOWS or trusted:
+        return
+    files = [Path(root) / name for root, _, names in os.walk(target) for name in names] \
+        if Path(target).is_dir() else [Path(target)]
+    for path in files:
+        if opens_as_program(path.name):
+            _write_zone_mark(path, INTERNET_ZONE_MARK)
+
+
 def mark_untrusted(target: Path):
     """Windows: mark output that came from someone else, with no file to inherit a mark
     from (a pasted message), as downloaded from the internet. Same rules as above."""
@@ -163,12 +180,16 @@ def portable_name(name: str) -> str:
 
 
 # File types that run code when opened through the desktop (Windows Explorer, or a Linux file
-# manager or xdg-open): programs, scripts, shortcuts and installers. Decrypted files come from
-# whoever made them, so opening one of these from Locksmith asks first.
+# manager or xdg-open): programs, scripts, shortcuts, installers, and files that start or configure
+# them (remote desktop, themes, search connectors, disk images, macro documents). Decrypted files come
+# from whoever made them, so opening one of these from Locksmith asks first.
 PROGRAM_EXTENSIONS = frozenset("""
-    .exe .com .scr .pif .cpl .msi .msp .msix .appx .appxbundle .appinstaller .bat .cmd .ps1 .psm1 .vbs .vbe
-    .js .jse .wsf .wsh .hta .lnk .url .reg .inf .scf .chm .jar .library-ms .settingcontent-ms .application
-    .appref-ms .gadget .xll .msc .desktop .sh .bash .run .appimage .py .pyw .pl .rb .bin .elf .deb .rpm
+    .exe .com .scr .pif .cpl .msi .msp .msu .msix .appx .appxbundle .appinstaller .bat .cmd .ps1 .psm1 .ps1xml
+    .psc1 .msh .msh1 .mshxml .vb .vbs .vbe .js .jse .ws .wsf .wsh .wsc .sct .hta .lnk .url .website .reg .inf .scf
+    .chm .hlp .jar .jnlp .xbap .library-ms .settingcontent-ms .search-ms .searchconnector-ms .application
+    .appref-ms .gadget .xll .msc .rdp .theme .themepack .deskthemepack .diagcab .cab .wsb .ppkg .one .onepkg
+    .iso .img .vhd .vhdx .mht .mhtml .docm .dotm .xlsm .xltm .xlam .pptm .potm .ppam .accde .mdb .mde .ade .adp
+    .desktop .sh .bash .run .appimage .flatpakref .flatpak .py .pyw .pyz .pl .rb .bin .elf .deb .rpm
 """.split())
 
 

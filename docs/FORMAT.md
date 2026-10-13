@@ -145,8 +145,10 @@ decoys as there is room for. The file then shows which kinds of recipient it has
 of each. (Locksmith 4 rounded the total and made every decoy one kind, which showed exactly how many
 recipients of the other kinds there were.) `ssh-rsa` decoys are RSA-OAEP encryptions of a random
 value to a recipient key of the same size, or to a throwaway key of that size up to 4096 bits, so
-they look like real ones even to someone who knows the recipients' keys. Decoys are ordinary slots
-that no key opens, so readers need nothing special.
+they look like real ones even to someone who knows the recipients' keys. (A ciphertext for a
+throwaway key can be larger than a real recipient's modulus, which shows it is a decoy, so a writer
+uses a recipient key whenever it knows one of that size; larger RSA keys get no decoys.) Decoys are
+ordinary slots that no key opens, so readers need nothing special.
 
 ### Changing the slots
 
@@ -156,7 +158,8 @@ a new slots array of 1 to 64 slots wrapping the same DEK, shuffled again. Nothin
 Without a recipient's private key, its slot can't be told apart from other recipients' slots or from
 decoys, so a writer either keeps every recipient slot or replaces them all with a new list; it can't
 take out one. When it hides the number of recipients, it rounds the recipient slots up as above,
-counting the kept ones.
+counting the kept ones. For `ssh-rsa` decoys it uses the keys it knows of that may be among the kept
+recipients (Locksmith: saved contacts), so they look like the kept slots.
 
 A change revokes nothing. Anyone who could open the file before may have kept its DEK, which opens
 every copy, old or new, whatever its slots say. Taking access away means encrypting the content again

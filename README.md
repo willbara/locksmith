@@ -100,7 +100,7 @@ docs/        file-format specification
   into Shamir shares, saved as a printable paper backup (QR code and words, restored by photographing
   or scanning the page), and shared as text or a QR code. Recipients aren't named in the file: it
   doesn't list whose keys can open it, and decoy slots can hide how many recipients there are. A signed
-  file can optionally be addressed to its recipients, so a reader can tell whether they were one of them.
+  file is addressed to its recipients by default, so a reader can tell whether they were one of them.
 - **SSH and age keys:** SSH Ed25519 and RSA public keys can be recipients, and the SSH private key opens
   the file (passphrase-protected keys too). age keys (`age1…`, `age1pq1…`, `AGE-SECRET-KEY-…`) can be
   added as contacts or restored as identities.
@@ -203,6 +203,11 @@ protected with a passphrase (Argon2id + AES-GCM).
 - Unsigned files are not authenticated. Decrypting proves a file was not changed after it was made, not
   who made it: anyone with your public key can send you a file, and its name and note can claim anything.
   To show who made a file, sign it (Encrypt → Sign as, or a detached `.lsig` from Tools). A valid signature
-  means "signed with the key you saved as X", which is only as good as your fingerprint check. It says who
-  signed the content, not whom it was sent to: anyone who can open a signed file can pass it on, still
-  signed.
+  means "signed with the key you saved as X", which is only as good as your fingerprint check: a contact
+  counts as checked only once you enter the fingerprint they gave you over another channel (Keys → the
+  fingerprint button). It says who signed the content, not whom it was sent to: anyone who can open a signed
+  file can pass it on, still signed. Files signed for public-key recipients list them by default, so a
+  passed-on copy says its reader wasn't on the list; one without a list says so too.
+- On Windows, decrypted files keep the Mark of the Web of the encrypted file. When it has none, programs,
+  scripts and macro documents inside are marked as downloaded from the internet, unless the file was signed
+  by you or by a contact whose fingerprint you checked.

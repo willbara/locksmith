@@ -1243,6 +1243,8 @@ def test_pasted_files_and_folders_are_written_like_decrypted_files(tmp_path, mon
     decrypt_path does, and everything written gets the internet zone mark."""
     marked = []
     monkeypatch.setattr(engine, "mark_untrusted", lambda target: marked.append(Path(target)))
+    # Marks aren't what this compares; Wine would list them as files ("run.exe:Zone.Identifier").
+    monkeypatch.setattr(engine, "mark_output", lambda *a, **k: None)
     src = tmp_path / "proj"
     (src / "sub").mkdir(parents=True)
     (src / "sub" / "run.exe").write_bytes(b"MZ")
@@ -2208,3 +2210,145 @@ def test_decoys_hide_how_many_of_each_kind():
     assert engine.decrypt_bytes(blob, DecryptKeys(identities=[me])).data == b"x"
     # Without a known key of that size (a kept slot), decoys use a throwaway key of the same size.
     assert len(engine._throwaway_rsa(256)) == 1 and engine._throwaway_rsa(1024) == []
+
+
+# ── 2026-10-12 audit: Low items (B5–B12) ──────────────────────────────────────
+
+@pytest.mark.parametrize("pw", ["Summer2024!", "January2025", "Liverpool1!", "Tr0ub4dor&3", "Fluffy1990!",
+                                "P@ssw0rd", "Welcome1!", "qwerty123", "hunter2"])
+def test_strength_meter_sees_common_patterns(pw):
+    """B5: word + year/digits + symbol, l33t spellings and keyboard runs rate as weak, so the
+    weak-password warning appears (the old estimate called the first five Strong or Fair)."""
+    assert tools.strength_label(tools.estimate_entropy(pw))[0] <= 1
+
+
+def test_strength_meter_still_trusts_random_passwords():
+    """B5: the pattern estimate doesn't drag down what Locksmith generates."""
+    assert min(tools.estimate_entropy(tools.generate_password(32)) for _ in range(100)) >= 90
+    assert min(tools.estimate_entropy(tools.generate_password(24)) for _ in range(100)) >= 64
+    assert min(tools.estimate_entropy(tools.generate_passphrase(6)) for _ in range(100)) >= 64
+
+
+def test_unaddressed_signed_file_reports_how_it_was_opened():
+    """B7: a reader can tell a signed file without a list was opened with one of their keys (so it could
+    have been addressed, and may have been passed on) from one opened with a password."""
+    signer, reader = os.urandom(96), os.urandom(96)
+    from locksmith.core import signing
+    blob = engine.encrypt_bytes(b"x", EncryptOptions(password="pw", recipients=[keys.public_from_private(reader)],
+                                                     signer=signer, **FAST))
+    verifiers = [signing.public_key(signer)]
+    by_key = engine.decrypt_bytes(blob, DecryptKeys(identities=[reader], verifiers=verifiers))
+    assert by_key.signature.verified and by_key.intent is None and by_key.opened_with_key
+    assert not engine.decrypt_bytes(blob, DecryptKeys(password="pw", verifiers=verifiers)).opened_with_key
+
+
+def test_fingerprint_check_needs_the_whole_fingerprint(tmp_path):
+    """B9: a prefix (which a key's maker can grind to match) never counts; spaces and hex case don't
+    matter; the owner's key QR text or the whole key also match; SSH fingerprints keep their case."""
+    store = keys.KeyStore(tmp_path / "store")
+    owner = keys.KeyStore(tmp_path / "owner").generate("Alice")
+    c = store.add_contact("Alice", owner.key_text)
+    fp = c.fingerprint
+    assert c.fingerprint_matches(fp) and c.fingerprint_matches(fp.lower().replace(" ", ""))
+    assert not c.fingerprint_matches(fp[:24]) and not c.fingerprint_matches("") and not c.fingerprint_matches(fp + "0")
+    assert c.fingerprint_matches(keys.qr_text(owner.key_raw)) and c.fingerprint_matches(owner.key_text)
+    other = keys.KeyStore(tmp_path / "other").generate("Mallory")
+    assert not c.fingerprint_matches(keys.fingerprint(other.key_raw)) and not c.fingerprint_matches(other.key_text)
+    line = (Path(__file__).parent / "interop" / "sshkeys" / "id_ed25519.pub").read_text(encoding="utf-8")
+    ssh = store.add_contact("Bob", line)
+    assert ssh.fingerprint_matches(ssh.fingerprint) and ssh.fingerprint_matches(ssh.fingerprint[len("SHA256:"):])
+    assert not ssh.fingerprint_matches(ssh.fingerprint.lower())
+
+
+def test_mark_output_marks_unmarked_programs_unless_trusted(tmp_path, monkeypatch):
+    """B10: output of an unmarked encrypted file gets the internet zone on its programs (not on
+    documents) unless a trusted key signed it; a marked source still passes its own mark on."""
+    monkeypatch.setattr(osutil, "IS_WINDOWS", True)   # "name:Zone.Identifier" is an ordinary file here
+    out = tmp_path / "out"
+    (out / "sub").mkdir(parents=True)
+    for name in ("sub/run.exe", "notes.txt", "deck.pptm", "call.rdp"):
+        (out / name).write_bytes(b"x")
+    source = tmp_path / "x.locked"
+    source.write_bytes(b"LOCKED")
+
+    def marked():   # each file's stream, not a glob: Windows refuses a pattern holding ":"
+        return [n for n in ("sub/run.exe", "notes.txt", "deck.pptm", "call.rdp") if os.path.exists(f"{out / n}:Zone.Identifier")]
+
+    osutil.mark_output(source, out, trusted=True)
+    assert marked() == []
+    osutil.mark_output(source, out, trusted=False)
+    assert marked() == ["sub/run.exe", "deck.pptm", "call.rdp"]
+    assert Path(f"{out / 'sub' / 'run.exe'}:Zone.Identifier").read_bytes() == osutil.INTERNET_ZONE_MARK
+    mark = b"[ZoneTransfer]\r\nZoneId=3\r\nHostUrl=https://example.com/\r\n"
+    Path(f"{source}:Zone.Identifier").write_bytes(mark)
+    osutil.mark_output(source, out / "notes.txt", trusted=True)   # inherited whatever the signer
+    assert Path(f"{out / 'notes.txt'}:Zone.Identifier").read_bytes() == mark
+
+
+def test_decrypted_folder_programs_are_marked_unless_a_trusted_key_signed_them(tmp_path, monkeypatch):
+    """B10 end to end: decrypt_path passes whether the signer is trusted to mark_output."""
+    from locksmith.core import signing
+    monkeypatch.setattr(osutil, "IS_WINDOWS", True)
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "run.exe").write_bytes(b"MZ")
+    (src / "notes.txt").write_bytes(b"hi")
+    signer = os.urandom(96)
+    key = signing.public_key(signer)
+    for trusted in (False, True):
+        enc = engine.encrypt_paths([src], tmp_path / f"enc{trusted}", EncryptOptions(password="pw", signer=signer,
+                                                                                       **FAST))
+        res = engine.decrypt_path(enc, tmp_path / f"dec{trusted}", DecryptKeys(
+            password="pw", verifiers=[key], trusted=[key] if trusted else []))
+        assert Path(f"{res.path / 'run.exe'}:Zone.Identifier").exists() is not trusted
+        assert not Path(f"{res.path / 'notes.txt'}:Zone.Identifier").exists()
+
+
+def test_program_extension_list_covers_recent_attack_types():
+    """B10: types used to run code or reach out from a double-click ask first on Open."""
+    for name in ("a.rdp", "a.theme", "a.search-ms", "a.diagcab", "a.one", "a.iso", "a.vhdx", "a.docm", "a.XLSM",
+                 "a.wsc", "a.mhtml", "a.flatpakref", "a.pyz"):
+        assert osutil.opens_as_program(name), name
+    assert not osutil.opens_as_program("a.docx") and not osutil.opens_as_program("a.pdf")
+
+
+def test_access_change_rsa_decoys_use_known_keys(tmp_path, monkeypatch):
+    """B11: hiding the recipients of a file with a kept RSA recipient makes its RSA decoys for a known
+    key of that size, so none is larger than the real recipient's modulus; without one, it falls back
+    to a throwaway key."""
+    from locksmith.core import sshkeys
+    here = Path(__file__).parent / "interop" / "sshkeys"
+    rsa_raw = sshkeys.parse_recipient((here / "id_rsa3072.pub").read_text(encoding="utf-8")).raw
+    modulus = sshkeys.rsa_public(rsa_raw).public_numbers().n
+    other = keys.public_from_private(os.urandom(32))
+    throwaway = []
+    monkeypatch.setattr(engine, "_throwaway_rsa", lambda size: (throwaway.append(size), [])[1])
+
+    path = _encrypt(tmp_path, recipients=[rsa_raw])
+    engine.change_access(path, PW, engine.AccessChange(add_recipients=[other], hide_recipients=True))
+    assert throwaway == [384]   # no known key: the old fallback (stubbed out here)
+
+    (tmp_path / "b").mkdir()
+    path = _encrypt(tmp_path / "b", recipients=[rsa_raw])
+    engine.change_access(path, PW, engine.AccessChange(add_recipients=[other], hide_recipients=True,
+                                                       known_recipients=[rsa_raw]))
+    assert throwaway == [384]
+    rsa = [s for s in _split(path.read_bytes())[0]["slots"] if s["t"] == "ssh-rsa"]
+    assert len(rsa) == 8 and all(int.from_bytes(base64.b64decode(s["c"]), "big") < modulus for s in rsa)
+    ident = sshkeys.load_identity((here / "id_rsa3072").read_bytes())
+    assert engine.decrypt_path(path, tmp_path / "out", DecryptKeys(ssh=[ident])).path.read_bytes()
+
+
+@pytest.mark.parametrize(("name", "head", "joined"), [
+    ("x.bat", engine.ARMOR_BEGIN.encode() + b"\r\nstart calc.exe\r\n", "x.bat.locked.txt"),
+    ("big.bin", b"LOCKED\x00\x02", "big.bin.locked"),
+    ("photo.age", b"age-encryption.org/v1\n", "photo.age"),
+    ("notes.LOCKED", b"LOCKED\x00\x02", "notes.LOCKED"),
+])
+def test_join_names_its_output_as_an_encrypted_file(tmp_path, name, head, joined):
+    """B12: the output name comes from the parts and the check from their content, so a name that isn't
+    an encrypted file's gets the matching extension and can't become a runnable x.bat."""
+    (tmp_path / name).write_bytes(head + os.urandom(2500))
+    (tmp_path / "parts").mkdir()
+    parts = tools.split_file(tmp_path / name, 1000, tmp_path / "parts")
+    assert tools.join_parts(parts, tmp_path / "parts").name == joined

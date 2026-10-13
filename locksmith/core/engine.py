@@ -388,6 +388,12 @@ def recipient_tag(key: bytes) -> bytes:
     return hashlib.sha256(RECIPIENT_LABEL + key).digest()
 
 
+def _created(opts: EncryptOptions, now: int) -> dict:
+    """The "created" field: when the file was encrypted, left out when metadata is stripped. Readers never
+    rely on it, and it would tell recipients when the file was made."""
+    return {} if opts.strip_metadata else {"created": now}
+
+
 def _option_meta(opts: EncryptOptions) -> dict:
     """Metadata that comes from the options: the note and the recipient list."""
     meta = {}
@@ -1057,7 +1063,9 @@ def _encrypt_stream(src: BinaryIO, total: int, out: BinaryIO, head: _Written,
     if opts.signer is not None:
         # Last of all, the signature, split into chunk-sized blocks (FORMAT.md §15).
         chk.report(None, "Signing")
-        sig = signing.sign_locked(opts.signer, head.fixed, content_hash.digest())
+        # Stripping metadata leaves out when the file was made: the signature's time is 0 ("not said").
+        sig = signing.sign_locked(opts.signer, head.fixed, content_hash.digest(),
+                                  created=0 if opts.strip_metadata else None)
         tail += [FRAME_HDR.pack(KIND_SIG, len(part)) + part
                  for part in (sig[i:i + chunk] for i in range(0, len(sig), chunk))]
     for i, fr in enumerate(tail):
@@ -1368,7 +1376,7 @@ def encrypt_paths(paths: list[Path], out_dir: Path | None, opts: EncryptOptions,
         raise LocksmithError(f"Text (ASCII armor) output is limited to {MAX_ARMOR_INPUT >> 20} MiB. "
                            "Turn off ASCII armor for larger files.")
     codec_id = _codec_for(opts, paths)
-    meta = {"name": name, "kind": kind, "comp": codec_id, "created": now, **meta_extra, **_option_meta(opts)}
+    meta = {"name": name, "kind": kind, "comp": codec_id, **_created(opts, now), **meta_extra, **_option_meta(opts)}
 
     out_dir.mkdir(parents=True, exist_ok=True)
     target = unique_path(out_dir / _output_name(opts, name))
@@ -1437,7 +1445,7 @@ def encrypt_bytes(data: bytes, opts: EncryptOptions, name: str = "message.txt",
                              "Encrypt larger content as a file.")
     chk = _Checker(None, None)
     codec_id = _codec_for(opts, [])
-    meta = {"name": name, "kind": kind, "comp": codec_id, "created": int(time.time()),
+    meta = {"name": name, "kind": kind, "comp": codec_id, **_created(opts, int(time.time())),
             "size": len(data), **_option_meta(opts)}
     head = _build_header(opts, meta, chk)
     out = io.BytesIO()
@@ -1558,7 +1566,7 @@ def _decrypt_into(f: BinaryIO, total: int, header: dict, raw: bytes, k: _Keys, m
                 if kind == "dir":
                     staging = out_dir / f".locksmith-{secrets.token_hex(6)}"
                     with scratch.tracked(staging):
-                        ext = extract_archive(tmp, staging, space=space)
+                        ext = extract_archive(tmp, staging, space=space, confine_to_top=True)
                         # Unwrap the archive's top-level folder (stored under its original
                         # name, which may differ from the safe one). Only a real folder: a
                         # symlink moved out of staging would resolve against the output folder.
@@ -1696,13 +1704,28 @@ def _check_tarfile(version: tuple = sys.version_info[:3]):
                              "to 3.12.11, 3.13.4, 3.14 or later to decrypt folders.")
 
 
-def extract_archive(archive: Path, dest: Path, space: _DiskGuard | None = None) -> Extraction:
+def _inside_top(dest: str, member: tarfile.TarInfo) -> bool:
+    """Whether a symlink resolves inside its own top-level folder. A folder is extracted into a staging
+    folder and then only its top-level folder is moved out, to the same depth: a link checked against the
+    staging folder alone, such as "photos/ssh -> ../.ssh", would then point beside the kept folder, into
+    the output folder (audit B1)."""
+    top = os.path.realpath(os.path.join(dest, member.name.split("/")[0]))
+    target = os.path.realpath(os.path.join(dest, os.path.dirname(member.name), member.linkname))
+    try:
+        return os.path.commonpath([top, target]) == top
+    except ValueError:   # different drives
+        return False
+
+
+def extract_archive(archive: Path, dest: Path, space: _DiskGuard | None = None,
+                    confine_to_top: bool = False) -> Extraction:
     """Extract with the tarfile "data" filter, one member at a time. Members the filter
     rejects (such as links pointing outside the folder, or device files), names the file
     system can't hold and members that fail to be created are skipped and reported instead
     of aborting, so one odd entry cannot make a whole folder unrecoverable. A damaged
     archive, a full disk or ``space`` running out stops everything. Everything extracted is
-    then fsynced."""
+    then fsynced. ``confine_to_top``: only one top-level folder is kept (a "dir" archive), so a
+    link inside one must point inside that folder, not just inside ``dest``."""
     _check_tarfile()
     result = Extraction()
     skipped = result.skipped
@@ -1726,6 +1749,9 @@ def extract_archive(archive: Path, dest: Path, space: _DiskGuard | None = None) 
         try:
             member = tarfile.data_filter(member, path)
         except tarfile.FilterError:
+            skipped.append(name)
+            return None
+        if confine_to_top and member.issym() and "/" in member.name and not _inside_top(path, member):
             skipped.append(name)
             return None
         # A later member must never replace an earlier one: an exact duplicate, a name

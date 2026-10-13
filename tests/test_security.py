@@ -2352,3 +2352,95 @@ def test_join_names_its_output_as_an_encrypted_file(tmp_path, name, head, joined
     (tmp_path / "parts").mkdir()
     parts = tools.split_file(tmp_path / name, 1000, tmp_path / "parts")
     assert tools.join_parts(parts, tmp_path / "parts").name == joined
+
+
+# ── 2026-10-13: Medium items (B1–B4) and smaller notes ───────────────────────
+
+def test_folder_links_stay_inside_the_kept_folder(tmp_path, needs_symlinks):
+    """B1: a folder's links are checked against the folder that is kept, not the staging folder around
+    it, so "photos/ssh -> ../.ssh" can't end up pointing at ~/.ssh beside the decrypted folder. Links
+    inside the folder still work, and in a bundle, links between its items do too."""
+    src = tmp_path / "sender"
+    photos = src / "photos"
+    (photos / "sub").mkdir(parents=True)
+    (photos / "a.txt").write_text("hello", encoding="utf-8")
+    os.symlink("../.ssh", photos / "ssh")             # leaves the kept folder once it is moved out
+    os.symlink("../../.ssh", photos / "deep")         # leaves the staging folder: the filter's job
+    os.symlink("a.txt", photos / "alias")
+    os.symlink("../a.txt", photos / "sub" / "up")
+    os.symlink("..", photos / "sub" / "top")          # the folder itself
+    enc = engine.encrypt_paths([photos], tmp_path / "enc", EncryptOptions(password="pw", **FAST))
+    home = tmp_path / "home"
+    (home / ".ssh").mkdir(parents=True)
+    (home / ".ssh" / "id_ed25519").write_text("PRIVATE KEY", encoding="utf-8")
+    res = engine.decrypt_path(enc, home, PW)
+    assert not os.path.lexists(res.path / "ssh") and not os.path.lexists(res.path / "deep")
+    assert sorted(res.skipped) == ["photos/deep", "photos/ssh"] and not res.complete
+    assert all(os.path.islink(res.path / n) for n in ("alias", "sub/up", "sub/top"))   # links inside are kept
+    if not osutil.IS_WINDOWS:   # Wine can't follow a relative "../" link
+        assert (res.path / "sub" / "up").read_text(encoding="utf-8") == "hello"
+        assert (res.path / "sub" / "top" / "a.txt").read_text(encoding="utf-8") == "hello"
+
+    other = src / "other"
+    other.mkdir()
+    (other / "f.txt").write_text("in the bundle", encoding="utf-8")
+    os.symlink("../other/f.txt", src / "photos" / "next")
+    enc = engine.encrypt_paths([photos, other], tmp_path / "enc2", EncryptOptions(password="pw", **FAST),
+                               bundle_name="both")
+    res = engine.decrypt_path(enc, tmp_path / "out", PW)
+    assert os.path.islink(res.path / "photos" / "next")
+    if not osutil.IS_WINDOWS:
+        assert (res.path / "photos" / "next").read_text(encoding="utf-8") == "in the bundle"
+    # A bundle keeps every item, so its links are checked against the bundle folder: "../.ssh" stays inside it.
+    assert res.skipped == ["photos/deep"]
+    assert os.path.realpath(res.path / "photos" / "ssh").startswith(os.path.realpath(res.path) + os.sep)
+
+
+def test_recovery_data_is_no_more_readable_than_its_file(tmp_path):
+    """B2: an unencrypted file's sidecar can rebuild it, so it gets the file's read permissions, not 0644."""
+    from locksmith.core import parity
+    if osutil.IS_WINDOWS:
+        pytest.skip("POSIX modes")
+    private = tmp_path / "diary.txt"
+    private.write_bytes(b"the safe code is 4711 " * 400)
+    os.chmod(private, 0o600)
+    assert stat.S_IMODE(parity.create(private).stat().st_mode) == 0o600
+    shared = tmp_path / "x.locked"
+    shared.write_bytes(b"LOCKED\x00\x02" + os.urandom(5000))
+    os.chmod(shared, 0o644)
+    assert stat.S_IMODE(parity.create(shared).stat().st_mode) == 0o644
+
+
+def test_shredding_a_file_shreds_its_recovery_data(tmp_path, monkeypatch):
+    """B2: the sidecar of a shredded file goes with it (overwritten, not just deleted)."""
+    from locksmith.core import parity
+    f = tmp_path / "diary.txt"
+    f.write_bytes(b"secret " * 1000)
+    side = parity.create(f)
+    keep = tmp_path / "other.txt"
+    keep.write_bytes(b"x")
+    overwritten = []
+    real = tools._shred
+    monkeypatch.setattr(tools, "_shred", lambda p, *a: (overwritten.append(Path(p).name), real(p, *a))[1])
+    tools.shred(f, recovery_data=True)
+    assert not f.exists() and not side.exists() and overwritten == ["diary.txt", "diary.txt.lpar"]
+    tools.shred(keep, recovery_data=True)   # no sidecar: nothing else touched
+    assert overwritten[-1] == "other.txt"
+    g = tmp_path / "g.txt"
+    g.write_bytes(b"y")
+    side = parity.create(g)
+    tools.shred(g)   # without the flag (temporary plaintext, for one), only the file
+    assert side.exists()
+
+
+def test_stripping_metadata_leaves_out_when_the_file_was_made():
+    """Smaller note: with metadata stripped, neither the metadata nor the signature says when the file
+    was encrypted; without it, both do as before."""
+    from locksmith.core import signing
+    signer = os.urandom(96)
+    verifiers = [signing.public_key(signer)]
+    for strip in (True, False):
+        blob = engine.encrypt_bytes(b"x", EncryptOptions(password="pw", signer=signer, strip_metadata=strip, **FAST))
+        res = engine.decrypt_bytes(blob, DecryptKeys(password="pw", verifiers=verifiers))
+        assert res.signature.verified
+        assert ("created" in res.meta) is not strip and (res.signature.created == 0) is strip

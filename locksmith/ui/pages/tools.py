@@ -220,6 +220,7 @@ class ToolsPage(Page):
         def done(h):
             self.hash_progress.finish()
             self.hash_go.setEnabled(True)
+            self._hash_used = alg
             self.hash_out.setText(h)
             self._compare()
 
@@ -236,6 +237,10 @@ class ToolsPage(Page):
         b = "".join(self.hash_expect.text().split()).lower()
         if not a or not b:
             self.hash_match.setText("")
+        elif a == b and getattr(self, "_hash_used", None) == "md5":
+            # Manifests refuse MD5 for this reason: whoever made the file can make another with the same MD5.
+            self.hash_match.setText("MD5 matches, but MD5 can't show the file wasn't swapped by whoever made it. "
+                                    "Compare a SHA-256 checksum to be sure")
         elif a == b:
             self.hash_match.setText("✓  Checksums match")
         else:
@@ -845,6 +850,13 @@ class ToolsPage(Page):
         path, _ = QFileDialog.getOpenFileName(self, "Choose the file to protect")
         if not path:
             return
+        if not tools.is_encrypted_file(Path(path)) and not dialogs.confirm(
+                "This file isn't encrypted",
+                "Recovery data is made of the file's own contents: a small file can be rebuilt from its .lpar alone, "
+                "and a larger one in part. Treat the .lpar like the file itself. To protect something private, "
+                "encrypt it first and add recovery data to the encrypted file (Encrypt → Add recovery data).",
+                ok="Save recovery data anyway", icon="alert"):   # audit B2
+            return
         level = self.rc_level.value()
         self._rc_run(lambda r, c: parity.create(Path(path), level, progress=r, cancel=c),
                      lambda out: (self.rc_result.setText(f"✓  Saved {out.name}"),
@@ -945,16 +957,22 @@ class ToolsPage(Page):
             dialogs.error(f"{links[0]} is a link. Removing it would leave what it points to in place. Add the file "
                           "or folder it points to instead.", "Can't shred a link")
             return
+        if tools.covered_by(self.store.path, [Path(p) for p in paths]):   # as Encrypt → Shred originals does
+            dialogs.error("Locksmith's own keys are inside one of the items being shredded. Shredding would destroy "
+                          "your private keys, and files encrypted to you could never be opened again. Leave that "
+                          "folder out.", "Keys would be shredded")
+            return
         if not dialogs.confirm("Shred permanently?",
                                f"{len(paths)} item{'s' if len(paths) != 1 else ''} will be overwritten and "
-                               "deleted. This cannot be undone.", ok="Shred"):
+                               "deleted, with any recovery data (.lpar) next to them. This cannot be undone.",
+                               ok="Shred"):
             return
         passes = self.passes.value()
 
         def work(report, cancel):
             for i, p in enumerate(paths):
                 report(i / len(paths), f"Shredding {Path(p).name}")
-                tools.shred(Path(p), passes, cancel)
+                tools.shred(Path(p), passes, cancel, recovery_data=True)
             return len(paths)
 
         self.shred_progress.start()

@@ -10,6 +10,7 @@ from ...core.ciphers import SUITES
 from ...core.engine import EncryptOptions
 from ...core.osutil import is_link
 from .. import dialogs
+from ..lock import mark_sensitive
 from ..settings import settings
 from ..widgets import (
     Button,
@@ -171,7 +172,8 @@ class EncryptPage(Page):
                                settings["armor"])
         self.strip = ToggleRow("Remove photo metadata",
                                "Strips location, camera, date and editing details from JPEG, PNG and WebP "
-                               "images, plus file times and owner names, without touching image quality. "
+                               "images, plus file times, owner names and when the file was encrypted, without "
+                               "touching image quality. "
                                "Originals are not changed. Other formats are encrypted as they are.",
                                settings["strip_metadata"])
         self.shred = ToggleRow("Shred originals",
@@ -186,7 +188,8 @@ class EncryptPage(Page):
             adv.add(t)
         self.bundle.toggled.connect(self._update_state)
         self.keyfile.changed.connect(self._update_state)
-        self.note = LineEdit("Private note, stored encrypted inside the file")
+        # Cleared on lock, like every other field that can hold something private.
+        self.note = mark_sensitive(LineEdit("Private note, stored encrypted inside the file"))
         adv.add(Field("Note", self.note))
         self.add(adv)
 
@@ -365,8 +368,8 @@ class EncryptPage(Page):
                 return
         if shred and settings["confirm_shred"] and not dialogs.confirm(
                 "Shred originals?",
-                "After encrypting, the original files will be overwritten and deleted. "
-                "This cannot be undone.", ok="Encrypt and shred"):
+                "After encrypting, the original files will be overwritten and deleted, with any recovery data "
+                "(.lpar) next to them. This cannot be undone.", ok="Encrypt and shred"):
             return
         signer = unlock_signer(self.store, self.sign_as.value())
         if signer is None:
@@ -402,7 +405,7 @@ class EncryptPage(Page):
                 if shred:
                     for p in group:
                         report(None, f"Shredding {p.name}")
-                        tools.shred(p, cancel=cancel)
+                        tools.shred(p, cancel=cancel, recovery_data=True)
             return outputs, stats
 
         def work(report, cancel):
@@ -425,7 +428,7 @@ class EncryptPage(Page):
                 if shred:
                     for p in group:
                         report(None, f"Shredding {p.name}")
-                        tools.shred(p, cancel=cancel)
+                        tools.shred(p, cancel=cancel, recovery_data=True)
             return outputs, stats
 
         self._clear_results()

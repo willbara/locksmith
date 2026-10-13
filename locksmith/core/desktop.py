@@ -27,12 +27,14 @@ ASSETS = Path(__file__).resolve().parent.parent / "assets"
 
 def command() -> list[str]:
     """How the desktop starts this Locksmith: the AppImage, the frozen .exe, or Python with the
-    package (when run from source)."""
+    package (when run from source). From source, Python runs isolated (-I): "python -m" would
+    otherwise import modules from the working directory first, and file managers start programs
+    in the folder being browsed, so a json.py there would run inside Locksmith (audit B4)."""
     if os.environ.get("APPIMAGE"):
         return [os.environ["APPIMAGE"]]
     if getattr(sys, "frozen", False):
         return [sys.executable]
-    return [sys.executable, "-m", "locksmith"]
+    return [sys.executable, "-I", "-m", "locksmith"]
 
 
 def desktop_quote(arg: str) -> str:
@@ -87,9 +89,19 @@ StartupWMClass=locksmith
   </mime-type>
 </mime-info>
 """
+    # GNOME Files runs scripts in the folder being browsed and passes the selected names relative to it,
+    # so a file named "-platformpluginpath" would arrive as an option. Make every name absolute and pass
+    # them after "--" (audit B3).
     script = f"""#!/bin/sh
 # {MARKER}: "Encrypt with Locksmith" in the Files right-click menu (Scripts).
-exec {" ".join(shlex.quote(a) for a in cmd)} --encrypt "$@"
+# The names arrive relative to the folder being browsed: make them absolute, so none reads as an option.
+here=$(pwd)
+for f; do
+    case "$f" in /*) ;; *) f="$here/$f" ;; esac
+    set -- "$@" "$f"
+    shift
+done
+exec {" ".join(shlex.quote(a) for a in cmd)} --encrypt -- "$@"
 """
     service = f"""[Desktop Entry]
 # {MARKER}
@@ -137,19 +149,51 @@ def _ours(path: Path) -> bool:
 def install_linux(base: Path | None = None, cmd: list[str] | None = None) -> list[Path]:
     """Write the integration files. A file of the same name that Locksmith didn't write is left
     alone (and reported by raising), never overwritten."""
-    from .keys import write_secret_file
     plan = linux_files(base, cmd)
     foreign = [p for p in plan.files if os.path.lexists(p) and not _ours(p)]
     if foreign:
         raise LocksmithError(f"{foreign[0]} already exists and wasn't written by Locksmith, so it was left alone. "
                              "Nothing was changed.")
-    written = []
     for path, (content, executable) in plan.files.items():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        write_secret_file(path, content)
-        os.chmod(path, 0o755 if executable else 0o644)
-        written.append(path)
-    return written
+        _write(path, content, executable)
+    return list(plan.files)
+
+
+def _write(path: Path, content: str, executable: bool):
+    from .keys import write_secret_file
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_secret_file(path, content)
+    os.chmod(path, 0o755 if executable else 0o644)
+
+
+def refresh_linux(base: Path | None = None, cmd: list[str] | None = None) -> list[Path]:
+    """Bring an integration this same program installed up to date, so a fix to its files reaches users
+    without reinstalling (Locksmith 5.0 and earlier: a GNOME Files script that passed relative names,
+    and from source a command that imported from the browsed folder, audit B3 and B4). Integration that
+    points at another program (another AppImage, or source instead of the AppImage) is left alone, as is
+    any file Locksmith didn't write. Returns the files rewritten."""
+    cmd = cmd or command()
+    plan = linux_files(base, cmd)
+    entry, (wanted, _) = next(iter(plan.files.items()))   # the application entry
+    try:
+        current = entry.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return []
+    exec_line = next((line for line in current.splitlines() if line.startswith("Exec=")), "")
+    if MARKER not in current or not exec_line.startswith("Exec=" + desktop_quote(cmd[0]) + " "):
+        return []
+    rewritten = []
+    for path, (content, executable) in plan.files.items():
+        if os.path.lexists(path) and (path.is_symlink() or not _ours(path)):
+            continue
+        try:
+            if path.read_text(encoding="utf-8") == content:
+                continue
+        except (OSError, UnicodeDecodeError):
+            pass
+        _write(path, content, executable)
+        rewritten.append(path)
+    return rewritten
 
 
 def uninstall_linux(base: Path | None = None) -> list[Path]:

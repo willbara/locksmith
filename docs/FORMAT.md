@@ -246,7 +246,7 @@ hold:
 | `comp`    | codec id, or `none` |
 | `size`    | content size in bytes, when known in advance (informational only: never a limit) |
 | `mtime`   | the file's modification time (Unix seconds), omitted when metadata is stripped |
-| `created` | when the file was encrypted (Unix seconds) |
+| `created` | when the file was encrypted (Unix seconds), omitted when metadata is stripped |
 | `items`   | number of items in a bundle |
 | `note`    | the sender's free text. Only a valid signature (section 15) vouches for it |
 | `to`      | the signer's intended recipients, in signed files only (see below) |
@@ -397,7 +397,7 @@ A signature is a separate file, by convention the signed file's name plus `.lsig
 ```
 magic     8 bytes   "LOCKSIG" 0x01
 alg       u8        1 = Ed25519 + ML-DSA-65
-created   u64       when it was signed (Unix seconds), as the signer's clock said
+created   u64       when it was signed (Unix seconds), as the signer's clock said; 0: not said
 key_id    32 bytes  SHA-256 of the signer's locksmith3 raw key (section 9)
 clen      u16       comment length, at most 1024
 comment   clen bytes of UTF-8
@@ -452,6 +452,7 @@ sig_ed = Ed25519.Sign(ed25519 key, M)
 sig_ml = ML-DSA-65.Sign(ml-dsa-65 key, M, ctx = LABEL || "sig")
 ```
 
+A writer that strips metadata writes `created` = 0, as it leaves out the metadata's `created`.
 `head` is the signature's first 51 bytes (magic through `clen`) and `content` is the plaintext the
 content frames decrypt to: the file, the text, or the tar stream of a folder. The signature therefore
 covers the cipher suite, chunk size, nonce prefix, salt and metadata (name, kind, note, `to`) as well as
@@ -495,6 +496,12 @@ the whole-file hash a repair is checked against come from the sidecar itself, so
 the sidecar alone decides what a repair rebuilds (up to `m/k` of the file). Locksmith files are
 authenticated anyway when opened; a reader repairing any other file should show how much it would
 rebuild and the expected SHA-256, and ask first.
+
+Parity is not encryption. It is made of the file's own bytes: a file of at most `m` blocks can be
+rebuilt from the sidecar alone, a larger one partly, and the block hashes confirm guesses. A writer
+makes the sidecar no more readable than the file (Locksmith: owner read and write, plus group and
+others' read only where the file has it), shreds it with the file, and warns before making one for a
+file that isn't encrypted.
 
 **Layout.** The protected file of `size` bytes is cut into `n = ceil(size / B)` data blocks of `B`
 bytes, the last one padded with zeros (blocks past the end are all zeros). With `k` data and `m`

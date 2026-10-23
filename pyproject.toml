@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "locksmith"
 dynamic = ["version"]
 description = "Minimalist desktop app to encrypt, decrypt and share files"
+license = { text = "GPL-3.0-only" }
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

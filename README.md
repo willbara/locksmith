@@ -213,3 +213,12 @@ protected with a passphrase (Argon2id + AES-GCM).
 - On Windows, decrypted files keep the Mark of the Web of the encrypted file. When it has none, programs,
   scripts and macro documents inside are marked as downloaded from the internet, unless the file was signed
   by you or by a contact whose fingerprint you checked.
+
+## License
+
+Copyright (C) 2026 willbara. Locksmith is free software: you can redistribute it and/or modify it under the
+terms of the [GNU General Public License version 3](LICENSE) as published by the Free Software Foundation.
+It is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY. If you distribute Locksmith
+or a modified version of it, you must provide its source code under the same license.
+
+The bundled Inter font keeps its own license (SIL OFL 1.1, `locksmith/assets/fonts/Inter-LICENSE.txt`).

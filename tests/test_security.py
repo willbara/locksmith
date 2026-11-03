@@ -243,7 +243,7 @@ def test_hostile_names_stay_in_output_folder(tmp_path, name):
 
 @pytest.mark.parametrize("meta", ["string", [1, 2], 42, None])
 def test_metadata_must_be_object(tmp_path, meta):
-    evil = _forge(tmp_path, [_frame(engine.KIND_RAW, b"x")], meta)
+    evil = _forge(tmp_path, [_frame(engine.KIND_RAW, b"x")], {}, meta_raw=json.dumps(meta).encode())
     _assert_rejected(tmp_path, evil.read_bytes())
 
 
@@ -772,6 +772,16 @@ def test_join_parts_edge_cases(tmp_path):
             paths.append(tmp_path / n)
         with pytest.raises(LocksmithError):
             tools.join_parts(paths)
+
+
+def test_join_rebuilds_a_thousand_parts_or_more(tmp_path):
+    """As text, "part1000" sorts between "part100" and "part101": join must go by number."""
+    data = b"LOCKED\x00\x02" + os.urandom(64 * 1001)
+    (tmp_path / "f.locked").write_bytes(data)
+    (tmp_path / "out").mkdir()
+    parts = tools.split_file(tmp_path / "f.locked", 64, tmp_path)   # join checks the first part's first 64 bytes
+    assert len(parts) > 1000
+    assert tools.join_parts(parts, tmp_path / "out").read_bytes() == data
 
 
 def _parts(tmp_path, data: bytes) -> list[Path]:

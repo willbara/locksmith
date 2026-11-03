@@ -154,3 +154,23 @@ def test_recovery_from_spec_matches_written_parity(tmp_path):
     import spec_reader
     f, lpar, data = _make(tmp_path, 300_000, "20", seed=9)
     assert spec_reader.read_recovery(data, lpar.read_bytes())["stripes"] == 4
+
+
+def test_changing_who_can_open_a_file_rebuilds_its_recovery_data(tmp_path):
+    """A stale sidecar would read the new key slots as damage, and repairing them would bring the old
+    password back."""
+    from locksmith.core import engine
+    from locksmith.core.engine import AccessChange, DecryptKeys, EncryptOptions
+    from locksmith.core.errors import WrongKeyError
+    fast = dict(kdf="pbkdf2-sha512", preset="fast")
+    src = tmp_path / "a.bin"
+    src.write_bytes(os.urandom(200_000))
+    enc = engine.encrypt_paths([src], tmp_path / "o", EncryptOptions(password="leaked", **fast))
+    parity.create(enc, "10")
+    engine.change_access(enc, DecryptKeys(password="leaked"),
+                         AccessChange(set_password=True, password="new", **fast))
+    assert parity.check(enc).intact
+    lay = parity.read_recovery(enc.with_name(enc.name + ".lpar")).lay
+    assert (lay.k, lay.m) == parity.LEVELS["10"]   # the same level as before
+    with pytest.raises(WrongKeyError):
+        engine.decrypt_path(enc, tmp_path / "out", DecryptKeys(password="leaked"))

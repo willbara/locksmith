@@ -526,16 +526,6 @@ def _chunk_nonce(counter: int, last: bool) -> bytes:
     return counter.to_bytes(11, "big") + (b"\x01" if last else b"\x00")
 
 
-def _read_full(f: BinaryIO, n: int) -> bytes:
-    buf = bytearray()
-    while len(buf) < n:
-        part = f.read(n - len(buf))
-        if not part:
-            break
-        buf += part
-    return bytes(buf)
-
-
 def encrypt_stream(src: BinaryIO, out: BinaryIO, recipients: list[Recipient], passphrase: str | None = None,
                    work_factor: int = DEFAULT_WORK_FACTOR, cancel: threading.Event | None = None,
                    progress=None, total: int = 0) -> bytes:
@@ -549,6 +539,7 @@ def encrypt_stream(src: BinaryIO, out: BinaryIO, recipients: list[Recipient], pa
     if recipients and len({r.post_quantum for r in recipients}) > 1:
         raise LocksmithError("age doesn't mix post-quantum and classical recipients in one file: it would leave "
                              "the file only as strong as the classical ones. Choose one kind.")
+    from .engine import _read_full
     file_key = secrets.token_bytes(16)
     unique = {(r.kind, r.key): r for r in recipients}.values()
     stanzas = [scrypt_stanza(passphrase, file_key, work_factor)] if passphrase else [wrap(r, file_key) for r in unique]
@@ -589,6 +580,7 @@ def decrypt_stream(f: BinaryIO, out: BinaryIO, keys: Keys, cancel: threading.Eve
 
 def decrypt_payload(f: BinaryIO, out: BinaryIO, file_key: bytes, cancel=None, progress=None, total: int = 0,
                     max_output: int | None = None, space=None):
+    from .engine import _read_full
     nonce = _read_full(f, 16)
     if len(nonce) != 16:
         raise AgeHeaderError("The age file is truncated after its header.")
@@ -724,14 +716,6 @@ def _info(header: Header) -> AgeInfo:
 
 # ── files ────────────────────────────────────────────────────────────────────
 
-class _Null(io.RawIOBase):
-    def writable(self):
-        return True
-
-    def write(self, b):
-        return len(b)
-
-
 def encrypt_paths(paths: list[Path], out_dir: Path | None, recipients: list[Recipient], passphrase: str | None = None,
                   armored: bool = False, bundle_name: str | None = None, progress=None,
                   cancel: threading.Event | None = None, verify: bool = False,
@@ -744,19 +728,7 @@ def encrypt_paths(paths: list[Path], out_dir: Path | None, recipients: list[Reci
     ``hide_name`` gives the output a random name (age stores no name inside)."""
     from . import engine, metadata
     stats = stats if stats is not None else {}
-    paths = [Path(p) for p in paths]
-    if not paths:
-        raise LocksmithError("Nothing to encrypt.")
-    for p in paths:
-        if engine.is_link(p):
-            raise LocksmithError(f"{p.name} is a link. Add the file or folder it points to instead.")
-        if not p.exists():
-            raise LocksmithError(f"{p.name} no longer exists.")
-    out_dir = Path(out_dir) if out_dir else paths[0].parent
-    for p in paths:
-        if p.is_dir() and out_dir.resolve().is_relative_to(p.resolve()):
-            raise LocksmithError(f"The output folder is inside “{p.name}”, the folder being encrypted. "
-                                 "Choose an output folder outside it.")
+    paths, out_dir = engine.check_sources(paths, out_dir)
     if len(paths) == 1 and paths[0].is_file():
         name, total = paths[0].name, paths[0].stat().st_size
         opener = lambda: open(paths[0], "rb")  # noqa: E731
@@ -773,8 +745,7 @@ def encrypt_paths(paths: list[Path], out_dir: Path | None, recipients: list[Reci
         total = sum(engine._tree_size(p) for p in paths)
         opener = lambda: engine._TarStream([(p, p.name) for p in paths], strip, stats)  # noqa: E731
     if armored and total > engine.MAX_ARMOR_INPUT:
-        raise LocksmithError(f"Text (ASCII armor) output is limited to {engine.MAX_ARMOR_INPUT >> 20} MiB. "
-                             "Turn off ASCII armor for larger files.")
+        raise engine.armor_too_large()
     out_dir.mkdir(parents=True, exist_ok=True)
     if hide_name:
         name = secrets.token_hex(8)
@@ -790,8 +761,7 @@ def encrypt_paths(paths: list[Path], out_dir: Path | None, recipients: list[Reci
                 buf = io.BytesIO()
                 file_key = encrypt_stream(src, buf, recipients, passphrase, work_factor, cancel, report, total)
                 if buf.tell() > engine.MAX_ARMOR_INPUT + (1 << 20):
-                    raise LocksmithError(f"Text (ASCII armor) output is limited to {engine.MAX_ARMOR_INPUT >> 20} "
-                                         "MiB. Turn off ASCII armor for larger files.")
+                    raise engine.armor_too_large()
                 engine.write_private(tmp, armor(buf.getvalue()).encode())
             else:
                 with engine.create_private(tmp) as out:
@@ -804,7 +774,7 @@ def encrypt_paths(paths: list[Path], out_dir: Path | None, recipients: list[Reci
                 header = read_header(f)
                 if not hmac.compare_digest(_mac(file_key, header.signed), header.mac):
                     raise LocksmithError("Verification failed: the header on disk does not match.")
-                decrypt_payload(f, _Null(), file_key, cancel)
+                decrypt_payload(f, engine._NullWriter(), file_key, cancel)
         os.replace(tmp, target)
         engine.fsync_dir(out_dir)
         os.chmod(target, 0o644)   # ciphertext is safe to share
@@ -866,7 +836,7 @@ def verify_path(path: Path, keys: Keys, progress=None, cancel: threading.Event |
     with open_source(Path(path)) as f:
         total = f.seek(0, os.SEEK_END)
         f.seek(0)
-        decrypt_stream(f, _Null(), keys, cancel, progress, total)
+        decrypt_stream(f, engine._NullWriter(), keys, cancel, progress, total)
     return engine.DecryptResult(None, {"name": Path(path).name, "format": "age"})
 
 

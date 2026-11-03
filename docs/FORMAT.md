@@ -141,8 +141,10 @@ A writer may add recipient slots for keys that are generated and immediately dis
 random value, to hide how many recipients there are. Since Locksmith 5, each kind of recipient slot
 (`x25519`, hybrid, and `ssh-rsa` of one ciphertext size) is rounded up on its own to 8, 16, 32 or
 64, the largest kind first, and a kind that no longer fits within the 64-slot limit gets as many
-decoys as there is room for. The file then shows which kinds of recipient it has, but not how many
-of each. (Locksmith 4 rounded the total and made every decoy one kind, which showed exactly how many
+decoys as there is room for. The file then shows which kinds of recipient it has. For each kind, it
+shows a range: 1 to 8, 9 to 16, 17 to 32 or 33 to 64. Near the 64-slot limit, a kind that gets
+fewer decoys than its range needs shows a smaller range. A kind that gets no decoys shows its real
+number. (Locksmith 4 rounded the total and made every decoy one kind, which showed exactly how many
 recipients of the other kinds there were.) `ssh-rsa` decoys are RSA-OAEP encryptions of a random
 value to a recipient key of the same size, or to a throwaway key of that size up to 4096 bits, so
 they look like real ones even to someone who knows the recipients' keys. (A ciphertext for a
@@ -160,6 +162,9 @@ decoys, so a writer either keeps every recipient slot or replaces them all with 
 take out one. When it hides the number of recipients, it rounds the recipient slots up as above,
 counting the kept ones. For `ssh-rsa` decoys it uses the keys it knows of that may be among the kept
 recipients (Locksmith: saved contacts), so they look like the kept slots.
+
+If the file has recovery data (section 17), the writer makes it again at the same level. Old recovery
+data would show the new slots as damage, and a repair would put the old slots back.
 
 A change revokes nothing. Anyone who could open the file before may have kept its DEK, which opens
 every copy, old or new, whatever its slots say. Taking access away means encrypting the content again
@@ -234,6 +239,10 @@ computed over the content only, so a signature adds its own fixed size on top.
 Codecs: `zstd` (Zstandard frame), `zlib` (RFC 1950), `lzma` (`.xz` container, dictionary within
 128 MiB of decoder memory), `bz2`.
 
+A reader applies the `chunk` limit during decompression. It stops the decoder when the output becomes
+larger than `chunk` bytes, and it rejects the frame. It must not decompress the full block first and
+then check its size.
+
 ## 7. Metadata
 
 `AES-256-GCM(meta key, nonce = meta.n, plaintext = JSON, aad = LABEL || "meta")`. The JSON object may
@@ -250,8 +259,15 @@ hold:
 | `items`   | number of items in a bundle |
 | `note`    | the sender's free text. Only a valid signature (section 15) vouches for it |
 | `to`      | the signer's intended recipients, in signed files only (see below) |
+| `pad`     | spaces only. Readers ignore it |
 
 Readers ignore unknown fields and fields of the wrong type.
+
+Since Locksmith 5, a writer adds `pad` as the last field. It sets the length of `pad` so that the
+metadata JSON is 1024, 2048, 4096, 8192, 16384, 32768 or 65536 bytes long. Above 65536 bytes, the
+JSON is a multiple of 65536 bytes. Thus the length of `meta.c` shows only a range for the length of
+the name, the note and `to`. The JSON uses `\u` escapes for all characters that are not ASCII, so each
+character is one byte. Older readers ignore `pad`, because they ignore unknown fields.
 
 `to` lists the recipients the signer addressed a signed file to: an array of 1 to 64 base64 32-byte
 entries, each `SHA-256("locksmith/v2/recipient" || 0x00 || key)` where `key` is a recipient's raw
@@ -275,7 +291,10 @@ encryption keys of every one of its own identities against it, not only the one 
 
 Without `to`, a reader says nothing about whom a file was meant for. Everyone who can open a file can
 read its list, and so learn how many recipients were addressed, even when decoy slots hide that number
-from everyone else.
+from everyone else. A person who can open the file can also find out if a public key that they know is
+on the list. To do this, they calculate the entry for that key and compare it with the list. Thus
+`to` tells each recipient about the other recipients. Locksmith writes `to` only when the user turns it
+on.
 
 For `dir` and `bundle`, the content is a
 POSIX (PAX) tar stream. A `dir` archive holds one top-level folder. Readers must extract only regular
@@ -533,7 +552,9 @@ meta  = u32 len(header) || header || data hashes (n × 16 bytes) || parity hashe
 ```
 
 `header` is UTF-8 JSON: `{"v": 1, "size", "block": B, "k", "m", "sha256": hex SHA-256 of the whole
-protected file, "name": its name when made}`. A block's hash is the first 16 bytes of SHA-256 of
+protected file, "name": its name when made}`. The header is not encrypted. `name` is the name of the
+protected file on the disk. For a Locksmith file, it is the name of the `.locked` file, not the name in
+its encrypted metadata. A block's hash is the first 16 bytes of SHA-256 of
 its bytes (a data block without its padding). The description is stored twice; a reader uses
 whichever copy matches its checksum and whose sizes add up to the file's length.
 
@@ -563,3 +584,25 @@ this one; this section only says how Locksmith's keys take part.
   in one file. It reads scrypt work factors up to 21. age files have no name, signature, padding or
   note: Locksmith names the output after the file without `.age`, and stores a folder as a tar
   archive (`name.tar.age`), which comes back as that archive.
+
+## 19. What a file shows without a key
+
+Some parts of a Locksmith file are not encrypted. Anyone who has the file can read them without a
+password, a keyfile or a private key:
+
+- **The container:** that it is a Locksmith file, and its format version.
+- **The fixed header:** the cipher suite and the chunk size. The length of `meta.c` gives the length
+  of the metadata JSON. Because of `pad` (section 7), this length shows only a range. Most files have
+  1024 bytes of metadata. A long note or a long `to` list makes it larger. Files from Locksmith 4 and
+  earlier have no `pad`, so their metadata length shows approximately how long the name and note are.
+- **The key slots:** the number of slots and the type of each slot. A password slot shows its KDF,
+  the KDF cost parameters (`p`) and if a keyfile is necessary (`kf`). An `ssh-rsa` slot shows the
+  size of the RSA key. Decoy slots show only a range for each kind of recipient (section 3).
+- **The frames:** the number and the size of the frames. These show the content size after padding
+  (section 6). A signature uses its own frames, so the frame sizes show that a file is signed. They
+  do not show who signed it.
+- **Outside the file:** the file name on the disk (random when the name is hidden), the file times
+  that the file system keeps, and the header of a recovery file (section 17).
+
+The encrypted parts are the content, the metadata (name, kind, size, times, note and `to`) and the
+signature with the signer's `key_id`.

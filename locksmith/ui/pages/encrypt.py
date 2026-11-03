@@ -89,10 +89,11 @@ class EncryptPage(Page):
         rl.addWidget(self.recipients)
         self.hide_recipients = ToggleRow(
             "Hide the number of recipients",
-            "Adds decoy recipient slots, so the file shows 8, 16, 32 or 64 instead of how many people "
-            "can really open it. With several kinds of key (post-quantum, classical, SSH RSA), each kind is "
-            "rounded up on its own: the file shows which kinds it has, not how many of each. SSH RSA keys over "
-            "4096 bits get no decoys.",
+            "Adds decoy recipient slots. The file then shows 8, 16, 32 or 64 slots, not the real number of "
+            "people who can open it. Each kind of key (post-quantum, classical, SSH RSA) is rounded up "
+            "separately. The file shows which kinds it has and a range for each kind, for example 9 to 16. "
+            "Near the limit of 64 slots, a kind can show its real number. SSH RSA keys larger than 4096 bits "
+            "get no decoys.",
             settings["hide_recipients"])
         rl.addWidget(self.hide_recipients)
         self.rsa_note = label("An SSH RSA recipient is selected. Locksmith 3.0 and earlier can't open such a file at "
@@ -198,13 +199,16 @@ class EncryptPage(Page):
         self.sign_field = Field("Sign as", self.sign_as, "Whoever opens the file can check it was signed with "
                                 "your key and hasn't changed since.")
         self.add(self.sign_field)
-        # On by default (audit B7): without a list, anyone who can open a signed file can re-send it to someone
-        # else, and it still shows as signed, with nothing saying it was meant for someone else.
+        # Off by default: the list lets each recipient test whether a key they know was also addressed. Without
+        # it, a reader of a signed file is told the file doesn't say whom it was for (audit B7).
         self.address = ToggleRow("Address it to the selected people",
-                                 "Lists the recipients inside the signed file, so whoever opens it can tell whether "
-                                 "they were one of them, and a copy passed on to someone else says so. Everyone who "
-                                 "can open it can read the list.", True)
-        self._address_wanted = True   # the user's choice, kept while no recipient is selected
+                                 "Puts a list of the recipients inside the signed file. Each person who opens the "
+                                 "file can see if they are on the list. A copy sent to a different person shows "
+                                 "that this person is not on the list. Each recipient can also see the number of "
+                                 "recipients. If a recipient has the public key of a person, they can find out if "
+                                 "that person is on the list. Use this only if the recipients can know about each "
+                                 "other.", False)
+        self._address_wanted = False   # the user's choice, kept while no recipient is selected
         self.address_note = label("", "caption")
         self.add(self.address)
         self.add(self.address_note)

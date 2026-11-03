@@ -172,6 +172,14 @@ def _forged(alice, content: bytes, signed_content: bytes | None = None, *, sig: 
     return _seal(head, [_frame(KIND_RAW, content), *_sig_frames(sig, chunk)])
 
 
+def _as_alice(alice, head) -> bytes:
+    """A signature that names Alice's key_id but is made, correctly over that head, with Mallory's keys."""
+    ed, ml = keys.signing_keys(os.urandom(96))
+    sig_head = signing.HEAD.pack(signing.MAGIC, signing.ALG_ED25519_MLDSA65, 0, signing.key_id(alice[1]), 0)
+    m = signing._locked_message(sig_head, head.fixed, hashlib.sha512(b"genuine").digest())
+    return sig_head + ed.sign(m) + ml.sign(m, signing.LOCKED_CONTEXT)
+
+
 def test_forged_signed_file_verifies(alice):
     blob = _forged(alice, b"genuine")
     assert engine.decrypt_bytes(blob, DecryptKeys(password="pw", verifiers=[alice[1]])).signature.verified
@@ -179,7 +187,8 @@ def test_forged_signed_file_verifies(alice):
 
 @pytest.mark.parametrize("case", ["content changed", "ml-dsa stripped", "ml-dsa zeroed", "ed25519 zeroed",
                                   "ml-dsa from another signature", "ed25519 from another signature",
-                                  "comment added", "signed for another header", "too long"])
+                                  "comment added", "signed for another header", "too long",
+                                  "signed by another key"])
 def test_invalid_signatures_fail_and_write_nothing(tmp_path, alice, case):
     good = signing.sign_locked(alice[0], b"other header", hashlib.sha512(b"genuine").digest())
     blob = {
@@ -195,6 +204,7 @@ def test_invalid_signatures_fail_and_write_nothing(tmp_path, alice, case):
         "comment added": lambda: _forged(alice, b"genuine", sig=good[:49] + b"\x00\x01x" + good[51:]),
         "signed for another header": lambda: _forged(alice, b"genuine", sig=good),
         "too long": lambda: _forged(alice, b"genuine", sig=good + b"\x00"),
+        "signed by another key": lambda: _forged(alice, b"genuine", tamper=lambda sig, h: _as_alice(alice, h)),
     }[case]()
     with pytest.raises(CorruptedError):
         engine.decrypt_bytes(blob, DecryptKeys(password="pw", verifiers=[alice[1]]))

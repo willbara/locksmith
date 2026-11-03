@@ -515,6 +515,19 @@ class _Written:
     dek: bytes          # kept with the keys derived from it, for rewriting the commitment
 
 
+META_PAD_STEP = 64 << 10
+
+
+def _padded_meta(meta: dict) -> bytes:
+    """The metadata JSON with a "pad" field of spaces (FORMAT.md §7), so its length shows little about
+    the name, note or recipient list: a power of two from 1 KiB up to 64 KiB, then a multiple of 64 KiB."""
+    n = len(json.dumps({**meta, "pad": ""}, separators=(",", ":")).encode())   # ASCII: json escapes the rest
+    target = max(1024, 1 << (n - 1).bit_length()) if n <= META_PAD_STEP else -(-n // META_PAD_STEP) * META_PAD_STEP
+    # Never pad past what the 1 MiB header holds as base64, so a note that fits unpadded still fits.
+    target = min(target, max(n, (MAX_HEADER - 512) * 3 // 4 - 16))
+    return json.dumps({**meta, "pad": " " * (target - n)}, separators=(",", ":")).encode()
+
+
 def _build_header(opts: EncryptOptions, meta: dict, chk: _Checker,
                   fmt: Format = WRITE_FORMAT) -> _Written:
     validate_options(opts)
@@ -539,8 +552,7 @@ def _build_header(opts: EncryptOptions, meta: dict, chk: _Checker,
     secrets.SystemRandom().shuffle(slots)
 
     mnonce = os.urandom(NONCE_SIZE)
-    mct = AESGCM(keys.meta_key).encrypt(
-        mnonce, json.dumps(meta, separators=(",", ":")).encode(), fmt.label + b"meta")
+    mct = AESGCM(keys.meta_key).encrypt(mnonce, _padded_meta(meta), fmt.label + b"meta")
 
     header = {
         "v": fmt.version,
@@ -634,7 +646,9 @@ def _slot_shape(slot: dict) -> tuple[str, int]:
 def _decoy_slots(recipient_slots: list[dict], password: bool, known: list[bytes], fmt: Format) -> list[dict]:
     """Decoy slots that hide how many recipients a file has (FORMAT.md §3, "Decoy slots"). Each kind
     of slot present (X25519, hybrid, or RSA with one ciphertext size) is rounded up on its own to 8,
-    16, 32 or 64, so the file shows which kinds it has but not how many of each; one shared total
+    16, 32 or 64, so the file shows which kinds it has and only a range (1-8, 9-16, ...) for each,
+    except that a kind the slot limit leaves short shows a narrower range, or its exact count when
+    no room is left; one shared total
     would show exactly how many of the rarer kinds there are (audit A9). Within MAX_SLOTS the largest
     kinds are rounded first; one that no longer fits gets as many decoys as there is room for. Every decoy is a genuine slot wrapping a random
     value: X25519 and hybrid ones for keys thrown away at once; RSA ones for a recipient key of the
@@ -914,8 +928,8 @@ def _read_meta(header: dict, keys: _Keys) -> dict:
             raise ValueError
     except (InvalidTag, KeyError, ValueError, RecursionError) as e:
         raise CorruptedError("The encrypted metadata is damaged.") from e
-    return {k: v for k, v in meta.items()
-            if k not in _META_TYPES or (isinstance(v, _META_TYPES[k]) and not isinstance(v, bool))}
+    return {k: v for k, v in meta.items() if k != "pad" and
+            (k not in _META_TYPES or (isinstance(v, _META_TYPES[k]) and not isinstance(v, bool)))}
 
 
 # ── free disk space ──────────────────────────────────────────────────────────
@@ -973,7 +987,7 @@ def _encrypt_stream(src: BinaryIO, total: int, out: BinaryIO, head: _Written,
     keys = head.keys
     prefix = _unb64(json.loads(head.fixed)["np"])
     aad = hashlib.sha256(head.fixed).digest()
-    content_hash = hashlib.sha512()   # what a signature covers
+    content_hash = hashlib.sha512() if opts.signer is not None else None   # what a signature covers
     chunk = opts.chunk_size
     codec = comp.CODECS.get(codec_id)
     level = codec.levels[opts.level] if codec else 0
@@ -1018,13 +1032,13 @@ def _encrypt_stream(src: BinaryIO, total: int, out: BinaryIO, head: _Written,
             if not blocks:
                 break
             done += sum(map(len, blocks))
-            for b in blocks:
-                content_hash.update(b)
+            if content_hash is not None:
+                for b in blocks:
+                    content_hash.update(b)
             # Checked on what is actually read: a folder's archive is larger than its
             # files, and a file can grow while it is read.
             if max_input is not None and done > max_input:
-                raise LocksmithError(f"Text (ASCII armor) output is limited to {max_input >> 20} MiB. "
-                                     "Turn off ASCII armor for larger files.")
+                raise armor_too_large()
 
             frames = list(pool.map(make_frame, blocks))
             # Adaptive compression: give up early on incompressible data.
@@ -1309,22 +1323,9 @@ def _output_name(opts: EncryptOptions, base: str) -> str:
     return stem + EXTENSION + (".txt" if opts.armor else "")
 
 
-def encrypt_paths(paths: list[Path], out_dir: Path | None, opts: EncryptOptions,
-                  bundle_name: str | None = None, progress: Progress | None = None,
-                  cancel: threading.Event | None = None, verify: bool = False,
-                  stats: dict | None = None) -> Path:
-    """Encrypt one file, one folder, or several items bundled as one archive.
-
-    With ``verify``, the written file is read back and every chunk is
-    authenticated and decoded before it is moved into place. Callers that will
-    delete the originals afterwards must pass ``verify=True``.
-
-    With ``opts.strip_metadata``, ``stats`` (if given) receives counts of images
-    "stripped" and files left "unchanged" because their format is not supported.
-    """
-    stats = stats if stats is not None else {}
-    chk = _Checker(cancel, progress)
-    validate_options(opts)
+def check_sources(paths: list[Path], out_dir: Path | None) -> tuple[list[Path], Path]:
+    """The checks every encryption (Locksmith or age) makes before reading anything. Returns the
+    paths and the output folder (by default, the first item's folder)."""
     paths = [Path(p) for p in paths]
     if not paths:
         raise LocksmithError("Nothing to encrypt.")
@@ -1341,7 +1342,32 @@ def encrypt_paths(paths: list[Path], out_dir: Path | None, opts: EncryptOptions,
     for p in paths:
         if p.is_dir() and resolved_out.is_relative_to(p.resolve()):
             raise LocksmithError(f"The output folder is inside “{p.name}”, the folder being encrypted. "
-                               "Choose an output folder outside it.")
+                                 "Choose an output folder outside it.")
+    return paths, out_dir
+
+
+def armor_too_large() -> LocksmithError:
+    return LocksmithError(f"Text (ASCII armor) output is limited to {MAX_ARMOR_INPUT >> 20} MiB. "
+                          "Turn off ASCII armor for larger files.")
+
+
+def encrypt_paths(paths: list[Path], out_dir: Path | None, opts: EncryptOptions,
+                  bundle_name: str | None = None, progress: Progress | None = None,
+                  cancel: threading.Event | None = None, verify: bool = False,
+                  stats: dict | None = None) -> Path:
+    """Encrypt one file, one folder, or several items bundled as one archive.
+
+    With ``verify``, the written file is read back and every chunk is
+    authenticated and decoded before it is moved into place. Callers that will
+    delete the originals afterwards must pass ``verify=True``.
+
+    With ``opts.strip_metadata``, ``stats`` (if given) receives counts of images
+    "stripped" and files left "unchanged" because their format is not supported.
+    """
+    stats = stats if stats is not None else {}
+    chk = _Checker(cancel, progress)
+    validate_options(opts)
+    paths, out_dir = check_sources(paths, out_dir)
 
     now = int(time.time())
     strip = opts.strip_metadata
@@ -1373,8 +1399,7 @@ def encrypt_paths(paths: list[Path], out_dir: Path | None, opts: EncryptOptions,
         opener = lambda: _TarStream([(p, p.name) for p in paths], strip, stats)  # noqa: E731
 
     if opts.armor and total > MAX_ARMOR_INPUT:
-        raise LocksmithError(f"Text (ASCII armor) output is limited to {MAX_ARMOR_INPUT >> 20} MiB. "
-                           "Turn off ASCII armor for larger files.")
+        raise armor_too_large()
     codec_id = _codec_for(opts, paths)
     meta = {"name": name, "kind": kind, "comp": codec_id, **_created(opts, now), **meta_extra, **_option_meta(opts)}
 
@@ -1969,5 +1994,26 @@ def change_access(path: Path, keys: DecryptKeys, change: AccessChange, allow_loc
         tmp.unlink(missing_ok=True)
         raise
     fsync_dir(path.parent)
+    _refresh_recovery(path, chk)
     chk.report(1.0, "Done")
     return AccessResult(path, sum(s["t"] == "pw" for s in new), sum(s["t"] != "pw" for s in new), you_can_open)
+
+
+def _refresh_recovery(path: Path, chk: _Checker):
+    """Rebuild the file's .lpar sidecar after its slots changed, at the same level. A stale one reports
+    the new slots as damage, and a repair from it would bring the old slots back, old password included."""
+    from . import parity
+    side = path.with_name(path.name + parity.EXTENSION)
+    if not side.is_file() or is_link(side):
+        return
+    try:
+        lay = parity.read_recovery(side).lay
+    except (LocksmithError, OSError):
+        return   # unreadable: it can't rebuild anything, old slots included
+    level = next(name for name, km in parity.LEVELS.items() if km == (lay.k, lay.m))
+    try:
+        parity.create(path, level, progress=chk.report, cancel=chk.cancel)
+    except BaseException:
+        side.unlink(missing_ok=True)
+        raise LocksmithError("Who can open the file was changed, but its recovery data could not be made again, "
+                             "so the old recovery data was removed. Make new recovery data in Tools.") from None

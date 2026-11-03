@@ -135,6 +135,18 @@ def test_fuzz_whole_file_decrypt(recipient_file, ident):
     fuzz("decrypt", recipient_file, lambda b: engine.decrypt_bytes(b, DecryptKeys(identities=[ident])))
 
 
+def test_fuzz_version_1_file(ident):
+    """The legacy reader (FORMAT.md §16): one header holding the slots, no signatures."""
+    frame = engine.FRAME_HDR.pack(engine.KIND_RAW, 600) + b"x" * 600
+    blob = fileformat.forge(EncryptOptions(recipients=[keys.public_from_private(ident)], chunk_size=1024, **FAST),
+                            {"name": "old.txt", "kind": "file", "comp": "none"}, [frame, frame],
+                            fmt=engine.LOCKED_V1)
+    dk = DecryptKeys(identities=[ident])
+    assert engine.decrypt_bytes(blob, dk).data == b"x" * 1200
+    fuzz("v1-header", blob[:2048], engine.inspect_bytes)
+    fuzz("v1-decrypt", blob, lambda b: engine.decrypt_bytes(b, dk))
+
+
 def test_fuzz_signed_file(ident):
     signer = os.urandom(96)
     blob = engine.encrypt_bytes(b"signed fuzz " * 300, EncryptOptions(
@@ -208,6 +220,8 @@ def test_fuzz_shares_and_words():
     v2 = ("locksmithshare2-2-1-b2a5bd73-4f90d9e19b16f5038af06a9901e0cba19d-5c8554\n"
           "locksmithshare2-2-2-b2a5bd73-046dc94c828967a9937f492914f1a8d419-26ea5f")   # still read
     fuzz("shares-v2", v2, lambda t: tools.shamir_combine(t.split()), mutate_text)
+    v1 = "locksmithshare-2-1-60714d9e165fd1a51310-bf5073\nlocksmithshare-2-2-71563647b9111cc789bc-bd2f36"
+    fuzz("shares-v1", v1, lambda t: tools.shamir_combine(t.split()), mutate_text)
     id_shares = "\n".join(keys.identity_shares(os.urandom(32), 2, 3))
     fuzz("identity-shares", id_shares, lambda t: keys.private_from_shares(t.split()), mutate_text)
     fuzz("words", " ".join(keys.backup_words(os.urandom(96))), keys.private_from_words, mutate_text)

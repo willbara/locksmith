@@ -406,9 +406,10 @@ class DecryptPage(Page):
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setMaximumHeight(200)
         s.add(scroll)
-        hide = ToggleRow("Hide the number of recipients", "Rounds each kind of recipient slot up to 8, 16, 32 or 64 "
-                         "with decoys: the file shows which kinds it has, not how many of each. SSH RSA keys over "
-                         "4096 bits get no decoys.",
+        hide = ToggleRow("Hide the number of recipients", "Adds decoy slots to round up each kind of recipient slot "
+                         "to 8, 16, 32 or 64. The file shows which kinds it has and a range for each kind. Near "
+                         "the limit of 64 slots, a kind can show its real number. SSH RSA keys larger than 4096 "
+                         "bits get no decoys.",
                          settings["hide_recipients"])
         s.add(hide)
         s.add_button("Cancel", None, "ghost")

@@ -852,6 +852,12 @@ def test_age_files_through_encrypt_and_decrypt(tmp_path, window, monkeypatch):
     e.start()
     assert any("not both" in a for a in window.asked)   # password and recipients: refused before anything runs
     e.mode.setIndex(1)
+    e.start()   # the default padding and decoys protect privacy, so age refuses them until turned off
+    assert any("no size padding" in a for a in window.asked)
+    e.padding.set_value("none")
+    e.start()
+    assert any("hide the number" in a for a in window.asked)
+    e.hide_recipients.setChecked(False)
     e.start()
     wait(lambda: e.task is None)
     (enc,) = (tmp_path / "enc").glob("*.age")
@@ -1096,6 +1102,8 @@ def test_age_with_ssh_recipients_warns_that_age_names_them(tmp_path, window, mon
     src.write_text("x", encoding="utf-8")
     e.files.add([str(src)])
     e.format.set_value("age")
+    e.padding.set_value("none")
+    e.hide_recipients.setChecked(False)
     e.mode.setIndex(1)
     for row, _ in e.recipients.rows:
         row.setChecked(True)
@@ -1178,9 +1186,9 @@ def test_share_page_sends_only_encrypted_files(tmp_path, window, monkeypatch):
     assert QApplication.clipboard().text().startswith(age.ARMOR_BEGIN)   # age stays age
 
 
-def test_signed_files_are_addressed_by_default(tmp_path, window):
-    """Audit B7: signing for public-key recipients lists them unless the user turns it off, and that
-    choice survives changing the recipients."""
+def test_signed_files_are_not_addressed_by_default(tmp_path, window):
+    """The recipient list tells each recipient about the others, so it is off until the user turns it
+    on, and that choice survives changing the recipients."""
     from locksmith.core.keys import KeyStore
     store, e = window.store, window.encrypt
     me = store.generate("Alice")
@@ -1199,11 +1207,11 @@ def test_signed_files_are_addressed_by_default(tmp_path, window):
 
     e.mode.setIndex(1)
     choose_bob(True)
-    assert e.address.isChecked() and e.options().address_to
-    e.address.setChecked(False)
+    assert not e.address.isChecked() and not e.options().address_to
+    e.address.setChecked(True)
     choose_bob(False)
     choose_bob(True)
-    assert not e.address.isChecked() and not e.options().address_to
+    assert e.address.isChecked() and e.options().address_to
 
 
 def test_unaddressed_signed_file_says_it_may_have_been_passed_on(window):

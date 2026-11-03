@@ -60,7 +60,7 @@ def test_wrong_password(tmp_path):
     assert not list((tmp_path / "out").glob("*"))
 
 
-@pytest.mark.parametrize("where", ["body", "header", "truncate", "append", "drop_last"])
+@pytest.mark.parametrize("where", ["body", "header", "truncate", "append", "drop_last", "swap"])
 def test_tamper_detected(tmp_path, where):
     src = tmp_path / "a.bin"
     src.write_bytes(os.urandom(700_000))
@@ -76,8 +76,8 @@ def test_tamper_detected(tmp_path, where):
         del blob[-50:]
     elif where == "append":
         blob += blob[-300:]
-    elif where == "drop_last":
-        # remove the final frame entirely
+    else:
+        # remove the final frame entirely, or swap the first two (both full-size)
         import struct
 
         import fileformat
@@ -87,7 +87,11 @@ def test_tamper_detected(tmp_path, where):
             n = struct.unpack(">I", blob[pos:pos + 4])[0]
             frames.append(pos)
             pos += 4 + n
-        del blob[frames[-1]:]
+        if where == "drop_last":
+            del blob[frames[-1]:]
+        else:
+            a, b, c = frames[:3]
+            blob[a:c] = blob[b:c] + blob[a:b]
     enc.write_bytes(bytes(blob))
     with pytest.raises((CorruptedError, WrongKeyError)):
         engine.decrypt_path(enc, tmp_path / "out", DecryptKeys(password="pw"))
@@ -224,3 +228,24 @@ def test_new_files_use_the_locksmith_format(tmp_path):
     foreign.write_bytes(b"CRYPTOR\x01" + enc.read_bytes()[8:])
     with pytest.raises(CorruptedError, match="not a Locksmith file"):
         engine.inspect(foreign)
+
+
+@pytest.mark.parametrize("meta, size", [({}, 1024), ({"name": "a", "kind": "file"}, 1024),
+                                        ({"name": "é" * 300}, 2048), ({"note": "x" * 70000}, 128 << 10)])
+def test_metadata_length_is_padded(meta, size):
+    import json
+    raw = engine._padded_meta(meta)
+    assert len(raw) == size and {k: v for k, v in json.loads(raw).items() if k != "pad"} == meta
+
+
+def test_padding_field_is_not_returned():
+    res = engine.decrypt_bytes(engine.encrypt_bytes(b"x", EncryptOptions(password="pw", note="hi", **FAST)),
+                               DecryptKeys(password="pw"))
+    assert res.meta["note"] == "hi" and "pad" not in res.meta
+
+
+def test_padding_never_refuses_a_note_that_fits_unpadded():
+    note = "n" * 760_000   # padded to the next 64 KiB, the header would pass 1 MiB
+    res = engine.decrypt_bytes(engine.encrypt_bytes(b"x", EncryptOptions(password="pw", note=note, **FAST)),
+                               DecryptKeys(password="pw"))
+    assert res.meta["note"] == note

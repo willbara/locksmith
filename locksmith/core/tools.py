@@ -735,8 +735,15 @@ def split_file(path: Path, part_size: int, out_dir: Path | None = None) -> list[
     return parts
 
 
+def _part_number(p: Path) -> float:
+    """The sort key of a part: its number, since "part1000" sorts between "part100" and "part101" as text.
+    Odd names go last, where join_parts rejects them."""
+    m = re.fullmatch(r"(.+)\.part(\d{3,})", p.name)
+    return int(m[2]) if m else float("inf")
+
+
 def join_parts(parts: list[Path], out_dir: Path | None = None) -> Path:
-    parts = sorted((Path(p) for p in parts), key=lambda p: p.name)
+    parts = sorted((Path(p) for p in parts), key=_part_number)
     if not parts:
         raise LocksmithError("Choose the parts to join.")
     m = re.fullmatch(r"(.+)\.part(\d{3,})", parts[0].name)

@@ -33,6 +33,91 @@ def qt_arguments(argv: list[str]) -> list[str]:
     return argv[:1]
 
 
+def instance_address() -> tuple[str, bytes] | None:
+    """Where this user's running Locksmith listens for later launches, and the key both sides prove they
+    hold, or None when that can't be set up. Two running copies would each save their own key list over
+    the other's and shred each other's temporary files. The key is a random token in the private config
+    folder: another user can't stand in for either side, so the paths a launch hands over stay private."""
+    import hashlib
+    import re
+    import secrets
+
+    from .core.keys import config_dir
+    from .core.osutil import open_new
+    folder = config_dir()
+    path = folder / "instance"
+    try:
+        fd = open_new(path)
+    except FileExistsError:
+        try:
+            token = path.read_text(encoding="ascii").strip()
+        except (OSError, UnicodeDecodeError):
+            return None
+        if not re.fullmatch(r"[0-9a-f]{32}", token):
+            return None
+    except OSError:
+        return None
+    else:
+        token = secrets.token_hex(16)
+        with os.fdopen(fd, "w", encoding="ascii") as f:
+            f.write(token)
+    # Other users can list pipe and abstract socket names, so the name is a hash: the token stays secret.
+    # An abstract socket (Linux) has no path length limit and goes away with the process.
+    name = "locksmith-" + hashlib.sha256(token.encode()).hexdigest()[:32]
+    return (rf"\\.\pipe\{name}" if sys.platform == "win32" else "\0" + name), bytes.fromhex(token)
+
+
+MAX_HANDOVER = 4 << 20   # above any command line (Linux allows about 2 MiB, Windows 32K characters)
+
+
+def hand_over(where: tuple[str, bytes], paths: list[str], encrypt: bool) -> bool:
+    """Give the paths to the Locksmith already running there. False when none answers."""
+    import json
+    from multiprocessing import AuthenticationError
+    from multiprocessing.connection import Client
+    address, key = where
+    try:
+        with Client(address, authkey=key) as conn:   # bytes only: never pickle
+            conn.send_bytes(json.dumps({"paths": [os.path.abspath(p) for p in paths], "encrypt": encrypt}).encode())
+    except (OSError, EOFError, AuthenticationError):   # nobody listening, a stale socket, or a failed handshake
+        return False
+    return True
+
+
+def listen(where: tuple[str, bytes], on_paths) -> bool:
+    """Accept later launches in a background thread and call ``on_paths(paths, encrypt)`` from it.
+    False when listening fails: Locksmith then runs as before."""
+    import json
+    import threading
+    from multiprocessing import AuthenticationError
+    from multiprocessing.connection import Listener
+    address, key = where
+    try:
+        listener = Listener(address, authkey=key)
+    except OSError:
+        return False
+
+    def run():
+        while True:
+            try:
+                conn = listener.accept()
+            except (AuthenticationError, EOFError):   # not one of this user's launches, or it gave up
+                continue
+            except OSError:
+                listener.close()   # so later launches find nobody, rather than hang in the handshake
+                return
+            try:
+                with conn:
+                    msg = json.loads(conn.recv_bytes(MAX_HANDOVER))
+                paths, encrypt = msg["paths"], msg["encrypt"]
+            except (OSError, EOFError, ValueError, KeyError, TypeError, RecursionError):
+                continue
+            if isinstance(paths, list) and all(isinstance(p, str) for p in paths) and isinstance(encrypt, bool):
+                on_paths(paths, encrypt)
+    threading.Thread(target=run, daemon=True).start()
+    return True
+
+
 def _options(args: list[str]) -> list[str]:
     return args[:args.index("--")] if "--" in args else args
 
@@ -100,8 +185,26 @@ def main() -> int:
         and theme.refresh_system())
 
     paths, encrypt = command_line(sys.argv[1:])
+    where = instance_address()
+    if where and hand_over(where, paths, encrypt):
+        return 0   # the running Locksmith opens them: one copy at a time keeps keys.json whole
     win = MainWindow(paths, encrypt)
     win.show()
+    if where:
+        from PySide6.QtCore import QObject, Signal
+
+        class Handover(QObject):
+            received = Signal(list, bool)   # emitted from the listening thread, delivered on this one
+
+        def opened(more: list[str], enc: bool):
+            if more:
+                win.open_paths(more, enc)
+            win.showNormal()
+            win.raise_()
+            win.activateWindow()
+        win.handover = Handover()
+        win.handover.received.connect(opened)
+        listen(where, win.handover.received.emit)
     if linux:
         _refresh_integration()
     return app.exec()

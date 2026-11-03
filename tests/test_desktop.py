@@ -167,3 +167,21 @@ def test_qt_never_sees_the_file_names(tmp_path):
                          text=True, timeout=60)
     assert out.returncode == 0, out.stderr
     assert "plugdir" not in out.stderr
+
+
+def test_second_launch_hands_over(config_home, tmp_path):
+    """Two running copies would save their key lists over each other's: a later launch passes its paths to
+    the running one instead. Both sides prove they hold the private token; a launch without it is refused."""
+    import queue
+
+    from locksmith.app import hand_over, instance_address, listen
+    where = instance_address()
+    assert where == instance_address()          # the same address every start
+    assert not hand_over(where, ["x"], False)   # nobody running yet
+    got = queue.Queue()
+    assert listen(where, lambda paths, encrypt: got.put((paths, encrypt)))
+    assert hand_over(where, ["a.txt", str(tmp_path / "b")], True)
+    assert got.get(timeout=5) == ([os.path.abspath("a.txt"), str(tmp_path / "b")], True)
+    assert not hand_over((where[0], bytes(16)), ["evil"], False)   # wrong token: refused
+    assert hand_over(where, [], False) and got.get(timeout=5) == ([], False)   # still listening
+    assert got.empty()

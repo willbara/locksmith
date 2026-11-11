@@ -20,7 +20,7 @@ from .pages.tools import ToolsPage
 from .settings import settings
 from .theme import app_icon
 from .widgets import AnimatedStack, Sidebar, Toaster, clear_clipboard_secret
-from .workers import run_task
+from .workers import Task, run_task
 
 NAV = [("Encrypt", "lock"), ("Decrypt", "unlock"), ("Share", "share"), ("Keys", "key"),
        ("Tools", "tool"), ("-", ""), ("Settings", "settings")]
@@ -36,7 +36,7 @@ class MainWindow(QMainWindow):
         self.store = KeyStore()
         # Plaintext temporary files a killed run left behind are shredded in the background.
         scratch.enable(self.store.dir / "scratch.json")
-        run_task(lambda r, c: scratch.clean_leftovers())
+        self._cleanup = run_task(lambda r, c: scratch.clean_leftovers())
 
         root = QWidget()
         root.setObjectName("root")
@@ -129,6 +129,20 @@ class MainWindow(QMainWindow):
         return looks_encrypted(head) or age.is_age(head)
 
     def closeEvent(self, e):
+        # Qt ends the whole process, at once, when a thread is still running as the window goes away.
+        # So ask before stopping a job the user started, then let every thread end first: a cancelled
+        # job removes its unfinished output on the way out.
+        running = [t for t in (self._cleanup, *self.findChildren(Task)) if t.isRunning()]
+        if any(t is not self._cleanup for t in running) and not dialogs.confirm(
+                "Stop the running job?",
+                "A job is still running. If you quit now, it stops and its unfinished output is removed. "
+                "Items it already finished are kept.", ok="Stop and quit"):
+            e.ignore()
+            return
+        for t in running:
+            t.cancel()
+        for t in running:
+            t.wait(10_000)
         clear_clipboard_secret()
         super().closeEvent(e)
 

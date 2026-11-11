@@ -1495,3 +1495,16 @@ def test_a_failed_batch_shows_what_it_finished(tmp_path, window):
     assert any(a.startswith("ERROR") and "1 item finished before this" in a for a in window.asked)
     assert d.files.paths() == [str(tmp_path / "junk.locked")] and d.result_box.count() == 1
     assert (tmp_path / "a.txt").read_text() == "first" and not (tmp_path / "a.txt.locked").exists()
+
+
+def test_closing_the_window_asks_before_stopping_a_job(window, monkeypatch):
+    """Qt ends the process at once when a thread still runs as the window goes away."""
+    from locksmith.ui import dialogs
+    from locksmith.ui.workers import run_task
+    task = run_task(lambda report, cancel: cancel.wait(60), parent=window)
+    wait(task.isRunning)
+    monkeypatch.setattr(dialogs, "confirm", lambda title, *a, **k: (window.asked.append(title), False)[1])
+    assert not window.close() and window.isVisible() and task.isRunning()
+    monkeypatch.setattr(dialogs, "confirm", lambda title, *a, **k: True)
+    assert window.close() and not task.isRunning()
+    assert window.asked.count("Stop the running job?") == 1

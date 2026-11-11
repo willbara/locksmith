@@ -602,6 +602,10 @@ def _from_dict(cls, data):
     when = obj.created if cls is Identity else obj.added
     if isinstance(when, bool) or not isinstance(when, int):
         raise TypeError
+    if not 0 <= when < 1 << 33:
+        # Only ever shown: a time no clock can format (a damaged or edited file) must not stop the
+        # window from being built, and is no reason to reject the key.
+        setattr(obj, "created" if cls is Identity else "added", 0)
     if cls is Contact and not isinstance(obj.checked, bool):
         obj.checked = False   # only a confirmation sets it: anything else reads as not checked
     decode_public(obj.public) if cls is Identity else decode_recipient(obj.public)

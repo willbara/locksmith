@@ -2544,3 +2544,19 @@ def test_names_that_are_not_utf8_can_be_decrypted(tmp_path, folder):
 def test_strength_meter_reads_digits_that_are_not_numbers(pw):
     """"²".isdigit() is true but int("²abc") fails: the meter raised, and Encrypt did nothing."""
     assert tools.estimate_entropy(pw) > 0
+
+
+@pytest.mark.parametrize("when", [10 ** 20, -1, 1 << 40])
+def test_a_time_no_clock_can_show_is_dropped_not_the_key(tmp_path, when):
+    """The Keys page formats these times while the window is built: one from a damaged or edited
+    file stopped Locksmith from starting."""
+    store = keys.KeyStore(tmp_path)
+    ident = store.generate("me", post_quantum=False)
+    store.add_contact("them", keys.encode_public(X25519PrivateKey.generate().public_key().public_bytes_raw()))
+    data = json.loads((tmp_path / "keys.json").read_text(encoding="utf-8"))
+    data["identities"][0]["created"] = data["contacts"][0]["added"] = when
+    (tmp_path / "keys.json").write_text(json.dumps(data), encoding="utf-8")
+    store = keys.KeyStore(tmp_path)
+    assert not store.problem and store.identities[0].created == store.contacts[0].added == 0
+    assert store.unlocked_private_keys() == [ident.private_raw()]
+    time.strftime("%d %b %Y", time.localtime(store.identities[0].created))

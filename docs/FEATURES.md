@@ -21,7 +21,8 @@
 ## Privacy
 
 - **Defaults:** Padmé size padding, decoy recipient slots and padded metadata are on by default.
-- **Size padding:** Padmé, a block size, or the next power of two.
+- **Size padding:** Padmé, a block size, or the next power of two. Padding hides the size fully only
+  when compression is off ([SECURITY_MODEL.md](SECURITY_MODEL.md)).
 - **Decoy slots:** decoy recipient slots hide the approximate number of recipients
   ([FORMAT.md](FORMAT.md) section 3).
 - **Hidden file names:** the encrypted file gets a random name. The real name stays in the encrypted

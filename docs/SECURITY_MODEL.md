@@ -43,7 +43,10 @@ Some data about a file is not encrypted. Without a key, anyone can see:
 - the key-derivation settings, and if a keyfile is necessary,
 - if the file is signed (but not who signed it),
 - a range for the length of the metadata,
-- the size after padding.
+- the size after padding,
+- for a compressed file, the number of chunks. This shows the size of the original to the nearest
+  chunk (1 MiB by default). Size padding does not hide this. To hide the size fully, set Compression to
+  None.
 
 [FORMAT.md](FORMAT.md) section 19 gives the full list.
 

@@ -234,7 +234,10 @@ any signature frames. Rules a reader enforces: everything after `block` is zero 
 a compressed frame needs a codec. Writers compress a block only when that makes it smaller, emit at
 least one content frame (empty content is one raw frame with an empty block), and add padding (zero
 bytes in the last content frame, then padding frames) to reach the chosen padded size. Padding is
-computed over the content only, so a signature adds its own fixed size on top.
+computed over the content only, so a signature adds its own fixed size on top. Padding is computed
+after compression, and each chunk of the original stays one frame. Thus the number of content frames
+of a compressed file shows the size of the original to the nearest chunk, whatever the padding
+(section 19). To hide the size, a writer must not compress.
 
 Codecs: `zstd` (Zstandard frame), `zlib` (RFC 1950), `lzma` (`.xz` container, dictionary within
 128 MiB of decoder memory), `bz2`.
@@ -599,8 +602,11 @@ password, a keyfile or a private key:
   the KDF cost parameters (`p`) and if a keyfile is necessary (`kf`). An `ssh-rsa` slot shows the
   size of the RSA key. Decoy slots show only a range for each kind of recipient (section 3).
 - **The frames:** the number and the size of the frames. These show the content size after padding
-  (section 6). A signature uses its own frames, so the frame sizes show that a file is signed. They
-  do not show who signed it.
+  (section 6). When the content is compressed, the frames are smaller than a chunk, and their number
+  is the number of chunks in the original. Thus a compressed file shows the size of the original to
+  the nearest chunk (1 MiB by default), and how well each chunk compressed. Padding does not hide
+  this. A file that is not compressed shows only the padded size. A signature uses its own frames, so
+  the frame sizes show that a file is signed. They do not show who signed it.
 - **Outside the file:** the file name on the disk (random when the name is hidden), the file times
   that the file system keeps, and the header of a recovery file (section 17).
 

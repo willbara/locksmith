@@ -152,7 +152,9 @@ class EncryptPage(Page):
             Field("Compression", self.comp, "Automatic skips already-compressed files."),
             Field("Compression level", self.level),
             Field("Chunk size", self.chunk),
-            Field("Size padding", self.padding, "Hides the exact size of the original."),
+            Field("Size padding", self.padding,
+                  "Hides the exact size of the original. With compression on, the number of chunks still shows "
+                  "the size to the nearest chunk: set Compression to None to hide it fully."),
             Field("Worker threads", self.threads),
         ]
         for i, f in enumerate(fields):

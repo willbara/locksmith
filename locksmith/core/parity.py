@@ -409,41 +409,47 @@ def repair(path: Path, lpar: Path | None = None, progress: Progress | None = Non
     report = _Checker(progress, cancel)
     good_parity = _good_parity(path, rec, lpar_path)
     damaged = set(result.damaged)
-    fixed: dict[int, bytes] = {}
     stripes = sorted({lay.stripe_of(b)[0] for b in damaged})
-    with open(path, "rb") as f, open(lpar_path, "rb") as p:
-        for done, j in enumerate(stripes):
-            report(done / len(stripes), "Repairing")
-            members = [t * lay.stripes + j for t in range(lay.k)]
-            lost = [t for t, b in enumerate(members) if b in damaged]
-            rows = [i for i in range(lay.m) if good_parity[j * lay.m + i]][:len(lost)]
-            syndromes = []
-            for i in rows:
-                p.seek(rec.parity_start + (j * lay.m + i) * lay.block)
-                s = int.from_bytes(p.read(lay.block), "big")
-                for t, b in enumerate(members):
-                    if t not in lost:
-                        s ^= _scale(_read_block(f, lay, b), coefficient(i, t, lay.m))
-                syndromes.append(s)
-            inverse = _solve([[coefficient(i, t, lay.m) for t in lost] for i in rows])
-            for a, t in enumerate(lost):
-                value = 0
-                for r, s in enumerate(syndromes):
-                    c = inverse[a][r]
-                    if c:
-                        value ^= _scale(s.to_bytes(lay.block, "big"), c)
-                fixed[members[t]] = value.to_bytes(lay.block, "big")
     tmp = temp_path(path.parent)
     whole = hashlib.sha256()
     try:
-        with open(path, "rb") as f, create_private(tmp) as out:
-            for b in range(lay.blocks):
-                want = min(lay.block, lay.size - b * lay.block)
-                blk = fixed[b][:want] if b in fixed else _read_block(f, lay, b)[:want]
-                whole.update(blk)
-                out.write(blk)
+        with open(path, "rb") as f, open(lpar_path, "rb") as p, create_private(tmp) as out:
+            # A copy of the file as it is, at the size it should have. Each rebuilt block is then
+            # written over its damaged one as soon as its stripe is solved, so memory holds a few
+            # blocks at a time however large the damage is.
+            left = lay.size
+            while left > 0:
+                piece = f.read(min(left, 4 << 20)) or bytes(min(left, 4 << 20))   # zeros past a truncated end
+                out.write(piece)
+                left -= len(piece)
+            for done, j in enumerate(stripes):
+                report(done / len(stripes), "Repairing")
+                members = [t * lay.stripes + j for t in range(lay.k)]
+                lost = [t for t, b in enumerate(members) if b in damaged]
+                rows = [i for i in range(lay.m) if good_parity[j * lay.m + i]][:len(lost)]
+                syndromes = []
+                for i in rows:
+                    p.seek(rec.parity_start + (j * lay.m + i) * lay.block)
+                    s = int.from_bytes(p.read(lay.block), "big")
+                    for t, b in enumerate(members):
+                        if t not in lost:
+                            s ^= _scale(_read_block(f, lay, b), coefficient(i, t, lay.m))
+                    syndromes.append(s)
+                inverse = _solve([[coefficient(i, t, lay.m) for t in lost] for i in rows])
+                for a, t in enumerate(lost):
+                    value = 0
+                    for r, s in enumerate(syndromes):
+                        c = inverse[a][r]
+                        if c:
+                            value ^= _scale(s.to_bytes(lay.block, "big"), c)
+                    b = members[t]
+                    out.seek(b * lay.block)
+                    out.write(value.to_bytes(lay.block, "big")[:min(lay.block, lay.size - b * lay.block)])
             out.flush()
             os.fsync(out.fileno())
+        with open(tmp, "rb") as f:
+            while piece := f.read(4 << 20):
+                whole.update(piece)
         if whole.digest() != rec.sha256:
             raise LocksmithError("The repair didn't reproduce the original file, so nothing was changed.")
         _check_still_encrypted(path, tmp)

@@ -1392,3 +1392,79 @@ def test_adding_a_passphrase_says_earlier_copies_stay_unprotected(window, monkey
     window.keys._set_passphrase(ident)
     wait(lambda: infos)
     assert infos == ["Earlier copies aren't protected"] and ident.is_locked
+
+
+def test_shredding_keeps_a_photo_that_lost_more_than_metadata(tmp_path, window, monkeypatch):
+    """Metadata removal drops what follows the image (a motion photo's video). The encrypted copy then
+    isn't the whole original, so that original is not shredded, and the user is told."""
+    from PySide6.QtCore import QBuffer, QIODevice
+    from PySide6.QtGui import QImage
+
+    from locksmith.ui import dialogs
+    told = []
+    monkeypatch.setattr(dialogs, "info", lambda title, *a, **k: told.append(title))
+    img = QImage(8, 8, QImage.Format.Format_RGB32)
+    img.fill(0x336699)
+    buf = QBuffer()
+    buf.open(QIODevice.OpenModeFlag.WriteOnly)
+    assert img.save(buf, "JPG")
+    plain, motion = tmp_path / "plain.jpg", tmp_path / "motion.jpg"
+    plain.write_bytes(bytes(buf.data()))
+    motion.write_bytes(bytes(buf.data()) + b"ftypmp42" + os.urandom(5000))
+    e = window.encrypt
+    e.add_paths([str(plain), str(motion)])
+    _set_password(e)
+    e.strip.setChecked(True)
+    e.shred.setChecked(True)
+    e.output._dir = str(tmp_path / "out")
+    e.output._rebuild()
+    e.go.click()
+    wait(lambda: e.task is None)
+    assert len(list((tmp_path / "out").glob("*.locked"))) == 2
+    assert not plain.exists() and motion.exists()
+    assert told == ["Some originals were not shredded"]
+
+
+def test_verify_only_writes_nothing_for_a_pasted_age_message(tmp_path, window, monkeypatch):
+    from locksmith.core import age
+    from locksmith.ui import dialogs
+    src = tmp_path / "blob.bin"
+    src.write_bytes(os.urandom(2000))   # not text: decrypting it would save a file
+    armored = age.encrypt_paths([src], tmp_path / "enc", [], "pw", armored=True, work_factor=10).read_text()
+    monkeypatch.setattr(dialogs, "text_input", lambda *a, **k: armored)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+    d = window.decrypt
+    d.paste_text()
+    d.password.setText("pw")
+    d.verify_only.setChecked(True)
+    d.output._dir = str(tmp_path / "dec")
+    d.output._rebuild()
+    d.go.click()
+    wait(lambda: d.task is None)
+    assert not any(a.startswith("ERROR") for a in window.asked), window.asked
+    assert not (tmp_path / "dec").exists() and not list((tmp_path / "home").iterdir())
+
+
+def test_new_recovery_data_never_replaces_what_can_still_repair(tmp_path, window, monkeypatch):
+    """Recovery data made from a damaged file can't bring the original back, so the old data stays."""
+    from PySide6.QtWidgets import QFileDialog
+
+    from locksmith.core import parity
+    t = window.tools
+    f = tmp_path / "archive.bin"
+    f.write_bytes(os.urandom(200_000))
+    side = parity.create(f, "1")
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: (str(f), ""))
+    t._rc_create()   # the file is intact: its recovery data may be made again (here at another level)
+    wait(lambda: t.rc_result.text().startswith("✓"))
+    wait(lambda: t._rc_task is None)
+    good = side.read_bytes()
+    assert parity.read_recovery(side).lay.m == 4
+    damaged = bytearray(f.read_bytes())
+    damaged[5000:5100] = bytes(100)
+    f.write_bytes(bytes(damaged))
+    t._rc_create()
+    wait(lambda: t.rc_result.text().startswith("✕"))
+    wait(lambda: t._rc_task is None)
+    assert side.read_bytes() == good and "Check or repair" in t.rc_detail.text()

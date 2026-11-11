@@ -472,6 +472,9 @@ class DecryptPage(Page):
         if verify and blob is None:
             res = age.verify_path(Path(p), akeys, progress, cancel)
             return ("verified", p, {**res.meta, "_signature": None})
+        if verify:   # a pasted message: checked in memory, then dropped. Nothing is written or shown.
+            age.decrypt_bytes(blob, akeys, engine.MAX_ARMOR_INPUT)
+            return ("verified", p, {"name": "Pasted age message", "format": "age", "_signature": None})
         if blob is not None:
             res = age.decrypt_pasted(blob, DecryptPage._paste_output(out_dir), akeys, engine.MAX_ARMOR_INPUT)
             if res.path is None:

@@ -360,3 +360,17 @@ def test_colour_profiles_are_kept_without_device_details(tmp_path):
         if kept:
             start = out.index(b"ICCP") + 8
             _icc_ok(out[start:start + len(profile)])
+
+
+def test_data_after_the_image_is_counted(tmp_path):
+    """A motion photo's video or an HDR layer sits after the image. It is dropped with the metadata, but it
+    is content: the count lets the caller say so and keep the original."""
+    jpg, _ = _image("JPG")
+    png, _ = _image("PNG")
+    video = b"\x00\x00\x00\x18ftypmp42" + bytes(4000)
+    out, stats = _roundtrip(tmp_path, "motion.jpg", jpg + video)
+    assert stats == {"stripped": 1, "trailing": 1} and out.endswith(b"\xff\xd9")
+    assert _roundtrip(tmp_path, "extra.png", png + video)[1] == {"stripped": 1, "trailing": 1}
+    assert _roundtrip(tmp_path, "padded.jpg", jpg + bytes(16))[1] == {"stripped": 1}   # padding isn't content
+    (tmp_path / "plain.jpg").write_bytes(jpg)
+    assert metadata.plan_for(tmp_path / "plain.jpg").trailing == 0

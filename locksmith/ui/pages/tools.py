@@ -9,7 +9,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QFileDialog, QSlider
 
 from ...core import keys, minisign, openpgp, parity, signing, sshsig, tools
-from ...core.errors import LocksmithError
+from ...core.errors import CancelledError, LocksmithError
 from ...core.keys import write_secret_file
 from ...core.osutil import is_link
 from .. import dialogs
@@ -858,9 +858,36 @@ class ToolsPage(Page):
                 ok="Save recovery data anyway", icon="alert"):   # audit B2
             return
         level = self.rc_level.value()
-        self._rc_run(lambda r, c: parity.create(Path(path), level, progress=r, cancel=c),
-                     lambda out: (self.rc_result.setText(f"✓  Saved {out.name}"),
-                                  self.rc_detail.setText(f"{human_size(out.stat().st_size)} of recovery data.")))
+        side = Path(path + parity.EXTENSION)
+
+        def create():
+            self._rc_run(lambda r, c: parity.create(Path(path), level, progress=r, cancel=c),
+                         lambda out: (self.rc_result.setText(f"✓  Saved {out.name}"),
+                                      self.rc_detail.setText(f"{human_size(out.stat().st_size)} of recovery data.")))
+
+        def check(r, c):
+            try:
+                return parity.check(Path(path), side, progress=r, cancel=c).intact
+            except CancelledError:
+                raise
+            except LocksmithError:
+                return True   # recovery data that can't be read can't repair anything: replace it
+
+        def checked(intact):
+            if intact:
+                create()
+                return
+            # New recovery data is made from the file as it is now. If the file is damaged, replacing the
+            # old data would throw away the only thing that can still bring the original back.
+            self.rc_result.setText("✕  The old recovery data was kept")
+            self.rc_detail.setText(
+                f"{Path(path).name} no longer matches {side.name}, the recovery data it already has. If the file "
+                "is damaged, use “Check or repair…” first. If you changed the file yourself, delete "
+                f"{side.name} and create recovery data again.")
+        if side.is_file():
+            self._rc_run(check, checked)
+        else:
+            create()
 
     def _rc_repair(self):
         path, _ = QFileDialog.getOpenFileName(self, "Choose the file to check")
@@ -923,7 +950,11 @@ class ToolsPage(Page):
         path, _ = QFileDialog.getSaveFileName(self, "Save keyfile", "locksmith.key")
         if not path:
             return
-        write_secret_file(Path(path), os.urandom(self.kf_size.value()))
+        try:
+            write_secret_file(Path(path), os.urandom(self.kf_size.value()))
+        except OSError as e:
+            dialogs.error(f"The keyfile could not be saved: {e.strerror or e}")
+            return
         toast("Keyfile created", "key")
 
     # ── shred ──

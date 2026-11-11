@@ -85,7 +85,9 @@ def compose_email(subject: str, body: str, attachment: Path) -> bool:
         os.startfile(f"mailto:?{query}")
         reveal(attachment)
         return False
-    if not launch(["xdg-email", "--subject", subject, "--body", body, "--attach", str(Path(attachment).resolve())]):
+    # launch only says that systemd started something, so look for the program first.
+    if not shutil.which("xdg-email", path=clean_env().get("PATH")) or \
+            not launch(["xdg-email", "--subject", subject, "--body", body, "--attach", str(Path(attachment).resolve())]):
         raise OSError("xdg-email is not available")
     return True
 

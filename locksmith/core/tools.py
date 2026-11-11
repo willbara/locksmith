@@ -26,6 +26,7 @@ from .osutil import (
     inherit_zone_identifier,
     is_link,
     open_new,
+    temp_path,
     windows_unsafe,
 )
 
@@ -222,6 +223,8 @@ def strength_label(bits: float) -> tuple[int, str]:
 
 
 def crack_time(bits: float, guesses_per_sec: float = 1e10) -> str:
+    if bits > 1000:   # 2 ** bits no longer fits in a float
+        return "longer than the universe has existed"
     seconds = 2 ** max(bits - 1, 0) / guesses_per_sec
     for unit, size in (("centuries", 3.15e9), ("years", 3.15e7), ("days", 86400),
                        ("hours", 3600), ("minutes", 60)):
@@ -725,10 +728,14 @@ def split_file(path: Path, part_size: int, out_dir: Path | None = None) -> list[
     parts = []
     with open(path, "rb") as f:
         n = 1
-        while block := f.read(part_size):
+        while block := f.read(min(part_size, 4 << 20)):
             part = out_dir / f"{path.name}.part{n:03d}"
             with os.fdopen(open_new(part), "wb") as out:  # never overwrites or follows a link
-                out.write(block)
+                left = part_size
+                while block:   # in pieces: a part can be 2 GB
+                    out.write(block)
+                    left -= len(block)
+                    block = f.read(min(left, 4 << 20))
             copy_zone_identifier(path, part)
             parts.append(part)
             n += 1
@@ -768,7 +775,7 @@ def join_parts(parts: list[Path], out_dir: Path | None = None) -> Path:
     target = unique_path(out_dir / base)
     # Build under a temporary name, so a failed join never leaves a truncated file
     # under the real name.
-    tmp = out_dir / f".{base}.{secrets.token_hex(4)}.part"
+    tmp = temp_path(out_dir)
     try:
         with os.fdopen(open_new(tmp), "wb") as out:
             for p in parts:

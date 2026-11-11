@@ -30,7 +30,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import secrets
 import stat
 import struct
 import threading
@@ -166,7 +165,7 @@ def create(path: Path, level: str = "5", out: Path | None = None, progress: Prog
            cancel: threading.Event | None = None) -> Path:
     """Write recovery data for ``path`` to ``out`` (by default ``path`` + ``.lpar``)."""
     from .engine import create_private
-    from .osutil import fsync_dir
+    from .osutil import fsync_dir, temp_path
     path = Path(path)
     out = Path(out) if out else path.with_name(path.name + EXTENSION)
     report = _Checker(progress, cancel)
@@ -178,7 +177,7 @@ def create(path: Path, level: str = "5", out: Path | None = None, progress: Prog
         data_hashes: list[bytes] = [b""] * n
         parity_hashes: list[bytes] = [b""] * (S * m)
         whole = hashlib.sha256()
-        tmp = out.with_name(f".{out.name}.{secrets.token_hex(4)}.part")
+        tmp = temp_path(out.parent)
         per_pass = max(1, PASS_MEMORY // (m * B))
         meta_len = None
         try:
@@ -296,7 +295,7 @@ def read_recovery(path: Path) -> Recovery:
         copies = []
         f.seek(0)
         head = f.read(12)
-        if head[:8] == MAGIC:
+        if len(head) == 12 and head[:8] == MAGIC:
             (n,) = struct.unpack(">I", head[8:12])
             if n <= MAX_META and 12 + n + 32 <= total:
                 copies.append((f.read(n), f.read(32), 12 + n + 32))
@@ -395,7 +394,7 @@ def repair(path: Path, lpar: Path | None = None, progress: Progress | None = Non
     the damaged original is kept beside it as ``name.damaged``. Nothing changes when the damage is
     more than the recovery data can repair."""
     from .engine import create_private, unique_path
-    from .osutil import copy_zone_identifier, fsync_dir
+    from .osutil import copy_zone_identifier, fsync_dir, temp_path
     path = Path(path)
     lpar_path = Path(lpar) if lpar else path.with_name(path.name + EXTENSION)
     result = check(path, lpar_path, progress, cancel)
@@ -434,7 +433,7 @@ def repair(path: Path, lpar: Path | None = None, progress: Progress | None = Non
                     if c:
                         value ^= _scale(s.to_bytes(lay.block, "big"), c)
                 fixed[members[t]] = value.to_bytes(lay.block, "big")
-    tmp = path.with_name(f".{path.name}.{secrets.token_hex(4)}.part")
+    tmp = temp_path(path.parent)
     whole = hashlib.sha256()
     try:
         with open(path, "rb") as f, create_private(tmp) as out:

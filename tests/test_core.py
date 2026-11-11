@@ -223,7 +223,6 @@ def test_new_files_use_the_locksmith_format(tmp_path):
     src.write_text("new")
     enc = engine.encrypt_paths([src], tmp_path / "e", EncryptOptions(password="p", **FAST))
     assert enc.name == "a.txt.locked" and enc.read_bytes().startswith(b"LOCKED\x00\x02")
-    assert engine.inspect(enc).format_name == "Locksmith"
     foreign = tmp_path / "old.cryptor"
     foreign.write_bytes(b"CRYPTOR\x01" + enc.read_bytes()[8:])
     with pytest.raises(CorruptedError, match="not a Locksmith file"):

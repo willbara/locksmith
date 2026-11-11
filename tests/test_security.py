@@ -2454,3 +2454,64 @@ def test_stripping_metadata_leaves_out_when_the_file_was_made():
         res = engine.decrypt_bytes(blob, DecryptKeys(password="pw", verifiers=verifiers))
         assert res.signature.verified
         assert ("created" in res.meta) is not strip and (res.signature.created == 0) is strip
+
+
+def test_bundle_refuses_two_items_with_the_same_name(tmp_path):
+    """Both would be stored under one name, and decryption keeps only the first: with the originals
+    shredded, the second would be gone."""
+    from locksmith.core import age
+    for folder in ("a", "b"):
+        (tmp_path / folder).mkdir()
+    first, second = tmp_path / "a" / "notes.txt", tmp_path / "b" / "Notes.txt"   # case alone isn't enough
+    first.write_text("first", encoding="utf-8")
+    second.write_text("second", encoding="utf-8")
+    opts = EncryptOptions(password="pw", **FAST)
+    for encrypt in (lambda paths: engine.encrypt_paths(paths, tmp_path / "out", opts),
+                    lambda paths: age.encrypt_paths(paths, tmp_path / "out", [], "pw", work_factor=10)):
+        with pytest.raises(LocksmithError, match="same name"):
+            encrypt([first, second])
+    assert not (tmp_path / "out").exists()
+    engine.encrypt_paths([first, tmp_path / "b"], tmp_path / "out", opts)   # different names: fine
+
+
+def test_a_long_file_name_can_be_encrypted(tmp_path):
+    """The temporary file's name is short, so it fits wherever the final name does."""
+    src = tmp_path / ("é" * 120 + ".txt")   # 244 bytes: 251 with ".locked", of the 255 a name may have
+    try:
+        src.write_text("x", encoding="utf-8")
+    except OSError:
+        pytest.skip("this file system holds shorter names only")
+    out = engine.encrypt_paths([src], tmp_path / "out", EncryptOptions(password="pw", **FAST))
+    assert out.name == src.name + ".locked"
+    assert engine.decrypt_path(out, tmp_path / "dec", PW).path.read_text(encoding="utf-8") == "x"
+
+
+def test_new_identity_is_dropped_when_it_cannot_be_saved(tmp_path, monkeypatch):
+    """An identity that exists only in memory could be chosen as a recipient; its key is gone after a restart."""
+    other = keys.KeyStore(tmp_path / "other")
+    backup = tmp_path / "backup.json"
+    other.export_identity(other.generate("theirs"), backup)
+    store = keys.KeyStore(tmp_path / "mine")
+
+    def full(*a, **k):
+        raise OSError(errno.ENOSPC, "No space left on device")
+    monkeypatch.setattr(keys, "write_secret_file", full)
+    with pytest.raises(OSError):
+        store.generate("new")
+    with pytest.raises(OSError):
+        store.import_identity(backup)
+    assert store.identities == []
+
+
+def test_split_copies_a_large_part_in_pieces(tmp_path):
+    data = os.urandom((9 << 20) + 123)
+    src = tmp_path / "big.locked"
+    src.write_bytes(data)
+    parts = tools.split_file(src, (5 << 20) + 1)
+    assert [p.stat().st_size for p in parts] == [(5 << 20) + 1, (4 << 20) + 122]
+    assert b"".join(p.read_bytes() for p in parts) == data
+
+
+def test_crack_time_of_a_very_long_password():
+    assert tools.crack_time(5000) == "longer than the universe has existed"
+    assert tools.crack_time(tools.estimate_entropy("x9$Kq7!bZ" * 60))   # never raises

@@ -671,8 +671,17 @@ class KeyStore:
                          created=int(time.time()))
         self._store_private(ident, raw, passphrase)
         self._remember_verify(ident, raw)
+        return self._add(ident)
+
+    def _add(self, ident: Identity) -> Identity:
+        """Add a new identity and save it. If the save fails, it is taken out again: an identity that
+        exists only in memory can be chosen as a recipient, and its private key is gone after a restart."""
         self.identities.append(ident)
-        self.save()
+        try:
+            self.save()
+        except BaseException:
+            self.identities.remove(ident)
+            raise
         return ident
 
     def upgrade(self, ident: Identity, passphrase: str | None = None) -> Identity:
@@ -854,9 +863,7 @@ class KeyStore:
         # Protected keys are checked against their public key when first unlocked.
         if any(i.public == ident.public for i in self.identities):
             raise LocksmithError("That identity is already imported.")
-        self.identities.append(ident)
-        self.save()
-        return ident
+        return self._add(ident)
 
     def restore(self, name: str, raw: bytes, passphrase: str | None = None) -> Identity:
         """Add an identity rebuilt from a raw private key (backup words or shares)."""
@@ -869,13 +876,7 @@ class KeyStore:
         ident = Identity(name=name.strip() or "Restored key", public=public, created=int(time.time()))
         self._store_private(ident, raw, passphrase)
         self._remember_verify(ident, raw)
-        self.identities.append(ident)
-        try:
-            self.save()
-        except BaseException:
-            self.identities.remove(ident)
-            raise
-        return ident
+        return self._add(ident)
 
     def unlocked_private_keys(self) -> list[bytes]:
         keys = []

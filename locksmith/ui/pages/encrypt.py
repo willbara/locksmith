@@ -174,7 +174,8 @@ class EncryptPage(Page):
         self.strip = ToggleRow("Remove photo metadata",
                                "Strips location, camera, date and editing details from JPEG, PNG and WebP "
                                "images, plus file times, owner names and when the file was encrypted, without "
-                               "touching image quality. "
+                               "touching image quality. Anything stored after the image is removed too, such as "
+                               "the video of a motion photo or an HDR layer. "
                                "Originals are not changed. Other formats are encrypted as they are.",
                                settings["strip_metadata"])
         self.shred = ToggleRow("Shred originals",
@@ -394,46 +395,38 @@ class EncryptPage(Page):
                 return
             work_factor = {"fast": 16, "balanced": 18, "strong": 19, "paranoid": 20}[opts.preset]
 
-        def work_age(report, cancel):
-            outputs, stats = [], {}
-            n = len(groups)
-            for i, group in enumerate(groups):
-                def sub(frac, stage, i=i):
-                    report(None if frac is None else (i + frac) / n,
-                           stage + (f"  ·  {i + 1} of {n}" if n > 1 else ""))
-                outputs.append(age.encrypt_paths(group, out_dir, age_recipients, opts.password, opts.armor,
-                                                 progress=sub, cancel=cancel, verify=shred, work_factor=work_factor,
-                                                 strip=opts.strip_metadata, hide_name=opts.hide_name, stats=stats))
-                if recovery:
-                    parity.create(outputs[-1], "5", progress=sub, cancel=cancel)
-                if shred:
-                    for p in group:
-                        report(None, f"Shredding {p.name}")
-                        tools.shred(p, cancel=cancel, recovery_data=True)
-            return outputs, stats
-
         def work(report, cancel):
-            if is_age:
-                return work_age(report, cancel)
-            ident, passphrase = signer
-            # Unlocking may run Argon2id, so it happens here, off the UI thread.
-            opts.signer = ident.private_raw(passphrase) if ident else None
-            outputs, stats = [], {}
+            if not is_age:
+                ident, passphrase = signer
+                # Unlocking may run Argon2id, so it happens here, off the UI thread.
+                opts.signer = ident.private_raw(passphrase) if ident else None
+            outputs, stats, kept = [], {}, []
             n = len(groups)
             for i, group in enumerate(groups):
                 def sub(frac, stage, i=i):
                     report(None if frac is None else (i + frac) / n,
                            stage + (f"  ·  {i + 1} of {n}" if n > 1 else ""))
-                # Shredding requires proof the encrypted copy on disk is intact.
-                outputs.append(engine.encrypt_paths(group, out_dir, opts, progress=sub, cancel=cancel,
-                                                    verify=shred, stats=stats))
+                trailing = stats.get("trailing", 0)
+                # Shredding requires proof the encrypted copy on disk is intact (verify).
+                if is_age:
+                    out = age.encrypt_paths(group, out_dir, age_recipients, opts.password, opts.armor,
+                                            progress=sub, cancel=cancel, verify=shred, work_factor=work_factor,
+                                            strip=opts.strip_metadata, hide_name=opts.hide_name, stats=stats)
+                else:
+                    out = engine.encrypt_paths(group, out_dir, opts, progress=sub, cancel=cancel, verify=shred,
+                                               stats=stats)
+                outputs.append(out)
                 if recovery:
-                    parity.create(outputs[-1], "5", progress=sub, cancel=cancel)
-                if shred:
+                    parity.create(out, "5", progress=sub, cancel=cancel)
+                if shred and stats.get("trailing", 0) > trailing:
+                    # Metadata removal cut data stored after an image (a motion photo's video, an HDR
+                    # layer): the encrypted copy isn't all the original holds, so the original stays.
+                    kept += group
+                elif shred:
                     for p in group:
                         report(None, f"Shredding {p.name}")
                         tools.shred(p, cancel=cancel, recovery_data=True)
-            return outputs, stats
+            return outputs, stats, kept
 
         self._clear_results()
         self.progress.start()
@@ -469,7 +462,7 @@ class EncryptPage(Page):
         self._update_state()
 
     def _done(self, result):
-        outputs, stats = result
+        outputs, stats, kept = result
         self._finish()
         self.files.clear()
         self.password.clear()
@@ -480,9 +473,21 @@ class EncryptPage(Page):
             msg = f"Metadata removed from {done} image{'s' if done != 1 else ''}"
             if same:
                 msg += f". {same} other file{'s' if same != 1 else ''} kept as-is (format not supported)"
-            toast(msg, "shield", 5000)
+            extra = stats.get("trailing", 0)
+            if extra:
+                msg += (f". {extra} image{'s' if extra != 1 else ''} also held data after the picture (such as a "
+                        "motion photo's video or an HDR layer), which was removed too")
+            toast(msg, "shield", 7000 if extra else 5000)
         for out in outputs:
             self._add_result(out)
+        if kept:
+            dialogs.info(
+                "Some originals were not shredded",
+                "Metadata removal also took out data stored after the picture in some images, such as the video "
+                "of a motion photo or an HDR layer. The encrypted copy doesn't hold that data, so these originals "
+                "were kept: " + ", ".join(tools.display_text(p.name, 80) for p in kept[:5])
+                + ("…" if len(kept) > 5 else "") + ". To keep everything, encrypt them again with “Remove photo "
+                "metadata” off. To accept the loss, shred them in Tools.", icon="alert")
 
     def _failed(self, msg, _kind=""):
         self._finish()

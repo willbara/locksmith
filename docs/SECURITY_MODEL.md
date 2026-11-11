@@ -83,7 +83,9 @@ identity with a passphrase (Argon2id + AES-GCM).
 Only one copy of Locksmith runs at a time. When you start it again, for example from the file manager,
 the new copy gives its files to the open window and stops. This prevents two copies from writing
 `keys.json` at the same time. The file `instance` holds a random token. The two copies use it to
-identify each other, so another user cannot receive the names of your files.
+identify each other, so another user cannot receive the names of your files. On Linux, the two copies
+connect through a socket file in a folder that only you can open (the runtime folder of your session,
+or the config folder). Thus another user cannot connect to it or prevent the start of Locksmith.
 
 ## Limits
 

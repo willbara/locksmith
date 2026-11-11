@@ -169,17 +169,34 @@ def test_qt_never_sees_the_file_names(tmp_path):
     assert "plugdir" not in out.stderr
 
 
-def test_second_launch_hands_over(config_home, tmp_path):
+def test_second_launch_hands_over(config_home, tmp_path, monkeypatch):
     """Two running copies would save their key lists over each other's: a later launch passes its paths to
-    the running one instead. Both sides prove they hold the private token; a launch without it is refused."""
+    the running one instead. Both sides prove they hold the private token; a launch without it is refused.
+    Only one copy ever listens, also when several start at once."""
     import queue
+    import tempfile
+    from multiprocessing.util import Finalize
 
     from locksmith.app import hand_over, instance_address, listen
+    runtime = Path(tempfile.mkdtemp(prefix="ls-"))   # private, and short: a socket path holds about 100 characters
+    # Removed when the tests end, after the listener (which lives that long) has removed its socket.
+    Finalize(None, shutil.rmtree, args=(runtime, True), exitpriority=-1)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
     where = instance_address()
     assert where == instance_address()          # the same address every start
     assert not hand_over(where, ["x"], False)   # nobody running yet
+    if sys.platform != "win32":
+        import socket
+        assert Path(where[0]).parent == runtime   # a folder only this user can enter
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "missing"))
+        assert Path(instance_address()[0]).parent == config_home / "locksmith"   # no runtime folder: the config folder
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+        with socket.socket(socket.AF_UNIX) as stale:   # what a killed copy leaves behind
+            stale.bind(where[0])
+        assert not hand_over(where, ["x"], False)
     got = queue.Queue()
     assert listen(where, lambda paths, encrypt: got.put((paths, encrypt)))
+    assert listen(where, lambda paths, encrypt: got.put("second listener")) is False   # the first one keeps it
     assert hand_over(where, ["a.txt", str(tmp_path / "b")], True)
     assert got.get(timeout=5) == ([os.path.abspath("a.txt"), str(tmp_path / "b")], True)
     assert not hand_over((where[0], bytes(16)), ["evil"], False)   # wrong token: refused

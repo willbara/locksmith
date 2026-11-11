@@ -74,6 +74,7 @@ from .osutil import (
     mark_untrusted,
     open_new,
     portable_name,
+    temp_path,
     windows_unsafe,
 )
 
@@ -82,16 +83,14 @@ from .osutil import (
 class Format:
     """A file format profile: its signature and the labels that domain-separate
     every derived key. A future format version adds a profile here."""
-    name: str
     magic: bytes            # 8 bytes at the start of the file
     version: int            # must match the header's "v"
     label: bytes            # prefix for every HKDF / AEAD label
     hybrid_label: bytes
-    allows_hybrid: bool
 
 
-LOCKED_V1 = Format("Locksmith", b"LOCKED\x00\x01", 1, b"locksmith/v1/", b"locksmith/v1/x25519-mlkem768", True)
-LOCKED_V2 = Format("Locksmith", b"LOCKED\x00\x02", 2, b"locksmith/v2/", b"locksmith/v2/x25519-mlkem768", True)
+LOCKED_V1 = Format(b"LOCKED\x00\x01", 1, b"locksmith/v1/", b"locksmith/v1/x25519-mlkem768")
+LOCKED_V2 = Format(b"LOCKED\x00\x02", 2, b"locksmith/v2/", b"locksmith/v2/x25519-mlkem768")
 FORMATS = {f.magic: f for f in (LOCKED_V1, LOCKED_V2)}
 WRITE_FORMAT = LOCKED_V2
 MAGIC = WRITE_FORMAT.magic
@@ -197,7 +196,6 @@ class FileInfo:
     recipient_slots: int
     needs_keyfile: bool
     header_size: int
-    format_name: str = "Locksmith"
     post_quantum_slots: int = 0
     format_version: int = 2
 
@@ -777,7 +775,7 @@ def _check_header(h: dict, fmt: Format):
             kdfmod.validate(slot["kdf"], slot["p"])
         elif kind == "x25519":
             _b64len(slot["epk"], X25519_LEN)
-        elif kind == HYBRID and fmt.allows_hybrid:
+        elif kind == HYBRID:
             _b64len(slot["epk"], X25519_LEN)
             _b64len(slot["kct"], MLKEM_CT_LEN)
         elif kind == SSH_RSA and fmt.version >= 2:
@@ -799,7 +797,6 @@ def _info_from_header(header: dict, raw: bytes, fmt: Format) -> FileInfo:
         post_quantum_slots=sum(1 for s in header["slots"] if s.get("t") == HYBRID),
         needs_keyfile=any(s.get("kf") for s in pw),
         header_size=len(raw),
-        format_name=fmt.name,
         format_version=fmt.version,
     )
 
@@ -1262,12 +1259,11 @@ class _TarStream(io.RawIOBase):
         info.mtime = int(time.time())
         if info.isreg():
             plan = metadata.plan_for(path)
+            metadata.tally(self._stats, plan)
             if plan is None:
-                self._stats["unchanged"] = self._stats.get("unchanged", 0) + 1
                 with open(path, "rb") as fh:
                     tar.addfile(info, fh)
             else:
-                self._stats["stripped"] = self._stats.get("stripped", 0) + 1
                 info.size = plan.size
                 with metadata.PlanReader(path, plan.plan) as fh:
                     tar.addfile(info, fh)
@@ -1337,6 +1333,16 @@ def check_sources(paths: list[Path], out_dir: Path | None) -> tuple[list[Path], 
             raise LocksmithError(f"{p.name} is a link. Add the file or folder it points to instead.")
         if not p.exists():
             raise LocksmithError(f"{p.name} no longer exists.")
+    # Several items go into one archive, each under its own name. Two with the same name (or names that
+    # differ only in case, which Windows and some drives don't tell apart) can't both be unpacked: the
+    # second would be left out, and it may be the only copy once the originals are shredded.
+    names: dict[str, Path] = {}
+    for p in paths:
+        other = names.setdefault(p.name.casefold(), p)
+        if other is not p:
+            raise LocksmithError(f"Two of the items have the same name: “{other.name}” in {other.parent} and "
+                                 f"“{p.name}” in {p.parent}. One archive can't hold both. Rename one, or "
+                                 "encrypt them separately.")
     out_dir = Path(out_dir) if out_dir else paths[0].parent
     resolved_out = out_dir.resolve()
     for p in paths:
@@ -1362,7 +1368,8 @@ def encrypt_paths(paths: list[Path], out_dir: Path | None, opts: EncryptOptions,
     delete the originals afterwards must pass ``verify=True``.
 
     With ``opts.strip_metadata``, ``stats`` (if given) receives counts of images
-    "stripped" and files left "unchanged" because their format is not supported.
+    "stripped" and files left "unchanged" because their format is not supported, and of images
+    that lost data stored after the image itself ("trailing", see ``metadata.tally``).
     """
     stats = stats if stats is not None else {}
     chk = _Checker(cancel, progress)
@@ -1380,10 +1387,8 @@ def encrypt_paths(paths: list[Path], out_dir: Path | None, opts: EncryptOptions,
         if strip:
             meta_extra.pop("mtime")
             plan = metadata.plan_for(src_path)
-            if plan is None:
-                stats["unchanged"] = stats.get("unchanged", 0) + 1
-            else:
-                stats["stripped"] = stats.get("stripped", 0) + 1
+            metadata.tally(stats, plan)
+            if plan is not None:
                 total = meta_extra["size"] = plan.size
                 opener = lambda: metadata.PlanReader(src_path, plan.plan)  # noqa: E731
     elif len(paths) == 1:
@@ -1405,7 +1410,7 @@ def encrypt_paths(paths: list[Path], out_dir: Path | None, opts: EncryptOptions,
 
     out_dir.mkdir(parents=True, exist_ok=True)
     target = unique_path(out_dir / _output_name(opts, name))
-    tmp = out_dir / f".{target.name}.{secrets.token_hex(4)}.part"
+    tmp = temp_path(out_dir)
 
     head = _build_header(opts, meta, chk)
     try:
@@ -1572,7 +1577,7 @@ def _decrypt_into(f: BinaryIO, total: int, header: dict, raw: bytes, k: _Keys, m
         _check_tarfile()   # before decrypting anything
     out_dir.mkdir(parents=True, exist_ok=True)
     name = safe_name(meta.get("name") or fallback_name)
-    tmp = out_dir / f".locksmith-{secrets.token_hex(6)}.part"
+    tmp = temp_path(out_dir)
     skipped: list[str] = []
     complete = True
     space = _DiskGuard(out_dir)
@@ -1595,12 +1600,16 @@ def _decrypt_into(f: BinaryIO, total: int, header: dict, raw: bytes, k: _Keys, m
                         # Unwrap the archive's top-level folder (stored under its original
                         # name, which may differ from the safe one). Only a real folder: a
                         # symlink moved out of staging would resolve against the output folder.
-                        inner = next((e for e in staging.iterdir() if safe_name(e.name) == name
-                                      and e.is_dir() and not e.is_symlink()), staging)
-                        os.replace(inner, target)
-                        # Anything stored beside the top-level folder is discarded: report it.
-                        if staging.exists():
-                            ext.skipped += sorted(e.name for e in staging.iterdir())
+                        try:
+                            inner = next((e for e in staging.iterdir() if safe_name(e.name) == name
+                                          and e.is_dir() and not e.is_symlink()), staging)
+                            os.replace(inner, target)
+                            # Anything stored beside the top-level folder is discarded: report it.
+                            if staging.exists():
+                                ext.skipped += sorted(e.name for e in staging.iterdir())
+                        except BaseException:
+                            scratch.discard(staging)   # plaintext: never left behind, unlisted
+                            raise
                         shutil.rmtree(staging, ignore_errors=True)
                 else:
                     ext = extract_archive(tmp, target, space=space)
@@ -1971,7 +1980,7 @@ def change_access(path: Path, keys: DecryptKeys, change: AccessChange, allow_loc
             raise LocksmithError("The change would make a file that can't be opened. Nothing was changed.") from e
         chk.check()
         chk.report(None, "Saving")
-        tmp = path.with_name(f".{path.name}.{secrets.token_hex(4)}.part")
+        tmp = temp_path(path.parent)
         try:
             if armored:
                 f.seek(start)

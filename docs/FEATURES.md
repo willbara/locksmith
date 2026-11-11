@@ -27,7 +27,9 @@
 - **Hidden file names:** the encrypted file gets a random name. The real name stays in the encrypted
   metadata.
 - **Photo metadata:** Locksmith can remove location, camera data and dates from JPEG, PNG and WebP
-  files without loss of image quality. It can also remove the file times.
+  files without loss of image quality. It can also remove the file times. It also removes data that is
+  after the image, for example the video of a motion photo or an HDR layer. Locksmith tells you when it
+  removes such data, and it does not shred that original.
 - **Folders:** folder archives never record user names or group names.
 - **Text messages:** Locksmith pads text messages and does not compress them.
 

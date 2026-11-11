@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import secrets
 import sys
 from pathlib import Path
 
@@ -22,6 +23,13 @@ def open_new(path: Path | str, mode: int = 0o600) -> int:
     """Create a new file readable only by the owner (on Windows, files inherit the
     parent folder's access list, which is per-user in the user's profile)."""
     return os.open(path, NEW_FILE_FLAGS, mode)
+
+
+def temp_path(folder: Path | str) -> Path:
+    """A hidden temporary name in ``folder``, for a file that is moved into place once it is complete.
+    It never holds the final name: a name built from that one can be too long for the file system
+    where the final name itself still fits."""
+    return Path(folder) / f".locksmith-{secrets.token_hex(6)}.part"
 
 
 def is_link(path: Path | str) -> bool:

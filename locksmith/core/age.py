@@ -726,7 +726,7 @@ def encrypt_paths(paths: list[Path], out_dir: Path | None, recipients: list[Reci
     file key before it is moved into place, as callers that shred the originals need.
     ``strip`` removes image metadata as for Locksmith files (counts go to ``stats``);
     ``hide_name`` gives the output a random name (age stores no name inside)."""
-    from . import engine, metadata
+    from . import engine, metadata, osutil
     stats = stats if stats is not None else {}
     paths, out_dir = engine.check_sources(paths, out_dir)
     if len(paths) == 1 and paths[0].is_file():
@@ -734,7 +734,7 @@ def encrypt_paths(paths: list[Path], out_dir: Path | None, recipients: list[Reci
         opener = lambda: open(paths[0], "rb")  # noqa: E731
         plan = metadata.plan_for(paths[0]) if strip else None
         if strip:
-            stats["stripped" if plan else "unchanged"] = stats.get("stripped" if plan else "unchanged", 0) + 1
+            metadata.tally(stats, plan)
         if plan is not None:
             total = plan.size
             opener = lambda: metadata.PlanReader(paths[0], plan.plan)  # noqa: E731
@@ -750,7 +750,7 @@ def encrypt_paths(paths: list[Path], out_dir: Path | None, recipients: list[Reci
     if hide_name:
         name = secrets.token_hex(8)
     target = engine.unique_path(out_dir / (name + EXTENSION))   # armored files are .age too, as age names them
-    tmp = out_dir / f".{target.name}.{secrets.token_hex(4)}.part"
+    tmp = osutil.temp_path(out_dir)
 
     def report(frac, stage):
         if progress:
@@ -802,7 +802,7 @@ def decrypt_path(path: Path, out_dir: Path | None, keys: Keys, progress=None,
     out_dir = Path(out_dir) if out_dir else path.parent
     out_dir.mkdir(parents=True, exist_ok=True)
     target_name = engine.safe_name(name or output_name(path.name))
-    tmp = out_dir / f".locksmith-{secrets.token_hex(6)}.part"
+    tmp = osutil.temp_path(out_dir)
     space = engine._DiskGuard(out_dir)
 
     def report(frac, stage):
@@ -869,7 +869,7 @@ def decrypt_pasted(blob: bytes, out_dir: Path, keys: Keys, max_output: int):
         return engine.DecryptResult(None, {"name": "message.txt", "kind": "text", "format": "age"}, data)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    tmp = out_dir / f".locksmith-{secrets.token_hex(6)}.part"
+    tmp = osutil.temp_path(out_dir)
     try:
         engine.write_private(tmp, data)
         target = engine.unique_path(out_dir / "decrypted")

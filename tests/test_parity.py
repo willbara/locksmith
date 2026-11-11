@@ -174,3 +174,11 @@ def test_changing_who_can_open_a_file_rebuilds_its_recovery_data(tmp_path):
     assert (lay.k, lay.m) == parity.LEVELS["10"]   # the same level as before
     with pytest.raises(WrongKeyError):
         engine.decrypt_path(enc, tmp_path / "out", DecryptKeys(password="leaked"))
+
+
+def test_cut_off_recovery_data_is_refused_cleanly(tmp_path):
+    side = tmp_path / "f.lpar"
+    for n in (0, 8, 10, 11):
+        side.write_bytes((parity.MAGIC + bytes(4))[:n])
+        with pytest.raises(LocksmithError):
+            parity.read_recovery(side)

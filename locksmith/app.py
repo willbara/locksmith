@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 
 
 def _attach_windows_console():
@@ -37,7 +38,9 @@ def instance_address() -> tuple[str, bytes] | None:
     """Where this user's running Locksmith listens for later launches, and the key both sides prove they
     hold, or None when that can't be set up. Two running copies would each save their own key list over
     the other's and shred each other's temporary files. The key is a random token in the private config
-    folder: another user can't stand in for either side, so the paths a launch hands over stay private."""
+    folder: another user can't stand in for either side, so the paths a launch hands over stay private.
+    Linux: a socket file in a folder only this user can enter, so no other user can connect to it, or
+    take the address first and leave every launch waiting for an answer. Windows: a named pipe."""
     import hashlib
     import re
     import secrets
@@ -61,10 +64,27 @@ def instance_address() -> tuple[str, bytes] | None:
         token = secrets.token_hex(16)
         with os.fdopen(fd, "w", encoding="ascii") as f:
             f.write(token)
-    # Other users can list pipe and abstract socket names, so the name is a hash: the token stays secret.
-    # An abstract socket (Linux) has no path length limit and goes away with the process.
+    # Other users can list pipe names, so the name is a hash: the token stays secret. The hash also keeps
+    # the sockets of two config folders apart in the one runtime folder.
     name = "locksmith-" + hashlib.sha256(token.encode()).hexdigest()[:32]
-    return (rf"\\.\pipe\{name}" if sys.platform == "win32" else "\0" + name), bytes.fromhex(token)
+    if sys.platform == "win32":
+        return rf"\\.\pipe\{name}", bytes.fromhex(token)
+    return str(_socket_folder(folder) / f"{name[:26]}.sock"), bytes.fromhex(token)   # a socket path is short
+
+
+def _socket_folder(fallback):
+    """Where the socket file goes: the session's runtime folder (a short path, in memory, emptied at logout)
+    when it is this user's alone, else the config folder."""
+    import stat
+    from pathlib import Path
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    try:
+        st = os.stat(runtime) if runtime else None
+    except OSError:
+        st = None
+    if st and stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o077:
+        return Path(runtime)
+    return fallback
 
 
 MAX_HANDOVER = 4 << 20   # above any command line (Linux allows about 2 MiB, Windows 32K characters)
@@ -84,20 +104,42 @@ def hand_over(where: tuple[str, bytes], paths: list[str], encrypt: bool) -> bool
     return True
 
 
-def listen(where: tuple[str, bytes], on_paths) -> bool:
-    """Accept later launches in a background thread and call ``on_paths(paths, encrypt)`` from it.
-    False when listening fails: Locksmith then runs as before."""
+def listen(where: tuple[str, bytes], on_paths) -> bool | None:
+    """Accept later launches in a background thread and call ``on_paths(paths, encrypt)`` from it. Only
+    one copy can: the first to ask. False: another copy has the address (it is running, or starting), so
+    hand over to it. None: listening isn't possible here, and Locksmith runs as it would without it."""
     import json
     import threading
     from multiprocessing import AuthenticationError
     from multiprocessing.connection import Listener
     address, key = where
+    lock = None
+    if sys.platform != "win32":
+        # A socket file outlives a copy that was killed, so who listens is decided by a lock, which
+        # doesn't: its holder removes the old socket file and makes its own. (A named pipe goes away
+        # with its process, and Windows lets only one process create it.)
+        import fcntl
+        try:
+            lock = os.open(address + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError:
+            return None
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(lock)
+            return False
+        try:
+            os.unlink(address)
+        except OSError:
+            pass
     try:
         listener = Listener(address, authkey=key)
-    except OSError:
-        return False
+    except OSError as e:
+        if lock is not None:
+            os.close(lock)
+        return False if isinstance(e, PermissionError) and sys.platform == "win32" else None
 
-    def run():
+    def run(lock=lock):   # the lock is held for as long as this copy runs
         while True:
             try:
                 conn = listener.accept()
@@ -149,7 +191,7 @@ def main() -> int:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Locksmith.Locksmith")
         except (AttributeError, OSError):
             pass
-    from PySide6.QtCore import Qt
+    from PySide6.QtCore import QObject, Qt, Signal
     from PySide6.QtGui import QGuiApplication
     from PySide6.QtWidgets import QApplication
 
@@ -188,23 +230,37 @@ def main() -> int:
     where = instance_address()
     if where and hand_over(where, paths, encrypt):
         return 0   # the running Locksmith opens them: one copy at a time keeps keys.json whole
+
+    class Handover(QObject):
+        received = Signal(list, bool)   # emitted from the listening thread, delivered on this one
+
+    handover, windows, early = Handover(), [], []
+
+    def opened(more: list[str], enc: bool):
+        if not windows:
+            early.append((more, enc))   # the window is still being built
+            return
+        win = windows[0]
+        if more:
+            win.open_paths(more, enc)
+        win.showNormal()
+        win.raise_()
+        win.activateWindow()
+    handover.received.connect(opened)
+    # Listen before the window is built. Building it takes a moment, and copies started together (several
+    # files opened at once) would otherwise all find nobody listening and all stay open.
+    if where and listen(where, handover.received.emit) is False:
+        # Another copy got there first and is still starting: it takes the paths as soon as it answers.
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if hand_over(where, paths, encrypt):
+                return 0
+            time.sleep(0.1)
     win = MainWindow(paths, encrypt)
+    windows.append(win)
+    for more, enc in early:
+        opened(more, enc)
     win.show()
-    if where:
-        from PySide6.QtCore import QObject, Signal
-
-        class Handover(QObject):
-            received = Signal(list, bool)   # emitted from the listening thread, delivered on this one
-
-        def opened(more: list[str], enc: bool):
-            if more:
-                win.open_paths(more, enc)
-            win.showNormal()
-            win.raise_()
-            win.activateWindow()
-        win.handover = Handover()
-        win.handover.received.connect(opened)
-        listen(where, win.handover.received.emit)
     if linux:
         _refresh_integration()
     return app.exec()

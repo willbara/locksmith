@@ -35,6 +35,22 @@ class Stripped:
     plan: Plan
     size: int
     removed: int   # bytes of metadata removed
+    trailing: int = 0   # of those, bytes that came after the end of the image (JPEG and PNG)
+
+
+# This much data after the end of an image is more than padding: a motion photo's video, an HDR
+# gain map or a second image. It is dropped like everything else that isn't the image (it carries
+# its own metadata), but it is content, so callers say so and keep the original (see ``tally``).
+TRAILING_NOTICE = 1024
+
+
+def tally(stats: dict, stripped: Stripped | None):
+    """Count one file in an encryption's ``stats``: "stripped", or "unchanged" when its format isn't
+    supported (``stripped`` None), and "trailing" when the image lost data stored after it."""
+    key = "unchanged" if stripped is None else "stripped"
+    stats[key] = stats.get(key, 0) + 1
+    if stripped is not None and stripped.trailing >= TRAILING_NOTICE:
+        stats["trailing"] = stats.get("trailing", 0) + 1
 
 
 def detect(head: bytes) -> str | None:
@@ -62,7 +78,11 @@ def plan_for(path: Path) -> Stripped | None:
             raise LocksmithError(f"Could not remove metadata from {path.name}: the {kind.upper()} file "
                                "is damaged. Turn off metadata removal to encrypt it as it is.") from e
     out = sum(len(p) if isinstance(p, bytes) else p[1] for p in plan)
-    return Stripped(kind, plan, out, size - out)
+    # A JPEG or PNG plan ends with the image's end marker (EOI, IEND): whatever the file holds after
+    # that was left out.
+    last = plan[-1]
+    trailing = size - (last[0] + last[1]) if kind != "webp" and isinstance(last, tuple) else 0
+    return Stripped(kind, plan, out, size - out, trailing)
 
 
 class PlanReader(io.RawIOBase):

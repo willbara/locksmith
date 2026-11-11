@@ -263,7 +263,7 @@ hold:
 
 Readers ignore unknown fields and fields of the wrong type.
 
-Since Locksmith 5, a writer adds `pad` as the last field. It sets the length of `pad` so that the
+Since Locksmith 5.1, a writer adds `pad` as the last field. It sets the length of `pad` so that the
 metadata JSON is 1024, 2048, 4096, 8192, 16384, 32768 or 65536 bytes long. Above 65536 bytes, the
 JSON is a multiple of 65536 bytes. Thus the length of `meta.c` shows only a range for the length of
 the name, the note and `to`. The JSON uses `\u` escapes for all characters that are not ASCII, so each
@@ -593,7 +593,7 @@ password, a keyfile or a private key:
 - **The container:** that it is a Locksmith file, and its format version.
 - **The fixed header:** the cipher suite and the chunk size. The length of `meta.c` gives the length
   of the metadata JSON. Because of `pad` (section 7), this length shows only a range. Most files have
-  1024 bytes of metadata. A long note or a long `to` list makes it larger. Files from Locksmith 4 and
+  1024 bytes of metadata. A long note or a long `to` list makes it larger. Files from Locksmith 5.0 and
   earlier have no `pad`, so their metadata length shows approximately how long the name and note are.
 - **The key slots:** the number of slots and the type of each slot. A password slot shows its KDF,
   the KDF cost parameters (`p`) and if a keyfile is necessary (`kf`). An `ssh-rsa` slot shows the

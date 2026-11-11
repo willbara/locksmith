@@ -325,8 +325,17 @@ class KeysPage(Page):
                 "Unprotected backup", "This identity has no passphrase, so the backup file contains the "
                 "raw private key. Keep it somewhere safe.", ok="Export"):
             return
-        self.store.export_identity(ident, Path(path))
-        toast("Backup saved", "download")
+        if self._save_backup(ident, path):
+            toast("Backup saved", "download")
+
+    def _save_backup(self, ident, path) -> bool:
+        """Export an identity, saying so when that fails: a backup the user believes in must exist."""
+        try:
+            self.store.export_identity(ident, Path(path))
+        except (OSError, LocksmithError) as e:
+            dialogs.error(str(e), "The backup was not saved")
+            return False
+        return True
 
     def _import(self):
         path, _ = QFileDialog.getOpenFileName(self, "Import identity backup", "",
@@ -381,7 +390,12 @@ class KeysPage(Page):
 
         def save(raw):
             from .. import paper
-            write_secret_file(Path(path), paper.render_pdf(ident.name, fingerprint(ident.key_raw), ident.created, raw))
+            try:
+                write_secret_file(Path(path),
+                                  paper.render_pdf(ident.name, fingerprint(ident.key_raw), ident.created, raw))
+            except OSError as e:
+                dialogs.error(str(e), "The paper backup was not saved")
+                return
             toast("Paper backup saved. Print it, then delete the PDF.", "download", 5000)
         self._with_private_key(ident, save)
 
@@ -498,9 +512,8 @@ class KeysPage(Page):
                 return
             path, _ = QFileDialog.getSaveFileName(self, "Save identity backup (keep it offline)",
                                                   f"{ident.name}.locksmith-identity.json")
-            if not path:
+            if not path or not self._save_backup(ident, path):
                 return
-            self.store.export_identity(ident, Path(path))
             job, done = (lambda r, c: self.store.seal(ident)), "Sealed to this device's TPM. Backup saved."
         run_task(job, lambda _: (self.reload(), toast(done, "chip")), lambda m, k: dialogs.error(m), parent=self)
 

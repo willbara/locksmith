@@ -1188,7 +1188,11 @@ class KeyfilePicker(QWidget):
     def _generate(self):
         path, _ = QFileDialog.getSaveFileName(self, "Save new keyfile", "locksmith.key")
         if path:
-            write_secret_file(Path(path), os.urandom(4096))
+            try:
+                write_secret_file(Path(path), os.urandom(4096))
+            except OSError as e:
+                toast(f"The keyfile could not be saved: {e.strerror or e}", "alert", 5000)
+                return
             self.set_path(path)
             toast("Keyfile created. Keep a backup: without it the file cannot be opened.", "key")
 

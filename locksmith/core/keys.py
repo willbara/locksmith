@@ -173,8 +173,17 @@ def _move_legacy_config(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         os.replace(old, path)
-    except OSError:   # another drive: copy, then remove the roaming copy
-        shutil.copytree(old, path)
+    except OSError:   # another drive (a redirected profile): copy, then remove the roaming copy
+        # Copied under another name and renamed once complete. A copy that failed halfway would
+        # otherwise be taken for the moved folder on the next start, and show no keys.
+        partial = path.with_name(path.name + ".moving")
+        shutil.rmtree(partial, ignore_errors=True)
+        try:
+            shutil.copytree(old, partial)
+            os.replace(partial, path)
+        except BaseException:
+            shutil.rmtree(partial, ignore_errors=True)
+            raise
         shutil.rmtree(old, ignore_errors=True)
 
 

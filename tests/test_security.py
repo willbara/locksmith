@@ -2560,3 +2560,34 @@ def test_a_time_no_clock_can_show_is_dropped_not_the_key(tmp_path, when):
     assert not store.problem and store.identities[0].created == store.contacts[0].added == 0
     assert store.unlocked_private_keys() == [ident.private_raw()]
     time.strftime("%d %b %Y", time.localtime(store.identities[0].created))
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_moving_the_old_config_folder_to_another_drive_is_all_or_nothing(tmp_path, monkeypatch, fails):
+    """Windows, a roaming profile on another drive: the folder is copied. A copy that failed halfway
+    was taken for the moved folder on the next start, which then showed no keys."""
+    old, new = tmp_path / "roaming" / "locksmith", tmp_path / "local" / "locksmith"
+    old.mkdir(parents=True)
+    (old / "keys.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(keys, "legacy_config_base", lambda: tmp_path / "roaming")
+    replace, copytree = os.replace, shutil.copytree
+
+    def other_drive(src, dst):
+        if Path(src) == old:
+            raise OSError(errno.EXDEV, "another drive")
+        replace(src, dst)
+
+    def half_a_copy(src, dst):
+        copytree(src, dst)
+        os.unlink(Path(dst) / "keys.json")
+        raise OSError(errno.EIO, "the share went away")
+
+    monkeypatch.setattr(os, "replace", other_drive)
+    if fails:
+        monkeypatch.setattr(shutil, "copytree", half_a_copy)
+        with pytest.raises(OSError):
+            keys._move_legacy_config(new)
+        assert (old / "keys.json").exists() and os.listdir(new.parent) == []   # tried again on the next start
+    else:
+        keys._move_legacy_config(new)
+        assert (new / "keys.json").exists() and not old.exists() and os.listdir(new.parent) == ["locksmith"]

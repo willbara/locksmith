@@ -147,7 +147,7 @@ def _case_bits(run: str) -> float:
 
 def _token_bits(token: str) -> float:
     low = token.lower()
-    if token[0].isdigit():
+    if token[0].isdecimal():   # not isdigit: "²" is a digit that int() can't read
         if len(token) == 4 and 1900 <= int(token) <= 2099:
             return math.log2(200)   # a year
         if len(set(token)) == 1 or _is_sequence(token):

@@ -2538,3 +2538,9 @@ def test_names_that_are_not_utf8_can_be_decrypted(tmp_path, folder):
     assert res.complete and res.path.name == "caf.txt"
     assert (res.path / "inside.txt" if folder else res.path).read_bytes() == b"latin-1 name"
     assert engine.safe_name("a\ud800b.txt") == "ab.txt"   # any lone surrogate, as a crafted file could hold
+
+
+@pytest.mark.parametrize("pw", ["²abc", "pass ²xyz", "²²²²", "①234", "12²abc"])
+def test_strength_meter_reads_digits_that_are_not_numbers(pw):
+    """"²".isdigit() is true but int("²abc") fails: the meter raised, and Encrypt did nothing."""
+    assert tools.estimate_entropy(pw) > 0

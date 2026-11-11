@@ -356,12 +356,8 @@ def _check(key: Key, sig: Signature, h) -> bool:
     return True
 
 
-def _new(sig: Signature):
-    return _hasher(sig)
-
-
 def _subkey_hash(primary: Key, subkey: Key, sig: Signature):
-    h = _new(sig)
+    h = _hasher(sig)
     h.update(primary.hashed_form + subkey.hashed_form)
     return h
 
@@ -404,7 +400,7 @@ def parse_key(data: bytes) -> Certificate:
                 except (LocksmithError, _Bad):
                     continue
                 try:
-                    h = _new(sig)
+                    h = _hasher(sig)
                 except LocksmithError:
                     continue
                 if component is primary and sig.sig_type in (DIRECT_KEY, KEY_REVOCATION):
@@ -558,7 +554,7 @@ def verify_file(path: Path, signature: bytes, key: bytes, now: int | None = None
     if expires and len(expires[0]) == 4 and struct.unpack(">I", expires[0])[0] and \
             now > sig.created + struct.unpack(">I", expires[0])[0]:
         raise LocksmithError("This signature has expired.")
-    h = _new(sig)
+    h = _hasher(sig)
     feed = _TextHasher(h) if sig.sig_type == SIG_TEXT else h
     with open_regular(Path(path)) as f:
         size = max(f.seek(0, 2), 1)

@@ -69,7 +69,7 @@ class EncryptPage(Page):
         pl.setSpacing(10)
         self.password = PasswordField("Password")
         self.confirm = PasswordField("Confirm password", strength=False, generate=False)
-        self.password.changed.connect(self._password_changed)
+        self.password.changed.connect(self._update_state)
         self.confirm.changed.connect(self._update_state)
         self.match = label("", "caption")
         pl.addWidget(self.password)
@@ -248,9 +248,6 @@ class EncryptPage(Page):
             self.recipients.reload()
             fade_in(self.rcpt_box, 240)
         self.rcpt_box.setVisible(show_rc)
-        self._update_state()
-
-    def _password_changed(self, _):
         self._update_state()
 
     def _describe(self):

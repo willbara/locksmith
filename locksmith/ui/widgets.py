@@ -660,9 +660,6 @@ class Collapsible(QFrame):
             self.lay.addLayout(w, stretch)
         return w
 
-    def is_expanded(self):
-        return self._expanded
-
     def toggle(self):
         self.set_expanded(not self._expanded)
 

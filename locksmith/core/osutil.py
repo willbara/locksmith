@@ -9,7 +9,6 @@ import sys
 from pathlib import Path
 
 IS_WINDOWS = sys.platform == "win32"
-IS_LINUX = sys.platform.startswith("linux")
 
 # Create a brand-new file only. O_EXCL refuses an existing path, including a planted
 # symlink (on Windows this is CreateFile's CREATE_NEW). The other flags exist only on

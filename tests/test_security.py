@@ -2515,3 +2515,26 @@ def test_split_copies_a_large_part_in_pieces(tmp_path):
 def test_crack_time_of_a_very_long_password():
     assert tools.crack_time(5000) == "longer than the universe has existed"
     assert tools.crack_time(tools.estimate_entropy("x9$Kq7!bZ" * 60))   # never raises
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows names are always Unicode")
+@pytest.mark.parametrize("folder", [False, True])
+def test_names_that_are_not_utf8_can_be_decrypted(tmp_path, folder):
+    """A Latin-1 name (from an old archive) is stored with surrogates. Encrypting it worked, even
+    with verification, but decrypting failed on the name: with shredding, the only copy was stuck."""
+    src = os.path.join(os.fsencode(tmp_path), b"caf\xe9.txt")
+    try:
+        if folder:
+            os.mkdir(src)
+            (Path(os.fsdecode(src)) / "inside.txt").write_bytes(b"latin-1 name")
+        else:
+            with open(src, "wb") as f:
+                f.write(b"latin-1 name")
+    except OSError:
+        pytest.skip("this file system only takes UTF-8 names")
+    enc = engine.encrypt_paths([Path(os.fsdecode(src))], tmp_path / "enc", EncryptOptions(password="pw", **FAST),
+                               verify=True)
+    res = engine.decrypt_path(enc, tmp_path / "dec", DecryptKeys(password="pw"))
+    assert res.complete and res.path.name == "caf.txt"
+    assert (res.path / "inside.txt" if folder else res.path).read_bytes() == b"latin-1 name"
+    assert engine.safe_name("a\ud800b.txt") == "ab.txt"   # any lone surrogate, as a crafted file could hold

@@ -1651,10 +1651,12 @@ def safe_name(name) -> str:
     """Make a received file name safe to create. Besides staying inside the output
     folder, it drops control and invisible formatting characters (a right-to-left
     override, U+202E, can make "photo\u202egpj.exe" display as "photoexe.jpg") and
-    leading dots, so a sender cannot plant hidden files such as .bash_profile or .ssh."""
+    leading dots, so a sender cannot plant hidden files such as .bash_profile or .ssh.
+    Lone surrogates are dropped too: a name that isn't valid UTF-8 on Linux ("caf\\xe9.txt")
+    is stored with them, and they can't be encoded again."""
     if not isinstance(name, str):
         return "decrypted"
-    name = "".join(ch for ch in name if unicodedata.category(ch) not in ("Cc", "Cf"))
+    name = "".join(ch for ch in name if unicodedata.category(ch) not in ("Cc", "Cf", "Cs"))
     name = os.path.basename(name.replace("\\", "/")).strip().lstrip(".").strip()
     # 240 bytes leaves room for a " (n)" suffix within the usual 255-byte limit.
     name = name.encode()[:240].decode(errors="ignore")

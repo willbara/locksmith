@@ -1468,3 +1468,30 @@ def test_new_recovery_data_never_replaces_what_can_still_repair(tmp_path, window
     wait(lambda: t.rc_result.text().startswith("✕"))
     wait(lambda: t._rc_task is None)
     assert side.read_bytes() == good and "Check or repair" in t.rc_detail.text()
+
+
+def test_a_failed_batch_shows_what_it_finished(tmp_path, window):
+    """The first item is encrypted (and shredded) before the second fails: its result is shown and it
+    leaves the list, so trying again doesn't stop at a file that is gone."""
+    e, d = window.encrypt, window.decrypt
+    (tmp_path / "a.txt").write_text("first")
+    (tmp_path / "b.txt").write_text("second")
+    e.add_paths([str(tmp_path / "a.txt"), str(tmp_path / "b.txt")])
+    (tmp_path / "b.txt").unlink()
+    _set_password(e)
+    e.shred.setChecked(True)
+    e.go.click()
+    wait(lambda: e.task is None)
+    assert any(a.startswith("ERROR") and "1 encrypted file finished before this" in a for a in window.asked)
+    assert e.files.paths() == [str(tmp_path / "b.txt")] and e.result_box.count() == 1
+    assert not (tmp_path / "a.txt").exists() and (tmp_path / "a.txt.locked").exists()
+
+    (tmp_path / "junk.locked").write_bytes(b"not a Locksmith file")
+    d.add_paths([str(tmp_path / "a.txt.locked"), str(tmp_path / "junk.locked")])
+    _set_password(d)
+    d.delete_after.setChecked(True)
+    d.go.click()
+    wait(lambda: d.task is None)
+    assert any(a.startswith("ERROR") and "1 item finished before this" in a for a in window.asked)
+    assert d.files.paths() == [str(tmp_path / "junk.locked")] and d.result_box.count() == 1
+    assert (tmp_path / "a.txt").read_text() == "first" and not (tmp_path / "a.txt.locked").exists()

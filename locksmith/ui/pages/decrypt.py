@@ -56,6 +56,7 @@ class DecryptPage(Page):
         self.task = None
         self.pasted: dict[str, bytes] = {}
         self._paste_dir = None
+        self._partial: list = []   # (item, result) of each item the running job has done
 
         self.drop = DropZone("Drop encrypted files here", "or choose them below", folders=False,
                              file_filter="Locksmith files (*.locked *.txt);;All files (*)")
@@ -301,22 +302,23 @@ class DecryptPage(Page):
         if build_keys is None:
             return
 
+        partial = self._partial = []
+
         def work(report, cancel):
             keys = build_keys()
-            results = []
             n = len(paths)
             for i, p in enumerate(paths):
                 def sub(frac, stage, i=i):
                     report(None if frac is None else (i + frac) / n,
                            stage + (f"  ·  {i + 1} of {n}" if n > 1 else ""))
                 if p in ages:
-                    results.append(self._open_age(p, pasted.get(p), keys, out_dir, verify, delete, sub, cancel))
+                    result = self._open_age(p, pasted.get(p), keys, out_dir, verify, delete, sub, cancel)
                 elif verify:
                     res = engine.verify_path(Path(p), keys, threads, sub, cancel)
-                    results.append(("verified", p, {**res.meta, "_signature": res.signature, "_intent": res.intent,
-                                                    "_by_key": res.opened_with_key}))
+                    result = ("verified", p, {**res.meta, "_signature": res.signature, "_intent": res.intent,
+                                              "_by_key": res.opened_with_key})
                 elif p in pasted:
-                    results.append(self._decrypt_pasted(pasted[p], keys, out_dir, threads, sub, cancel))
+                    result = self._decrypt_pasted(pasted[p], keys, out_dir, threads, sub, cancel)
                 else:
                     r = engine.decrypt_path(Path(p), out_dir, keys, threads, sub, cancel)
                     meta = {**r.meta, "_skipped": r.skipped, "_signature": r.signature, "_intent": r.intent,
@@ -328,10 +330,11 @@ class DecryptPage(Page):
                         Path(p + parity.EXTENSION).unlink(missing_ok=True)   # its recovery data, if any
                     elif delete:
                         meta["_kept"] = True
-                    results.append(("file", r.path, meta))
+                    result = ("file", r.path, meta)
                 if p in pasted:
                     Path(p).unlink(missing_ok=True)  # only a temporary copy of the paste
-            return results
+                partial.append((p, result))   # kept if a later item fails: see _take_partial
+            return [result for _, result in partial]
 
         self._clear_results()
         self.progress.start()
@@ -512,8 +515,28 @@ class DecryptPage(Page):
         self.progress.finish()
         self._update_state()
 
+    def _take_partial(self) -> tuple[list, str]:
+        """After a failure or a cancel: take the items that were finished before it out of the list (with
+        "Delete encrypted file afterwards", they are already gone), so trying again starts with the rest.
+        Returns their results, and a sentence about them for the message, or ""."""
+        partial, self._partial = self._partial, []
+        for p, _ in partial:
+            self.pasted.pop(p, None)
+            self.files.remove(p)
+        n = len(partial)
+        return [result for _, result in partial], \
+            (f" {n} item{'s' if n != 1 else ''} finished before this: see below." if n else "")
+
+    def _show_results(self, results):
+        for kind, value, meta in results:
+            if kind == "text" and is_locked():
+                withhold("Decrypted message")   # the lock already cleared the page: don't put it back
+                continue
+            self._add_result(kind, value, meta)
+
     def _done(self, results):
         self._finish()
+        self._partial = []
         self.files.clear()
         self.pasted.clear()
         self.password.clear()
@@ -527,23 +550,23 @@ class DecryptPage(Page):
             toast(f"Decrypted {len(results)} item{'s' if len(results) != 1 else ''}"
                   + (f", kept {kept} encrypted file{'s' if kept != 1 else ''}" if kept else ""),
                   "alert" if kept else "unlock", 4000 if kept else 3200)
-        for kind, value, meta in results:
-            if kind == "text" and is_locked():
-                withhold("Decrypted message")   # the lock already cleared the page: don't put it back
-                continue
-            self._add_result(kind, value, meta)
+        self._show_results(results)
 
     def _failed(self, msg, kind=""):
         self._finish()
+        results, note = self._take_partial()
         if kind == "WrongKeyError":
             shake(self.password)
-            toast(msg, "alert", 4000)
+            toast(msg + note, "alert", 4000)
         else:
-            dialogs.error(msg, "Decryption failed")
+            dialogs.error(msg + note, "Decryption failed")
+        self._show_results(results)
 
     def _cancelled(self):
         self._finish()
-        toast("Cancelled", "x")
+        results, note = self._take_partial()
+        toast("Cancelled." + note, "x")
+        self._show_results(results)
 
     def clear_secrets(self):
         """Called when the app locks: drop decrypted previews and pending pastes."""

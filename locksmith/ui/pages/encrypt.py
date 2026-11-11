@@ -48,6 +48,7 @@ class EncryptPage(Page):
         super().__init__("Encrypt", "Lock files and folders with authenticated, streaming encryption.")
         self.store = store
         self.task = None
+        self._finished: list[tuple[list[Path], Path]] = []   # (inputs, output) of each group the running job has done
 
         self.drop = DropZone()
         self.drop.dropped.connect(lambda p: self.files.add(p))
@@ -395,12 +396,14 @@ class EncryptPage(Page):
                 return
             work_factor = {"fast": 16, "balanced": 18, "strong": 19, "paranoid": 20}[opts.preset]
 
+        finished = self._finished = []
+
         def work(report, cancel):
             if not is_age:
                 ident, passphrase = signer
                 # Unlocking may run Argon2id, so it happens here, off the UI thread.
                 opts.signer = ident.private_raw(passphrase) if ident else None
-            outputs, stats, kept = [], {}, []
+            stats, kept = {}, []
             n = len(groups)
             for i, group in enumerate(groups):
                 def sub(frac, stage, i=i):
@@ -415,9 +418,9 @@ class EncryptPage(Page):
                 else:
                     out = engine.encrypt_paths(group, out_dir, opts, progress=sub, cancel=cancel, verify=shred,
                                                stats=stats)
-                outputs.append(out)
                 if recovery:
                     parity.create(out, "5", progress=sub, cancel=cancel)
+                finished.append((group, out))   # kept if a later item fails: see _take_finished
                 if shred and stats.get("trailing", 0) > trailing:
                     # Metadata removal cut data stored after an image (a motion photo's video, an HDR
                     # layer): the encrypted copy isn't all the original holds, so the original stays.
@@ -426,7 +429,7 @@ class EncryptPage(Page):
                     for p in group:
                         report(None, f"Shredding {p.name}")
                         tools.shred(p, cancel=cancel, recovery_data=True)
-            return outputs, stats, kept
+            return [out for _, out in finished], stats, kept
 
         self._clear_results()
         self.progress.start()
@@ -461,9 +464,22 @@ class EncryptPage(Page):
         self.progress.finish()
         self._update_state()
 
+    def _take_finished(self) -> str:
+        """After a failure or a cancel: show what was encrypted before it and take those items out of the
+        list (with shredding, their originals are already gone), so trying again starts with the rest.
+        Returns a sentence about them for the message, or ""."""
+        finished, self._finished = self._finished, []
+        for group, out in finished:
+            for p in group:
+                self.files.remove(str(p))
+            self._add_result(out)
+        n = len(finished)
+        return f" {n} encrypted file{'s' if n != 1 else ''} finished before this: see below." if n else ""
+
     def _done(self, result):
         outputs, stats, kept = result
         self._finish()
+        self._finished = []
         self.files.clear()
         self.password.clear()
         self.confirm.clear()
@@ -491,11 +507,11 @@ class EncryptPage(Page):
 
     def _failed(self, msg, _kind=""):
         self._finish()
-        dialogs.error(msg, "Encryption failed")
+        dialogs.error(msg + self._take_finished(), "Encryption failed")
 
     def _cancelled(self):
         self._finish()
-        toast("Cancelled", "x")
+        toast("Cancelled." + self._take_finished(), "x")
 
     def _clear_results(self):
         while self.result_box.count():

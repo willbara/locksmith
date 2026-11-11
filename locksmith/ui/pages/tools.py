@@ -214,23 +214,14 @@ class ToolsPage(Page):
 
     def _compute(self):
         f, alg = self.hash_file, self.hash_alg.value()
-        self.hash_progress.start()
-        self.hash_go.setEnabled(False)
 
         def done(h):
-            self.hash_progress.finish()
-            self.hash_go.setEnabled(True)
             self._hash_used = alg
             self.hash_out.setText(h)
             self._compare()
 
-        def failed(m, k):
-            self.hash_progress.finish()
-            self.hash_go.setEnabled(True)
-            dialogs.error(m)
-
-        run_task(lambda r, c: tools.hash_file(f, alg, lambda x: r(x, "Hashing"), c), done, failed,
-                 self.hash_progress.update_progress, parent=self)
+        self._hashing_task(self.hash_go, self.hash_progress, lambda p, c: tools.hash_file(f, alg, p, c), done,
+                           lambda m, k: dialogs.error(m))
 
     def _compare(self):
         a = self.hash_out.text().strip().lower()
@@ -245,6 +236,20 @@ class ToolsPage(Page):
             self.hash_match.setText("✓  Checksums match")
         else:
             self.hash_match.setText("✕  Checksums do not match")
+
+    def _hashing_task(self, button, progress, work, done, failed):
+        """Run ``work(progress, cancel)``, which hashes a file, showing a card's progress bar and keeping
+        its button off until it ends. Then ``done(result)`` or ``failed(message, kind)`` is called."""
+        progress.start()
+        button.setEnabled(False)
+
+        def end(then, *args):
+            progress.finish()
+            button.setEnabled(True)
+            then(*args)
+
+        run_task(lambda r, c: work(lambda x: r(x, "Hashing"), c), lambda res: end(done, res),
+                 lambda m, k: end(failed, m, k), progress.update_progress, parent=self)
 
     def _run_extra(self, work, done):
         """Run one compare or manifest job at a time, with progress and cancel."""
@@ -380,27 +385,13 @@ class ToolsPage(Page):
                 return
         out = Path(out)
 
-        def work(r, c):
-            text = signing.sign_file(f, ident.private_raw(passphrase), comment, progress=lambda x: r(x, "Hashing"),
-                                     cancel=c)
-            write_secret_file(out, text)
+        def work(p, c):
+            write_secret_file(out, signing.sign_file(f, ident.private_raw(passphrase), comment, progress=p, cancel=c))
             return out
 
-        def end():
-            self.sg_progress.finish()
-            self.sg_go.setEnabled(True)
-
-        def done(path):
-            end()
-            toast(f"Signed. Saved {path.name}", "fingerprint")
-
-        def failed(m, k):
-            end()
-            dialogs.error(m, "Not signed")
-
-        self.sg_progress.start()
-        self.sg_go.setEnabled(False)
-        run_task(work, done, failed, self.sg_progress.update_progress, parent=self)
+        self._hashing_task(self.sg_go, self.sg_progress, work,
+                           lambda path: toast(f"Signed. Saved {path.name}", "fingerprint"),
+                           lambda m, k: dialogs.error(m, "Not signed"))
 
     def _lsig_card(self):
         c = Collapsible("Verify a Locksmith signature", "Check a file against its .lsig file", icon="shield")
@@ -473,15 +464,8 @@ class ToolsPage(Page):
         else:
             candidates = saved
         f, sig = self.ls_file, self.ls_sig
-        self.ls_progress.start()
-        self.ls_go.setEnabled(False)
-
-        def end():
-            self.ls_progress.finish()
-            self.ls_go.setEnabled(True)
 
         def done(v):
-            end()
             name = candidates.get(v.key)
             self.ls_result.setText(signed_with(v.key, saved) if name else "✓  Signed with the key you entered")
             try:
@@ -492,16 +476,15 @@ class ToolsPage(Page):
             self.ls_comment.setText(f"Signed comment: {v.comment}" if v.comment else "No comment")
 
         def failed(m, k):
-            end()
             self.ls_result.setText("✕  Not verified")
             if k == "UnknownSignerError":
                 m += (" A signature can claim any fingerprint. Paste the signer's public key above, or add them as a "
                       "contact after checking their fingerprint with them, and verify again.")
             self.ls_detail.setText(m)
 
-        run_task(lambda r, c: signing.verify_file(f, signing.read_small(sig), list(candidates),
-                                                  lambda x: r(x, "Hashing"), c),
-                 done, failed, self.ls_progress.update_progress, parent=self)
+        self._hashing_task(self.ls_go, self.ls_progress,
+                           lambda p, c: signing.verify_file(f, signing.read_small(sig), list(candidates), p, c),
+                           done, failed)
 
     # ── minisign ──
 
@@ -578,25 +561,17 @@ class ToolsPage(Page):
             return
         f, sig, key = self.ms_file, self.ms_sig, self.ms_key.text()
         self._ms_reset()
-        self.ms_progress.start()
-        self.ms_go.setEnabled(False)
-
-        def end():
-            self.ms_progress.finish()
-            self.ms_go.setEnabled(True)
 
         def done(v):
-            end()
             self.ms_result.setText(f"✓  Valid signature from key {v.key_id}")
             self.ms_comment.setText(f"Trusted comment: {tools.display_text(_shown(v.trusted_comment))}")
 
         def failed(m, k):
-            end()
             self.ms_result.setText("✕  Not verified")
             self.ms_comment.setText(m)
 
-        run_task(lambda r, c: minisign.verify_file(f, minisign.read_small(sig), key, lambda x: r(x, "Hashing"), c),
-                 done, failed, self.ms_progress.update_progress, parent=self)
+        self._hashing_task(self.ms_go, self.ms_progress,
+                           lambda p, c: minisign.verify_file(f, minisign.read_small(sig), key, p, c), done, failed)
 
     # ── SSH signatures ──
 
@@ -678,26 +653,18 @@ class ToolsPage(Page):
             return
         f, sig, key, namespace = self.ss_file, self.ss_sig, self.ss_key.text(), self.ss_namespace.text()
         self._ss_reset()
-        self.ss_progress.start()
-        self.ss_go.setEnabled(False)
-
-        def end():
-            self.ss_progress.finish()
-            self.ss_go.setEnabled(True)
 
         def done(v):
-            end()
             self.ss_result.setText(f"✓  Valid signature from key {v.fingerprint}")
             self.ss_detail.setText(f"{v.key_label} key  ·  namespace “{v.namespace}”  ·  {v.hash_algorithm.upper()}")
 
         def failed(m, k):
-            end()
             self.ss_result.setText("✕  Not verified")
             self.ss_detail.setText(m)
 
-        run_task(lambda r, c: sshsig.verify_file(f, sshsig.read_small(sig), key, namespace,
-                                                 lambda x: r(x, "Hashing"), c),
-                 done, failed, self.ss_progress.update_progress, parent=self)
+        self._hashing_task(self.ss_go, self.ss_progress,
+                           lambda p, c: sshsig.verify_file(f, sshsig.read_small(sig), key, namespace, p, c),
+                           done, failed)
 
     # ── OpenPGP signatures ──
 
@@ -772,15 +739,8 @@ class ToolsPage(Page):
             return
         f, sig, key = self.pg_file, self.pg_sig, self.pg_key
         self._pg_reset()
-        self.pg_progress.start()
-        self.pg_go.setEnabled(False)
-
-        def end():
-            self.pg_progress.finish()
-            self.pg_go.setEnabled(True)
 
         def done(v):
-            end()
             self.pg_result.setText(f"✓  Valid signature from key {v.fingerprint}")
             try:
                 when = time.strftime("%d %b %Y, %H:%M", time.localtime(v.created))
@@ -795,13 +755,13 @@ class ToolsPage(Page):
             self.pg_detail.setText("\n".join(lines))
 
         def failed(m, k):
-            end()
             self.pg_result.setText("✕  Not verified")
             self.pg_detail.setText(m)
 
-        run_task(lambda r, c: openpgp.verify_file(f, openpgp.read_signature_file(sig), openpgp.read_key_file(key),
-                                                  progress=lambda x: r(x, "Hashing"), cancel=c),
-                 done, failed, self.pg_progress.update_progress, parent=self)
+        self._hashing_task(self.pg_go, self.pg_progress,
+                           lambda p, c: openpgp.verify_file(f, openpgp.read_signature_file(sig),
+                                                            openpgp.read_key_file(key), progress=p, cancel=c),
+                           done, failed)
 
     # ── recovery data ──
 

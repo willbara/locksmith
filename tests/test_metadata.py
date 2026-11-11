@@ -172,6 +172,16 @@ def test_png(tmp_path):
     assert _decode(out).convertToFormat(QImage.Format.Format_RGB32) == img
 
 
+def test_png_keeps_only_the_orientation(tmp_path):
+    png, img = _image("PNG")
+    iend = png.rindex(b"IEND") - 4
+    out, _ = _roundtrip(tmp_path, "turned.png", png[:iend] + _png_chunk(b"eXIf", _exif(6)[6:]) + png[iend:])
+    assert _png_chunk(b"eXIf", metadata._orientation_tiff(6)) in out and b"GPS-SECRET" not in out
+    assert _decode(out).convertToFormat(QImage.Format.Format_RGB32) == img
+    out, _ = _roundtrip(tmp_path, "upright.png", png[:iend] + _png_chunk(b"eXIf", _exif(1)[6:]) + png[iend:])
+    assert b"eXIf" not in out
+
+
 def _webp_chunk(fourcc: bytes, data: bytes) -> bytes:
     return fourcc + struct.pack("<I", len(data)) + data + (b"\x00" if len(data) & 1 else b"")
 
@@ -193,6 +203,25 @@ def test_webp(tmp_path):
     assert image_chunk in out
     if QImage().loadFromData(QByteArray(simple)):
         assert _decode(out).size() == _decode(simple).size()
+
+
+@pytest.mark.parametrize("prefix", [b"", b"Exif\x00\x00"])
+def test_webp_keeps_only_the_orientation(tmp_path, prefix):
+    simple, _ = _image("WEBP")
+    vp8x = bytes([0x0C, 0, 0, 0]) + (63).to_bytes(3, "little") + (47).to_bytes(3, "little")
+
+    def webp(orientation):
+        body = (b"WEBP" + _webp_chunk(b"VP8X", vp8x) + simple[12:]
+                + _webp_chunk(b"EXIF", prefix + _exif(orientation)[6:]) + _webp_chunk(b"XMP ", b"<x>XMP-SECRET</x>"))
+        return b"RIFF" + struct.pack("<I", len(body)) + body
+
+    out, _ = _roundtrip(tmp_path, "turned.webp", webp(6))
+    assert out.endswith(_webp_chunk(b"EXIF", metadata._orientation_tiff(6)))
+    assert b"GPS-SECRET" not in out and b"XMP-SECRET" not in out
+    assert out[out.index(b"VP8X") + 8] & 0x0C == 0x08, "the EXIF flag stays, the XMP flag goes"
+    assert struct.unpack("<I", out[4:8])[0] == len(out) - 8
+    out, _ = _roundtrip(tmp_path, "upright.webp", webp(1))
+    assert b"EXIF" not in out and out[out.index(b"VP8X") + 8] & 0x0C == 0
 
 
 def test_unsupported_files_pass_through(tmp_path):

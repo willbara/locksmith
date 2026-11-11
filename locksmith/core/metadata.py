@@ -7,7 +7,7 @@ device-description tags are cleared in place, so its colours are unchanged. Ever
 EXIF (camera, GPS location, dates, serial numbers), XMP, IPTC, comments,
 thumbnails, C2PA content credentials and unknown chunks. Pixels are never
 re-encoded, so image quality is untouched. The EXIF orientation is kept in a
-minimal new EXIF block so photos do not appear rotated.
+minimal new EXIF block (in all three formats) so photos do not appear rotated.
 
 Stripping works as a *plan*: a list of byte ranges to copy from the file and
 small byte strings to insert. The plan is computed from the headers only, then
@@ -251,8 +251,8 @@ def _plan_jpeg_segments(f, size) -> Plan:
         if marker == 0xE1 and body.startswith(b"Exif\x00\x00") and not scanned:
             # Replace the whole EXIF block, in place, by one holding only the orientation.
             orientation = _read_orientation(_read(f, pos + 4, length - 2)[6:])
-            if orientation and orientation != 1:
-                plan.append(_exif_orientation(orientation))
+            if orientation:
+                plan.append(_segment(0xE1, b"Exif\x00\x00" + _orientation_tiff(orientation)))
         elif marker == 0xE0 and "jfif" not in rewritten and body.startswith(b"JFIF\x00") and len(body) >= 14:
             # JFIF: only its version, density units and densities, never its thumbnail.
             # JFXX (an extension holding a whole thumbnail JPEG) and other APP0 are dropped.
@@ -297,6 +297,7 @@ def _scan_end(f, pos: int, size: int) -> int:
 
 
 def _read_orientation(tiff: bytes) -> int | None:
+    """The orientation in an EXIF (TIFF) block when the picture has to be turned, else None."""
     try:
         endian = {b"II": "<", b"MM": ">"}[tiff[:2]]
         if struct.unpack(endian + "H", tiff[2:4])[0] != 42:
@@ -308,18 +309,16 @@ def _read_orientation(tiff: bytes) -> int | None:
             tag, typ, n = struct.unpack(endian + "HHI", tiff[e:e + 8])
             if tag == 0x0112 and typ == 3 and n == 1:
                 value = struct.unpack(endian + "H", tiff[e + 8:e + 10])[0]
-                return value if 1 <= value <= 8 else None
+                return value if 2 <= value <= 8 else None   # 1 is upright: nothing to keep
     except (KeyError, struct.error):
         return None
     return None
 
 
-def _exif_orientation(value: int) -> bytes:
-    """A minimal APP1 EXIF segment holding only the orientation tag."""
-    tiff = (b"MM\x00\x2a" + struct.pack(">I", 8) + struct.pack(">H", 1)
+def _orientation_tiff(value: int) -> bytes:
+    """A minimal EXIF (TIFF) block holding only the orientation tag."""
+    return (b"MM\x00\x2a" + struct.pack(">I", 8) + struct.pack(">H", 1)
             + struct.pack(">HHIHH", 0x0112, 3, 1, value, 0) + struct.pack(">I", 0))
-    payload = b"Exif\x00\x00" + tiff
-    return b"\xff\xe1" + struct.pack(">H", len(payload) + 2) + payload
 
 
 # ── PNG ──────────────────────────────────────────────────────────────────────
@@ -341,12 +340,20 @@ def _plan_png(f, size) -> Plan:
             chunk = _png_iccp(_read(f, pos + 8, length))
             if chunk is not None:
                 plan.append(chunk)
+        elif ctype == b"eXIf":
+            orientation = _read_orientation(_read(f, pos + 8, min(length, 64 << 10)))
+            if orientation:
+                plan.append(_png_chunk(b"eXIf", _orientation_tiff(orientation)))
         elif ctype in PNG_KEEP:
             plan.append((pos, end - pos))
         pos = end
         if ctype == b"IEND":
             return plan  # anything after IEND is not part of the image
     raise ValueError("missing IEND")
+
+
+def _png_chunk(ctype: bytes, body: bytes) -> bytes:
+    return struct.pack(">I", len(body)) + ctype + body + struct.pack(">I", zlib.crc32(ctype + body))
 
 
 def _png_iccp(data: bytes) -> bytes | None:
@@ -365,8 +372,7 @@ def _png_iccp(data: bytes) -> bytes | None:
     scrubbed = scrub_icc(profile)
     if scrubbed is None:
         return None
-    body = b"ICC profile\x00\x00" + zlib.compress(scrubbed, 9)
-    return struct.pack(">I", len(body)) + b"iCCP" + body + struct.pack(">I", zlib.crc32(b"iCCP" + body))
+    return _png_chunk(b"iCCP", b"ICC profile\x00\x00" + zlib.compress(scrubbed, 9))
 
 
 # ── WebP ─────────────────────────────────────────────────────────────────────
@@ -380,8 +386,8 @@ def _plan_webp(f, size) -> Plan:
     end_of_riff = min(size, 8 + riff_size)
     chunks: Plan = []
     pos = 12
-    vp8x = None   # its index in chunks, to clear the ICC flag if the profile is dropped
-    icc_kept = False
+    vp8x = None   # its index in chunks, to set its flags to what is kept
+    icc_kept = exif_kept = False
     while pos + 8 <= end_of_riff:
         fourcc, length = struct.unpack("<4sI", _read(f, pos, 8))
         padded = length + (length & 1)
@@ -397,14 +403,25 @@ def _plan_webp(f, size) -> Plan:
             if scrubbed is not None:
                 icc_kept = True
                 chunks.append(b"ICCP" + struct.pack("<I", length) + scrubbed + (b"\x00" if length & 1 else b""))
+        elif fourcc == b"EXIF":
+            # Only valid after a VP8X chunk, which says the file has one. Some writers start it with "Exif\0\0".
+            tiff = _read(f, pos + 8, min(length, 64 << 10)).removeprefix(b"Exif\x00\x00")
+            orientation = _read_orientation(tiff) if vp8x is not None and not exif_kept else None
+            if orientation:
+                exif_kept = True
+                tiff = _orientation_tiff(orientation)
+                chunks.append(b"EXIF" + struct.pack("<I", len(tiff)) + tiff)
         elif fourcc == b"ANMF":
             chunks.extend(_webp_frame(f, pos, length))
         elif fourcc in WEBP_KEEP:
             chunks.append((pos, 8 + padded))
         pos += 8 + padded
-    if vp8x is not None and not icc_kept:
+    if vp8x is not None:
         head = bytearray(chunks[vp8x])
-        head[8] &= ~0x20 & 0xFF          # no profile kept: clear the ICC flag
+        if not icc_kept:
+            head[8] &= ~0x20 & 0xFF      # no profile kept: clear the ICC flag
+        if exif_kept:
+            head[8] |= 0x08              # the orientation was kept: the EXIF flag again
         chunks[vp8x] = bytes(head)
     body = sum(len(c) if isinstance(c, bytes) else c[1] for c in chunks)
     return [b"RIFF" + struct.pack("<I", 4 + body) + b"WEBP", *chunks]
